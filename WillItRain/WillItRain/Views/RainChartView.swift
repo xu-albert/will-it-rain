@@ -175,7 +175,13 @@ struct PrecipChart: View {
                     .gesture(
                         DragGesture(minimumDistance: 0)
                             .onChanged { value in
-                                guard let date: Date = proxy.value(atX: value.location.x) else { return }
+                                let plotArea = proxy.plotAreaSize
+                                let plotOrigin = CGPoint(
+                                    x: geo.size.width - plotArea.width,
+                                    y: 0
+                                )
+                                let xInPlot = value.location.x - plotOrigin.x
+                                guard let date: Date = proxy.value(atX: xInPlot) else { return }
                                 selectedPoint = points.min(by: {
                                     abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date))
                                 })

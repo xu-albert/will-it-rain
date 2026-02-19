@@ -1,10 +1,9 @@
 import SwiftUI
 
-struct Snowflake: Identifiable {
-    let id = UUID()
+struct Snowflake {
     var x: CGFloat
     var y: CGFloat
-    var speed: Double
+    var speed: CGFloat
     var opacity: Double
     var size: CGFloat
     var wobble: CGFloat
@@ -12,12 +11,47 @@ struct Snowflake: Identifiable {
     var phase: Double
 }
 
+final class SnowState {
+    var flakes: [Snowflake] = []
+    var lastUpdate: Date = .now
+    var elapsed: Double = 0
+
+    func setup(count: Int, width: CGFloat, height: CGFloat) {
+        guard flakes.isEmpty else { return }
+        flakes = (0..<count).map { _ in
+            Snowflake(
+                x: .random(in: 0...width),
+                y: .random(in: -50...height),
+                speed: .random(in: 1.5...4),
+                opacity: .random(in: 0.3...0.7),
+                size: .random(in: 3...8),
+                wobble: .random(in: 10...30),
+                wobbleSpeed: .random(in: 0.5...2),
+                phase: .random(in: 0...(.pi * 2))
+            )
+        }
+        lastUpdate = .now
+    }
+
+    func update(now: Date, width: CGFloat, height: CGFloat) {
+        let dt = now.timeIntervalSince(lastUpdate)
+        lastUpdate = now
+        elapsed += dt
+        let scale = CGFloat(dt * 60)
+        for i in flakes.indices {
+            flakes[i].y += flakes[i].speed * scale
+            if flakes[i].y > height + 20 {
+                flakes[i].y = .random(in: -40 ... -5)
+                flakes[i].x = .random(in: 0...width)
+            }
+        }
+    }
+}
+
 struct SnowAnimationView: View {
     let intensity: PrecipitationIntensity
 
-    @State private var flakes: [Snowflake] = []
-    @State private var timer: Timer?
-    @State private var elapsed: Double = 0
+    @State private var state = SnowState()
 
     private var flakeCount: Int {
         switch intensity {
@@ -29,59 +63,29 @@ struct SnowAnimationView: View {
     }
 
     var body: some View {
-        Canvas { context, size in
-            for flake in flakes {
-                let rect = CGRect(
-                    x: flake.x + sin(elapsed * flake.wobbleSpeed + flake.phase) * flake.wobble,
-                    y: flake.y,
-                    width: flake.size,
-                    height: flake.size
-                )
-                context.opacity = flake.opacity
-                context.fill(
-                    Path(ellipseIn: rect),
-                    with: .color(.white.opacity(0.8))
-                )
+        GeometryReader { geo in
+            TimelineView(.animation) { timeline in
+                Canvas { context, size in
+                    state.setup(count: flakeCount, width: size.width, height: size.height)
+                    state.update(now: timeline.date, width: size.width, height: size.height)
+
+                    for flake in state.flakes {
+                        let xOffset = sin(state.elapsed * flake.wobbleSpeed + flake.phase) * flake.wobble
+                        let rect = CGRect(
+                            x: flake.x + xOffset,
+                            y: flake.y,
+                            width: flake.size,
+                            height: flake.size
+                        )
+                        context.opacity = flake.opacity
+                        context.fill(
+                            Path(ellipseIn: rect),
+                            with: .color(.white.opacity(0.8))
+                        )
+                    }
+                }
             }
         }
-        .onAppear { startAnimation() }
-        .onDisappear { timer?.invalidate() }
-        .onChange(of: intensity) { _ in resetFlakes() }
         .allowsHitTesting(false)
-    }
-
-    private func startAnimation() {
-        resetFlakes()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
-            elapsed += 1.0 / 60.0
-            updateFlakes()
-        }
-    }
-
-    private func resetFlakes() {
-        flakes = (0..<flakeCount).map { _ in
-            Snowflake(
-                x: CGFloat.random(in: 0...UIScreen.main.bounds.width),
-                y: CGFloat.random(in: -50...UIScreen.main.bounds.height),
-                speed: Double.random(in: 1.5...4),
-                opacity: Double.random(in: 0.3...0.7),
-                size: CGFloat.random(in: 3...8),
-                wobble: CGFloat.random(in: 10...30),
-                wobbleSpeed: Double.random(in: 0.5...2),
-                phase: Double.random(in: 0...(.pi * 2))
-            )
-        }
-    }
-
-    private func updateFlakes() {
-        let height = UIScreen.main.bounds.height
-        let width = UIScreen.main.bounds.width
-        for i in flakes.indices {
-            flakes[i].y += CGFloat(flakes[i].speed)
-            if flakes[i].y > height + 20 {
-                flakes[i].y = CGFloat.random(in: -40 ... -5)
-                flakes[i].x = CGFloat.random(in: 0...width)
-            }
-        }
     }
 }

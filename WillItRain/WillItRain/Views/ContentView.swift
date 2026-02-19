@@ -89,11 +89,8 @@ struct ContentView: View {
 
             Spacer()
 
-            // Precipitation animation
+            // Status
             ZStack {
-                precipitationAnimation(forecast: forecast)
-                    .frame(height: 200)
-
                 let status = forecast.heroStatus
                 RainStatusView(title: status.title, subtitle: status.subtitle)
             }
@@ -141,23 +138,6 @@ struct ContentView: View {
         }
         .padding(.horizontal, 20)
         .padding(.top, 8)
-    }
-
-    @ViewBuilder
-    private func precipitationAnimation(forecast: RainForecast) -> some View {
-        if let current = forecast.currentPrecipitationPeriod {
-            let intensity = current.peakIntensity
-            switch current.type {
-            case .snow:
-                SnowAnimationView(intensity: intensity)
-            case .hail:
-                HailAnimationView(intensity: intensity)
-            case .rain, .sleet:
-                RainAnimationView(intensity: intensity)
-            case .none:
-                EmptyView()
-            }
-        }
     }
 
     // MARK: - Error View

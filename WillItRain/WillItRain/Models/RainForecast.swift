@@ -127,12 +127,14 @@ struct RainForecast {
         if let next = nextPrecipitationPeriod {
             let minutes = Int(next.start.timeIntervalSince(now) / 60)
             let timeStr = formatDuration(minutes: minutes)
+            let duration = Int(next.end.timeIntervalSince(next.start) / 60)
+            let durationStr = "Will last \(formatDuration(minutes: duration))"
             switch next.type {
-            case .rain: return ("Rains in \(timeStr)", "")
-            case .snow: return ("Snows in \(timeStr)", "")
-            case .hail: return ("Hails in \(timeStr)", "")
-            case .sleet: return ("Sleet in \(timeStr)", "")
-            case .none: return ("Rains in \(timeStr)", "")
+            case .rain: return ("Rains in \(timeStr)", durationStr)
+            case .snow: return ("Snows in \(timeStr)", durationStr)
+            case .hail: return ("Hails in \(timeStr)", durationStr)
+            case .sleet: return ("Sleet in \(timeStr)", durationStr)
+            case .none: return ("Rains in \(timeStr)", durationStr)
             }
         }
 

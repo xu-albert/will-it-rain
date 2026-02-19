@@ -69,7 +69,8 @@ final class WeatherService {
         case .snow: return .snow
         case .hail: return .hail
         case .sleet: return .sleet
-        default: return .none
+        case .none: return .none
+        default: return .rain
         }
     }
 

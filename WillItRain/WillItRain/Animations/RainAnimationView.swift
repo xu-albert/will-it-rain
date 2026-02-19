@@ -1,19 +1,7 @@
 import SwiftUI
 
-struct RainDrop: Identifiable {
-    let id = UUID()
-    var x: CGFloat
-    var y: CGFloat
-    var speed: Double
-    var opacity: Double
-    var length: CGFloat
-}
-
 struct RainAnimationView: View {
     let intensity: PrecipitationIntensity
-
-    @State private var drops: [RainDrop] = []
-    @State private var timer: Timer?
 
     private var dropCount: Int {
         switch intensity {
@@ -25,49 +13,64 @@ struct RainAnimationView: View {
     }
 
     var body: some View {
-        Canvas { context, size in
-            for drop in drops {
-                let rect = CGRect(x: drop.x, y: drop.y, width: 1.5, height: drop.length)
-                context.opacity = drop.opacity
-                context.fill(
-                    Path(roundedRect: rect, cornerRadius: 1),
-                    with: .color(.white.opacity(0.6))
-                )
+        GeometryReader { geo in
+            ZStack {
+                ForEach(0..<dropCount, id: \.self) { i in
+                    RainDropView(
+                        containerWidth: geo.size.width,
+                        containerHeight: geo.size.height
+                    )
+                }
             }
         }
-        .onAppear { startAnimation() }
-        .onDisappear { timer?.invalidate() }
-        .onChange(of: intensity) { _ in resetDrops() }
         .allowsHitTesting(false)
     }
+}
 
-    private func startAnimation() {
-        resetDrops()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
-            updateDrops()
-        }
+struct RainDropView: View {
+    let containerWidth: CGFloat
+    let containerHeight: CGFloat
+
+    @State private var yOffset: CGFloat = 0
+    @State private var xPos: CGFloat = 0
+    @State private var opacity: Double = 0.3
+    @State private var length: CGFloat = 15
+    @State private var started = false
+
+    private var duration: Double { .random(in: 0.4...0.9) }
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1)
+            .fill(Color.white.opacity(0.5))
+            .frame(width: 1.5, height: length)
+            .opacity(opacity)
+            .position(x: xPos, y: yOffset)
+            .onAppear {
+                xPos = .random(in: 0...containerWidth)
+                opacity = .random(in: 0.2...0.5)
+                length = .random(in: 10...25)
+                // Start at random y so they don't all begin at top
+                let startY = CGFloat.random(in: -50...containerHeight)
+                yOffset = startY
+                started = true
+                startFalling()
+            }
     }
 
-    private func resetDrops() {
-        drops = (0..<dropCount).map { _ in
-            RainDrop(
-                x: CGFloat.random(in: 0...UIScreen.main.bounds.width),
-                y: CGFloat.random(in: -100...UIScreen.main.bounds.height),
-                speed: Double.random(in: 8...15),
-                opacity: Double.random(in: 0.2...0.5),
-                length: CGFloat.random(in: 10...25)
-            )
+    private func startFalling() {
+        let fallDuration = Double.random(in: 0.4...0.9)
+        withAnimation(.linear(duration: fallDuration)) {
+            yOffset = containerHeight + 30
         }
-    }
-
-    private func updateDrops() {
-        let height = UIScreen.main.bounds.height
-        let width = UIScreen.main.bounds.width
-        for i in drops.indices {
-            drops[i].y += CGFloat(drops[i].speed)
-            if drops[i].y > height + 30 {
-                drops[i].y = CGFloat.random(in: -80 ... -10)
-                drops[i].x = CGFloat.random(in: 0...width)
+        DispatchQueue.main.asyncAfter(deadline: .now() + fallDuration) {
+            // Reset to top without animation
+            withAnimation(.none) {
+                yOffset = .random(in: -50 ... -10)
+                xPos = .random(in: 0...containerWidth)
+            }
+            // Fall again
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
+                startFalling()
             }
         }
     }
