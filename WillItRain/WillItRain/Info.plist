@@ -4,9 +4,11 @@
 <dict>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
-		<string>BGTaskSchedulerPermittedIdentifiers</string>
+		<string>com.willitrain.refresh</string>
 	</array>
 	<key>UIBackgroundModes</key>
-	<array/>
+	<array>
+		<string>fetch</string>
+	</array>
 </dict>
 </plist>
