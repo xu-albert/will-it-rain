@@ -86,9 +86,28 @@ enum WeatherCondition {
     }
 }
 
+struct DaySummary: Identifiable {
+    let id = UUID()
+    let date: Date
+    let precipChance: Double // 0–1
+    let type: PrecipitationType
+    let highTemp: Double? // Celsius
+    let lowTemp: Double? // Celsius
+
+    var dayName: String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) { return "Today" }
+        if calendar.isDateInTomorrow(date) { return "Tomorrow" }
+        let f = DateFormatter()
+        f.dateFormat = "EEE"
+        return f.string(from: date)
+    }
+}
+
 struct RainForecast {
     let dataPoints: [ChartDataPoint]
     let precipitationPeriods: [PrecipitationPeriod]
+    let dailySummaries: [DaySummary]
     let currentCondition: WeatherCondition
     let currentType: PrecipitationType
     let locationName: String
@@ -141,14 +160,38 @@ struct RainForecast {
         // All clear
         let lastPoint = dataPoints.last?.date ?? now.addingTimeInterval(3600 * 12)
         let hours = max(1, Int(lastPoint.timeIntervalSince(now) / 3600))
-        if hours >= 48 {
+        if hours >= 7 * 24 {
+            return ("All Clear", "Probably won't rain within the next 7 days")
+        } else if hours >= 48 {
             let days = hours / 24
-            return ("All Clear", "Won't rain for \(days) days at least")
-        } else if hours >= 24 {
-            return ("All Clear", "Won't rain for a day at least")
+            return ("All Clear", "Probably won't rain for the next \(days) days")
         } else {
-            return ("All Clear", "Won't rain for \(hours) hours at least")
+            return ("All Clear", "Chance of rain within 48 hours")
         }
+    }
+
+    /// Returns the adaptive poll interval in seconds based on current forecast conditions.
+    func nextPollInterval(leadTimeMinutes: Int = 20) -> TimeInterval {
+        let now = Date()
+
+        // Currently raining
+        if let current = currentPrecipitationPeriod {
+            let minsUntilEnd = current.end.timeIntervalSince(now) / 60
+            if minsUntilEnd <= 10 { return 2 * 60 }
+            if minsUntilEnd <= 30 { return 5 * 60 }
+            return 15 * 60
+        }
+
+        // Rain coming
+        if let next = nextPrecipitationPeriod {
+            let minsUntilStart = next.start.timeIntervalSince(now) / 60
+            if minsUntilStart <= Double(leadTimeMinutes + 20) { return 5 * 60 }
+            let hoursUntilStart = minsUntilStart / 60
+            if hoursUntilStart <= 6 { return 30 * 60 }
+        }
+
+        // Clear 6+ hours or no rain
+        return 60 * 60
     }
 
     private func formatDuration(minutes: Int) -> String {

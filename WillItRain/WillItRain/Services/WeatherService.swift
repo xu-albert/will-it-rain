@@ -10,7 +10,7 @@ final class WeatherService {
     func fetch(location: CLLocation, locationName: String) async throws -> RainForecast {
         let weather = try await Self.weatherKitService.weather(
             for: location,
-            including: .minute, .hourly, .current
+            including: .minute, .hourly, .current, .daily
         )
 
         let now = Date()
@@ -53,9 +53,20 @@ final class WeatherService {
         let periods = findPrecipitationPeriods(from: dataPoints)
         let condition = currentWeatherCondition(current: weather.2, periods: periods)
 
+        let dailySummaries = weather.3.forecast.prefix(7).map { day in
+            DaySummary(
+                date: day.date,
+                precipChance: day.precipitationChance,
+                type: precipitationType(from: day.precipitation),
+                highTemp: day.highTemperature.converted(to: .fahrenheit).value,
+                lowTemp: day.lowTemperature.converted(to: .fahrenheit).value
+            )
+        }
+
         return RainForecast(
             dataPoints: dataPoints,
             precipitationPeriods: periods,
+            dailySummaries: Array(dailySummaries),
             currentCondition: condition,
             currentType: periods.first { $0.contains(now) }?.type ?? .none,
             locationName: locationName,

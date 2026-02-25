@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 enum AppState {
     case loading
@@ -12,8 +13,11 @@ struct ContentView: View {
     @State private var settings = NotificationSettings.load()
     @State private var showSettings = false
     @State private var currentCondition: WeatherCondition = .clear
+    @State private var tick: Date = Date()
 
     private let weatherService = WeatherService()
+    private let uiTimer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
+    @State private var weatherPoller = WeatherPoller()
 
     var body: some View {
         ZStack {
@@ -34,6 +38,7 @@ struct ContentView: View {
             }
         }
         .task { await fetchWeather() }
+        .onReceive(uiTimer) { tick = $0 }
         .sheet(isPresented: $showSettings) {
             SettingsView(settings: $settings)
                 .presentationDetents([.medium])
@@ -54,15 +59,15 @@ struct ContentView: View {
     private func gradientColors(for condition: WeatherCondition) -> [Color] {
         switch condition {
         case .clear:
-            return [Color(red: 0.53, green: 0.81, blue: 0.98), Color(red: 0.95, green: 0.97, blue: 1.0)]
+            return [Color(red: 0.30, green: 0.65, blue: 0.95), Color(red: 0.55, green: 0.82, blue: 1.0)]
         case .cloudy:
-            return [Color(red: 0.55, green: 0.6, blue: 0.7), Color(red: 0.4, green: 0.45, blue: 0.55)]
+            return [Color(red: 0.40, green: 0.47, blue: 0.58), Color(red: 0.55, green: 0.60, blue: 0.68)]
         case .raining:
-            return [Color(red: 0.25, green: 0.3, blue: 0.4), Color(red: 0.1, green: 0.12, blue: 0.25)]
+            return [Color(red: 0.15, green: 0.20, blue: 0.35), Color(red: 0.22, green: 0.28, blue: 0.45)]
         case .snowing:
-            return [Color(red: 0.85, green: 0.88, blue: 0.92), Color(red: 0.65, green: 0.7, blue: 0.78)]
+            return [Color(red: 0.60, green: 0.68, blue: 0.78), Color(red: 0.75, green: 0.80, blue: 0.88)]
         case .night:
-            return [Color(red: 0.12, green: 0.1, blue: 0.25), Color(red: 0.05, green: 0.04, blue: 0.1)]
+            return [Color(red: 0.08, green: 0.06, blue: 0.18), Color(red: 0.15, green: 0.12, blue: 0.28)]
         }
     }
 
@@ -89,19 +94,20 @@ struct ContentView: View {
 
             Spacer()
 
-            // Precipitation animation
+            // Status (tick forces re-evaluation every 15s)
             ZStack {
-                precipitationAnimation(forecast: forecast)
-                    .frame(height: 200)
-
+                let _ = tick
                 let status = forecast.heroStatus
                 RainStatusView(title: status.title, subtitle: status.subtitle)
             }
 
             Spacer()
 
-            // Chart
-            RainChartView(dataPoints: forecast.dataPoints, chartHours: settings.chartHours)
+            // Charts
+            RainChartView(dataPoints: forecast.dataPoints, chartHours: 12)
+                .padding(.bottom, 12)
+
+            WeeklyForecastView(days: forecast.dailySummaries)
                 .padding(.bottom, 20)
 
             // Attribution
@@ -143,23 +149,6 @@ struct ContentView: View {
         .padding(.top, 8)
     }
 
-    @ViewBuilder
-    private func precipitationAnimation(forecast: RainForecast) -> some View {
-        if let current = forecast.currentPrecipitationPeriod {
-            let intensity = current.peakIntensity
-            switch current.type {
-            case .snow:
-                SnowAnimationView(intensity: intensity)
-            case .hail:
-                HailAnimationView(intensity: intensity)
-            case .rain, .sleet:
-                RainAnimationView(intensity: intensity)
-            case .none:
-                EmptyView()
-            }
-        }
-    }
-
     // MARK: - Error View
 
     private func errorView(_ message: String) -> some View {
@@ -185,7 +174,8 @@ struct ContentView: View {
     // MARK: - Data Fetching
 
     private func fetchWeather() async {
-        appState = .loading
+        // Don't show loading spinner on background refreshes
+        if case .loaded = appState {} else { appState = .loading }
         do {
             let location = try await locationService.currentLocation()
             let name = await locationService.reverseGeocode(location)
@@ -196,8 +186,17 @@ struct ContentView: View {
             var settings = self.settings
             NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: &settings)
             self.settings = settings
+
+            let interval = forecast.nextPollInterval(leadTimeMinutes: settings.leadTime)
+            print("[Weather] Next poll in \(Int(interval))s")
+            weatherPoller.schedule(after: interval) {
+                Task { await fetchWeather() }
+            }
         } catch {
             appState = .error("Unable to load weather data.\n\(error.localizedDescription)")
+            weatherPoller.schedule(after: 60) {
+                Task { await fetchWeather() }
+            }
         }
     }
 
@@ -210,3 +209,14 @@ struct ContentView: View {
 
 // Make WeatherCondition Equatable for animation value
 extension WeatherCondition: Equatable {}
+
+private class WeatherPoller {
+    private var workItem: DispatchWorkItem?
+
+    func schedule(after interval: TimeInterval, block: @escaping () -> Void) {
+        workItem?.cancel()
+        let item = DispatchWorkItem(block: block)
+        workItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: item)
+    }
+}

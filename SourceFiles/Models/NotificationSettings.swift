@@ -45,6 +45,41 @@ struct NotificationSettings {
         }
     }
 
+    // Confirmation state for two-pass notification
+    var pendingPrecipStart: Date? {
+        didSet {
+            if let date = pendingPrecipStart {
+                Self.defaults.set(date.timeIntervalSinceReferenceDate, forKey: "pendingPrecipStart")
+            } else {
+                Self.defaults.removeObject(forKey: "pendingPrecipStart")
+            }
+        }
+    }
+    var pendingPrecipEnd: Date? {
+        didSet {
+            if let date = pendingPrecipEnd {
+                Self.defaults.set(date.timeIntervalSinceReferenceDate, forKey: "pendingPrecipEnd")
+            } else {
+                Self.defaults.removeObject(forKey: "pendingPrecipEnd")
+            }
+        }
+    }
+    var lastRainEndTime: Date? {
+        didSet {
+            if let date = lastRainEndTime {
+                Self.defaults.set(date.timeIntervalSinceReferenceDate, forKey: "lastRainEndTime")
+            } else {
+                Self.defaults.removeObject(forKey: "lastRainEndTime")
+            }
+        }
+    }
+
+    /// Check if two dates refer to the same event (within 10 minutes).
+    func isSameEvent(_ a: Date?, _ b: Date?) -> Bool {
+        guard let a, let b else { return false }
+        return abs(a.timeIntervalSince(b)) < 10 * 60
+    }
+
     static func load() -> NotificationSettings {
         let d = defaults
         let leadTime = d.object(forKey: "leadTime") as? Int ?? 20
@@ -73,6 +108,15 @@ struct NotificationSettings {
         let lastEnd: Date? = d.object(forKey: "lastNotifiedPrecipEnd") != nil
             ? Date(timeIntervalSinceReferenceDate: d.double(forKey: "lastNotifiedPrecipEnd"))
             : nil
+        let pendingStart: Date? = d.object(forKey: "pendingPrecipStart") != nil
+            ? Date(timeIntervalSinceReferenceDate: d.double(forKey: "pendingPrecipStart"))
+            : nil
+        let pendingEnd: Date? = d.object(forKey: "pendingPrecipEnd") != nil
+            ? Date(timeIntervalSinceReferenceDate: d.double(forKey: "pendingPrecipEnd"))
+            : nil
+        let lastRainEnd: Date? = d.object(forKey: "lastRainEndTime") != nil
+            ? Date(timeIntervalSinceReferenceDate: d.double(forKey: "lastRainEndTime"))
+            : nil
 
         return NotificationSettings(
             leadTime: leadTime,
@@ -83,7 +127,10 @@ struct NotificationSettings {
             rainEndEnabled: rainEndEnabled,
             chartHours: chartHours,
             lastNotifiedPrecipStart: lastStart,
-            lastNotifiedPrecipEnd: lastEnd
+            lastNotifiedPrecipEnd: lastEnd,
+            pendingPrecipStart: pendingStart,
+            pendingPrecipEnd: pendingEnd,
+            lastRainEndTime: lastRainEnd
         )
     }
 

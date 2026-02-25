@@ -5,7 +5,6 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
 
     private let leadTimeOptions = [10, 15, 20, 30, 60]
-    private let chartHourOptions = [6, 12, 24]
 
     var body: some View {
         NavigationView {
@@ -27,14 +26,6 @@ struct SettingsView: View {
                     if settings.quietHoursEnabled {
                         DatePicker("Start", selection: $settings.quietHoursStart, displayedComponents: .hourAndMinute)
                         DatePicker("End", selection: $settings.quietHoursEnd, displayedComponents: .hourAndMinute)
-                    }
-                }
-
-                Section("Chart") {
-                    Picker("Time Range", selection: $settings.chartHours) {
-                        ForEach(chartHourOptions, id: \.self) { hours in
-                            Text("\(hours) hours").tag(hours)
-                        }
                     }
                 }
             }

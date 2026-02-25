@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 enum AppState {
     case loading
@@ -12,8 +13,11 @@ struct ContentView: View {
     @State private var settings = NotificationSettings.load()
     @State private var showSettings = false
     @State private var currentCondition: WeatherCondition = .clear
+    @State private var tick: Date = Date()
 
     private let weatherService = WeatherService()
+    private let uiTimer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
+    @State private var weatherPoller = WeatherPoller()
 
     var body: some View {
         ZStack {
@@ -34,6 +38,7 @@ struct ContentView: View {
             }
         }
         .task { await fetchWeather() }
+        .onReceive(uiTimer) { tick = $0 }
         .sheet(isPresented: $showSettings) {
             SettingsView(settings: $settings)
                 .presentationDetents([.medium])
@@ -89,16 +94,20 @@ struct ContentView: View {
 
             Spacer()
 
-            // Status
+            // Status (tick forces re-evaluation every 15s)
             ZStack {
+                let _ = tick
                 let status = forecast.heroStatus
                 RainStatusView(title: status.title, subtitle: status.subtitle)
             }
 
             Spacer()
 
-            // Chart
-            RainChartView(dataPoints: forecast.dataPoints, chartHours: settings.chartHours)
+            // Charts
+            RainChartView(dataPoints: forecast.dataPoints, chartHours: 12)
+                .padding(.bottom, 12)
+
+            WeeklyForecastView(days: forecast.dailySummaries)
                 .padding(.bottom, 20)
 
             // Attribution
@@ -165,7 +174,8 @@ struct ContentView: View {
     // MARK: - Data Fetching
 
     private func fetchWeather() async {
-        appState = .loading
+        // Don't show loading spinner on background refreshes
+        if case .loaded = appState {} else { appState = .loading }
         do {
             let location = try await locationService.currentLocation()
             let name = await locationService.reverseGeocode(location)
@@ -176,8 +186,17 @@ struct ContentView: View {
             var settings = self.settings
             NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: &settings)
             self.settings = settings
+
+            let interval = forecast.nextPollInterval(leadTimeMinutes: settings.leadTime)
+            print("[Weather] Next poll in \(Int(interval))s")
+            weatherPoller.schedule(after: interval) {
+                Task { await fetchWeather() }
+            }
         } catch {
             appState = .error("Unable to load weather data.\n\(error.localizedDescription)")
+            weatherPoller.schedule(after: 60) {
+                Task { await fetchWeather() }
+            }
         }
     }
 
@@ -190,3 +209,14 @@ struct ContentView: View {
 
 // Make WeatherCondition Equatable for animation value
 extension WeatherCondition: Equatable {}
+
+private class WeatherPoller {
+    private var workItem: DispatchWorkItem?
+
+    func schedule(after interval: TimeInterval, block: @escaping () -> Void) {
+        workItem?.cancel()
+        let item = DispatchWorkItem(block: block)
+        workItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: item)
+    }
+}
