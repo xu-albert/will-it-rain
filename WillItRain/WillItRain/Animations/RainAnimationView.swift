@@ -1,7 +1,49 @@
 import SwiftUI
 
+struct RainDrop {
+    var x: CGFloat
+    var y: CGFloat
+    var speed: CGFloat
+    var opacity: Double
+    var length: CGFloat
+}
+
+final class RainState {
+    var drops: [RainDrop] = []
+    var lastUpdate: Date = .now
+
+    func setup(count: Int, width: CGFloat, height: CGFloat) {
+        guard drops.isEmpty else { return }
+        drops = (0..<count).map { _ in
+            RainDrop(
+                x: .random(in: 0...width),
+                y: .random(in: -50...height),
+                speed: .random(in: 8...16),
+                opacity: .random(in: 0.2...0.5),
+                length: .random(in: 10...25)
+            )
+        }
+        lastUpdate = .now
+    }
+
+    func update(now: Date, width: CGFloat, height: CGFloat) {
+        let dt = now.timeIntervalSince(lastUpdate)
+        lastUpdate = now
+        let scale = CGFloat(dt * 60)
+        for i in drops.indices {
+            drops[i].y += drops[i].speed * scale
+            if drops[i].y > height + 30 {
+                drops[i].y = .random(in: -50 ... -5)
+                drops[i].x = .random(in: 0...width)
+            }
+        }
+    }
+}
+
 struct RainAnimationView: View {
     let intensity: PrecipitationIntensity
+
+    @State private var state = RainState()
 
     private var dropCount: Int {
         switch intensity {
@@ -14,64 +56,28 @@ struct RainAnimationView: View {
 
     var body: some View {
         GeometryReader { geo in
-            ZStack {
-                ForEach(0..<dropCount, id: \.self) { i in
-                    RainDropView(
-                        containerWidth: geo.size.width,
-                        containerHeight: geo.size.height
-                    )
+            TimelineView(.animation) { timeline in
+                Canvas { context, size in
+                    state.setup(count: dropCount, width: size.width, height: size.height)
+                    state.update(now: timeline.date, width: size.width, height: size.height)
+
+                    for drop in state.drops {
+                        let rect = CGRect(
+                            x: drop.x - 0.75,
+                            y: drop.y,
+                            width: 1.5,
+                            height: drop.length
+                        )
+                        context.opacity = drop.opacity
+                        context.fill(
+                            Path(roundedRect: rect, cornerRadius: 1),
+                            with: .color(.white.opacity(0.5))
+                        )
+                    }
                 }
+                .id(timeline.date)
             }
         }
         .allowsHitTesting(false)
-    }
-}
-
-struct RainDropView: View {
-    let containerWidth: CGFloat
-    let containerHeight: CGFloat
-
-    @State private var yOffset: CGFloat = 0
-    @State private var xPos: CGFloat = 0
-    @State private var opacity: Double = 0.3
-    @State private var length: CGFloat = 15
-    @State private var started = false
-
-    private var duration: Double { .random(in: 0.4...0.9) }
-
-    var body: some View {
-        RoundedRectangle(cornerRadius: 1)
-            .fill(Color.white.opacity(0.5))
-            .frame(width: 1.5, height: length)
-            .opacity(opacity)
-            .position(x: xPos, y: yOffset)
-            .onAppear {
-                xPos = .random(in: 0...containerWidth)
-                opacity = .random(in: 0.2...0.5)
-                length = .random(in: 10...25)
-                // Start at random y so they don't all begin at top
-                let startY = CGFloat.random(in: -50...containerHeight)
-                yOffset = startY
-                started = true
-                startFalling()
-            }
-    }
-
-    private func startFalling() {
-        let fallDuration = Double.random(in: 0.4...0.9)
-        withAnimation(.linear(duration: fallDuration)) {
-            yOffset = containerHeight + 30
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + fallDuration) {
-            // Reset to top without animation
-            withAnimation(.none) {
-                yOffset = .random(in: -50 ... -10)
-                xPos = .random(in: 0...containerWidth)
-            }
-            // Fall again
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
-                startFalling()
-            }
-        }
     }
 }

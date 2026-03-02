@@ -95,6 +95,7 @@ struct HailAnimationView: View {
                         )
                     }
                 }
+                .id(timeline.date)
             }
         }
         .allowsHitTesting(false)

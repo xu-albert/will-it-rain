@@ -84,6 +84,7 @@ struct SnowAnimationView: View {
                         )
                     }
                 }
+                .id(timeline.date)
             }
         }
         .allowsHitTesting(false)
