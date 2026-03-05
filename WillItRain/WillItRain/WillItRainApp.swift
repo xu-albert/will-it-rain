@@ -53,8 +53,8 @@ struct WillItRainApp: App {
                 let name = await locationService.reverseGeocode(location)
                 let forecast = try await weatherService.fetch(location: location, locationName: name)
 
-                var settings = NotificationSettings.load()
-                NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: &settings)
+                let settings = NotificationSettings()
+                NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: settings)
 
                 let nextInterval = forecast.nextPollInterval(leadTimeMinutes: settings.leadTime)
                 scheduleBackgroundRefresh(after: nextInterval)

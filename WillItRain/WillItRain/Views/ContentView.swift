@@ -15,7 +15,7 @@ enum AppState {
 struct ContentView: View {
     @StateObject private var locationService = LocationService()
     @State private var appState: AppState = .loading
-    @State private var settings = NotificationSettings.load()
+    @StateObject private var settings = NotificationSettings()
     @State private var showSettings = false
     @State private var currentCondition: WeatherCondition = .clear
     @State private var tick: Date = Date()
@@ -29,7 +29,6 @@ struct ContentView: View {
             // Dynamic gradient background
             gradientBackground
                 .ignoresSafeArea()
-                .animation(.easeInOut(duration: 2.0), value: currentCondition)
 
             switch appState {
             case .loading:
@@ -52,7 +51,7 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showSettings) {
-            SettingsView(settings: $settings)
+            SettingsView(settings: settings)
                 .presentationDetents([.medium])
         }
     }
@@ -136,7 +135,7 @@ struct ContentView: View {
             RainChartView(dataPoints: forecast.dataPoints, chartHours: 12)
                 .padding(.bottom, 12)
 
-            WeeklyForecastView(days: forecast.dailySummaries)
+            WeeklyForecastView(days: forecast.dailySummaries, useCelsius: settings.useCelsius)
                 .padding(.bottom, 20)
 
             // Attribution
@@ -237,12 +236,12 @@ struct ContentView: View {
             let location = try await locationService.currentLocation()
             let name = await locationService.reverseGeocode(location)
             let forecast = try await weatherService.fetch(location: location, locationName: name)
-            currentCondition = forecast.currentCondition
+            withAnimation(.easeInOut(duration: 2.0)) {
+                currentCondition = forecast.currentCondition
+            }
             appState = .loaded(forecast)
 
-            var settings = self.settings
-            NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: &settings)
-            self.settings = settings
+            NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: settings)
 
             let interval = forecast.nextPollInterval(leadTimeMinutes: settings.leadTime)
             print("[Weather] Next poll in \(Int(interval))s")

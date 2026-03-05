@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct SettingsView: View {
-    @Binding var settings: NotificationSettings
+    @ObservedObject var settings: NotificationSettings
     @Environment(\.dismiss) private var dismiss
 
     private let leadTimeOptions = [10, 15, 20, 30, 60]
@@ -18,6 +18,10 @@ struct SettingsView: View {
 
                     Toggle("Rain Starting", isOn: $settings.rainStartEnabled)
                     Toggle("Rain Ending", isOn: $settings.rainEndEnabled)
+                }
+
+                Section("Temperature") {
+                    Toggle("Use Celsius", isOn: $settings.useCelsius)
                 }
 
                 Section("Quiet Hours") {

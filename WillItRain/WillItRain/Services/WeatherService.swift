@@ -58,8 +58,8 @@ final class WeatherService {
                 date: day.date,
                 precipChance: day.precipitationChance,
                 type: precipitationType(from: day.precipitation),
-                highTemp: day.highTemperature.converted(to: .fahrenheit).value,
-                lowTemp: day.lowTemperature.converted(to: .fahrenheit).value
+                highTemp: day.highTemperature.converted(to: .celsius).value,
+                lowTemp: day.lowTemperature.converted(to: .celsius).value
             )
         }
 

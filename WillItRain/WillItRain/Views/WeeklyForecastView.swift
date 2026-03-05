@@ -2,6 +2,7 @@ import SwiftUI
 
 struct WeeklyForecastView: View {
     let days: [DaySummary]
+    var useCelsius: Bool = false
 
     private let barMaxHeight: CGFloat = 80
 
@@ -27,6 +28,12 @@ struct WeeklyForecastView: View {
                             .font(.system(size: 12))
                             .foregroundColor(day.type == .none ? .yellow.opacity(0.8) : .cyan)
 
+                        if let high = day.highTemp {
+                            Text("\(displayTemp(high))°")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(.white.opacity(0.6))
+                        }
+
                         Text(day.dayName.prefix(3))
                             .font(.system(size: 12, weight: .medium))
                             .foregroundColor(.white.opacity(0.7))
@@ -43,6 +50,14 @@ struct WeeklyForecastView: View {
                 .fill(.ultraThinMaterial.opacity(0.3))
                 .padding(.horizontal, 8)
         )
+    }
+
+    private func displayTemp(_ celsius: Double) -> Int {
+        if useCelsius {
+            return Int(celsius.rounded())
+        } else {
+            return Int((celsius * 9 / 5 + 32).rounded())
+        }
     }
 
     private func barColor(for chance: Double) -> Color {

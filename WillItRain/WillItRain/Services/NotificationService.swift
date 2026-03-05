@@ -13,7 +13,7 @@ final class NotificationService {
         }
     }
 
-    func evaluateAndSchedule(forecast: RainForecast, settings: inout NotificationSettings) {
+    func evaluateAndSchedule(forecast: RainForecast, settings: NotificationSettings) {
         let now = Date()
 
         guard !settings.isInQuietHours(at: now) else { return }
