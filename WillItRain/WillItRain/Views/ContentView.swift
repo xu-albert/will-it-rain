@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import CoreLocation
 
 enum AppState {
     case loading
@@ -202,6 +203,8 @@ struct ContentView: View {
             let granted = await NotificationService.shared.requestPermission()
             if granted {
                 await MainActor.run { UIApplication.shared.registerForRemoteNotifications() }
+                // Wait briefly for APNs to deliver the device token
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
                 await PushRegistrationService.shared.registerLocation(
                     lat: location.coordinate.latitude,
                     lon: location.coordinate.longitude,
