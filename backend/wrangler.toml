@@ -1,0 +1,11 @@
+name = "will-it-rain"
+main = "src/index.ts"
+compatibility_date = "2025-03-01"
+
+[triggers]
+crons = ["*/10 * * * *"]
+
+[[kv_namespaces]]
+binding = "DEVICES"
+id = "placeholder-id"
+preview_id = "placeholder-preview-id"

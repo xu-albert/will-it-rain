@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 enum AppState {
     case loading
@@ -196,6 +197,17 @@ struct ContentView: View {
             var settings = self.settings
             NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: &settings)
             self.settings = settings
+
+            // Register for remote push notifications
+            let granted = await NotificationService.shared.requestPermission()
+            if granted {
+                await MainActor.run { UIApplication.shared.registerForRemoteNotifications() }
+                await PushRegistrationService.shared.registerLocation(
+                    lat: location.coordinate.latitude,
+                    lon: location.coordinate.longitude,
+                    leadTimeMinutes: settings.leadTime
+                )
+            }
         } catch {
             appState = .error("Unable to load weather data.\n\(error.localizedDescription)")
         }

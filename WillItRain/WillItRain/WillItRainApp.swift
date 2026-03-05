@@ -1,8 +1,10 @@
 import SwiftUI
 import BackgroundTasks
+import UIKit
 
 @main
 struct WillItRainApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
