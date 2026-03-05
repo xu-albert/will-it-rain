@@ -90,7 +90,19 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   };
 
   // Key by device token for easy lookup/update
-  await env.DEVICES.put(`device:${body.token}`, JSON.stringify(registration));
+  try {
+    const key = `device:${body.token}`;
+    const value = JSON.stringify(registration);
+    console.log(`[Register] Writing key=${key} value=${value}`);
+    await env.DEVICES.put(key, value);
+    console.log(`[Register] Write successful`);
+  } catch (err) {
+    console.error(`[Register] KV write failed: ${err}`);
+    return new Response(JSON.stringify({ error: 'KV write failed', details: String(err) }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
 
   return new Response(JSON.stringify({ ok: true, gridKey: toGridKey(body.lat, body.lon) }), {
     headers: { 'Content-Type': 'application/json' },
