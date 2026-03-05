@@ -4,7 +4,7 @@ final class PushRegistrationService {
     static let shared = PushRegistrationService()
 
     // TODO: Replace with your deployed Worker URL
-    private let baseURL = "https://will-it-rain.YOUR_SUBDOMAIN.workers.dev"
+    private let baseURL = "https://will-it-rain.albertwxu.workers.dev"
 
     /// Called from AppDelegate when APNs returns a device token
     func storeToken(_ deviceToken: Data) {

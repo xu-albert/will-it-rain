@@ -7,5 +7,4 @@ crons = ["*/10 * * * *"]
 
 [[kv_namespaces]]
 binding = "DEVICES"
-id = "placeholder-id"
-preview_id = "placeholder-preview-id"
+id = "142615e17bc84dc7adbd9e64d0b29410"

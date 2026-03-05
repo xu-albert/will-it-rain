@@ -5,6 +5,7 @@ export interface Env {
   APPLE_PRIVATE_KEY: string;
   WEATHERKIT_SERVICE_ID: string;
   APNS_TOPIC: string;
+  APNS_ENV: string; // "sandbox" or "production"
 }
 
 export interface DeviceRegistration {

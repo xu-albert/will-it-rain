@@ -52,7 +52,8 @@ async function sendNotification(
 ): Promise<void> {
   const token = await generateAPNsJWT(env);
 
-  const resp = await fetch(`https://api.push.apple.com/3/device/${deviceToken}`, {
+  const host = env.APNS_ENV === 'sandbox' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
+  const resp = await fetch(`https://${host}/3/device/${deviceToken}`, {
     method: 'POST',
     headers: {
       Authorization: `bearer ${token}`,
