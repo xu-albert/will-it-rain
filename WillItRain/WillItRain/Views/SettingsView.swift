@@ -1,16 +1,15 @@
 import SwiftUI
 
 struct SettingsView: View {
-    @Binding var settings: NotificationSettings
+    @ObservedObject var settings: NotificationSettings
     @Environment(\.dismiss) private var dismiss
 
     private let leadTimeOptions = [10, 15, 20, 30, 60]
-    private let chartHourOptions = [6, 12, 24]
 
     var body: some View {
         NavigationView {
             Form {
-                Section("Notifications") {
+                Section {
                     Picker("Lead Time", selection: $settings.leadTime) {
                         ForEach(leadTimeOptions, id: \.self) { minutes in
                             Text("\(minutes) min").tag(minutes)
@@ -19,6 +18,14 @@ struct SettingsView: View {
 
                     Toggle("Rain Starting", isOn: $settings.rainStartEnabled)
                     Toggle("Rain Ending", isOn: $settings.rainEndEnabled)
+                } header: {
+                    Text("Notifications")
+                } footer: {
+                    Text("Lead time is how far in advance you'll be notified before rain starts or stops.")
+                }
+
+                Section("Temperature") {
+                    Toggle("Use Celsius", isOn: $settings.useCelsius)
                 }
 
                 Section("Quiet Hours") {
@@ -27,14 +34,6 @@ struct SettingsView: View {
                     if settings.quietHoursEnabled {
                         DatePicker("Start", selection: $settings.quietHoursStart, displayedComponents: .hourAndMinute)
                         DatePicker("End", selection: $settings.quietHoursEnd, displayedComponents: .hourAndMinute)
-                    }
-                }
-
-                Section("Chart") {
-                    Picker("Time Range", selection: $settings.chartHours) {
-                        ForEach(chartHourOptions, id: \.self) { hours in
-                            Text("\(hours) hours").tag(hours)
-                        }
                     }
                 }
             }

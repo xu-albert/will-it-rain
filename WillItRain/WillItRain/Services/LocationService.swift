@@ -1,6 +1,17 @@
 import CoreLocation
 import Combine
 
+enum LocationError: LocalizedError {
+    case permissionDenied
+
+    var errorDescription: String? {
+        switch self {
+        case .permissionDenied:
+            return "Location access is needed to show weather for your area."
+        }
+    }
+}
+
 @MainActor
 final class LocationService: NSObject, ObservableObject {
     private let manager = CLLocationManager()
@@ -18,7 +29,14 @@ final class LocationService: NSObject, ObservableObject {
     }
 
     func currentLocation() async throws -> CLLocation {
-        manager.requestWhenInUseAuthorization()
+        let status = manager.authorizationStatus
+        if status == .denied || status == .restricted {
+            throw LocationError.permissionDenied
+        }
+
+        if status == .notDetermined {
+            manager.requestWhenInUseAuthorization()
+        }
 
         return try await withCheckedThrowingContinuation { continuation in
             self.continuation = continuation

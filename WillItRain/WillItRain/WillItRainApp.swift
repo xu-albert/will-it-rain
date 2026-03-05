@@ -17,7 +17,7 @@ struct WillItRainApp: App {
         }
         .onChange(of: scenePhase) { phase in
             if phase == .background {
-                scheduleBackgroundRefresh()
+                scheduleBackgroundRefresh(after: 15 * 60)
             }
         }
     }
@@ -34,19 +34,19 @@ struct WillItRainApp: App {
         }
     }
 
-    private func scheduleBackgroundRefresh() {
+    private func scheduleBackgroundRefresh(after interval: TimeInterval) {
+        let clamped = min(max(interval, 2 * 60), 60 * 60)
         let request = BGAppRefreshTaskRequest(identifier: "com.willitrain.refresh")
-        request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
+        request.earliestBeginDate = Date(timeIntervalSinceNow: clamped)
         do {
             try BGTaskScheduler.shared.submit(request)
+            print("[Background] Scheduled refresh in \(Int(clamped))s")
         } catch {
             print("Background task scheduling failed: \(error)")
         }
     }
 
     private func handleBackgroundRefresh(_ task: BGAppRefreshTask) {
-        scheduleBackgroundRefresh()
-
         let operation = Task {
             do {
                 let locationService = LocationService()
@@ -55,10 +55,14 @@ struct WillItRainApp: App {
                 let name = await locationService.reverseGeocode(location)
                 let forecast = try await weatherService.fetch(location: location, locationName: name)
 
-                var settings = NotificationSettings.load()
-                NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: &settings)
+                let settings = NotificationSettings()
+                NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: settings)
+
+                let nextInterval = forecast.nextPollInterval(leadTimeMinutes: settings.leadTime)
+                scheduleBackgroundRefresh(after: nextInterval)
                 task.setTaskCompleted(success: true)
             } catch {
+                scheduleBackgroundRefresh(after: 15 * 60)
                 task.setTaskCompleted(success: false)
             }
         }
