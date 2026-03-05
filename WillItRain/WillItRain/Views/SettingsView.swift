@@ -9,7 +9,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationView {
             Form {
-                Section("Notifications") {
+                Section {
                     Picker("Lead Time", selection: $settings.leadTime) {
                         ForEach(leadTimeOptions, id: \.self) { minutes in
                             Text("\(minutes) min").tag(minutes)
@@ -18,6 +18,10 @@ struct SettingsView: View {
 
                     Toggle("Rain Starting", isOn: $settings.rainStartEnabled)
                     Toggle("Rain Ending", isOn: $settings.rainEndEnabled)
+                } header: {
+                    Text("Notifications")
+                } footer: {
+                    Text("Lead time is how far in advance you'll be notified before rain starts or stops.")
                 }
 
                 Section("Temperature") {
