@@ -1,4 +1,4 @@
-import { Env, DeviceRegistration } from './types';
+import { Env, DeviceRegistration, CronLogEntry, GridLogEntry } from './types';
 import { getDevicesByGrid, gridCenter, toGridKey } from './grid';
 import { fetchForecast } from './weatherkit';
 import { sendRainAlert } from './apns';
@@ -16,6 +16,21 @@ export default {
       return handleUnregister(request, env);
     }
 
+    if (request.method === 'GET' && url.pathname === '/debug/status') {
+      const tokenPrefix = url.searchParams.get('token');
+      if (!tokenPrefix) {
+        return new Response(JSON.stringify({ error: 'Pass ?token=<first 8+ chars of your device token>' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return handleDebugStatus(tokenPrefix, env);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/debug/logs') {
+      return handleDebugLogs(env);
+    }
+
     if (request.method === 'POST' && url.pathname === '/test-rain') {
       return handleTestRain(request, env);
     }
@@ -31,24 +46,49 @@ export default {
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const grids = await getDevicesByGrid(env);
     console.log(`[Cron] Processing ${grids.length} grid cells`);
+    const now = Date.now();
+    const cronLog: CronLogEntry = {
+      timestamp: new Date(now).toISOString(),
+      gridResults: [],
+    };
 
     const promises = grids.map(async (grid) => {
       const { lat, lon } = gridCenter(grid.gridKey);
+      const gridLog: GridLogEntry = {
+        gridKey: grid.gridKey,
+        lat,
+        lon,
+        deviceCount: grid.devices.length,
+        deviceTokenPrefixes: grid.devices.map((d) => d.token.substring(0, 8)),
+        forecastResult: 'no_data',
+        notificationsSent: [],
+      };
+
       try {
         const forecast = await fetchForecast(lat, lon, env);
         const minutes = forecast.forecastNextHour?.minutes;
-        if (!minutes || minutes.length === 0) return;
+        if (!minutes || minutes.length === 0) {
+          cronLog.gridResults.push(gridLog);
+          return;
+        }
 
         // Find first minute with precipitation
-        const now = Date.now();
         const rainStart = minutes.find(
           (m) => m.precipitationChance > 0.3 && m.precipitationIntensity > 0
         );
 
-        if (!rainStart) return;
+        if (!rainStart) {
+          gridLog.forecastResult = 'clear';
+          cronLog.gridResults.push(gridLog);
+          return;
+        }
 
         const rainStartTime = new Date(rainStart.startTime).getTime();
         const minutesUntilRain = Math.round((rainStartTime - now) / 60000);
+        gridLog.forecastResult = 'rain';
+        gridLog.minutesUntilRain = minutesUntilRain;
+        gridLog.precipChance = rainStart.precipitationChance;
+        gridLog.precipIntensity = rainStart.precipitationIntensity;
 
         // Notify each device in this grid if rain is within their lead time
         for (const device of grid.devices) {
@@ -64,6 +104,7 @@ export default {
             try {
               await sendRainAlert(device.token, minutesUntilRain, env);
               await env.DEVICES.put(metaKey, now.toString(), { expirationTtl: 3600 });
+              gridLog.notificationsSent.push(device.token.substring(0, 8));
               console.log(`[Cron] Notified device in grid ${grid.gridKey}, rain in ${minutesUntilRain}m`);
             } catch (err) {
               console.error(`[Cron] Failed to notify device: ${err}`);
@@ -71,11 +112,30 @@ export default {
           }
         }
       } catch (err) {
+        gridLog.forecastResult = 'error';
+        gridLog.error = String(err);
         console.error(`[Cron] Failed to fetch weather for grid ${grid.gridKey}: ${err}`);
       }
+      cronLog.gridResults.push(gridLog);
     });
 
     await Promise.all(promises);
+
+    // Write the log entry to KV, keep last 50 runs
+    try {
+      const logIndex: string[] = JSON.parse(await env.DEVICES.get('log:index') || '[]');
+      const logKey = `log:${now}`;
+      logIndex.push(logKey);
+      // Trim to last 50
+      const toDelete = logIndex.splice(0, Math.max(0, logIndex.length - 50));
+      await Promise.all([
+        env.DEVICES.put(logKey, JSON.stringify(cronLog), { expirationTtl: 86400 * 3 }),
+        env.DEVICES.put('log:index', JSON.stringify(logIndex)),
+        ...toDelete.map((k) => env.DEVICES.delete(k)),
+      ]);
+    } catch (err) {
+      console.error(`[Cron] Failed to write log: ${err}`);
+    }
   },
 };
 
@@ -154,6 +214,67 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
       headers: { 'Content-Type': 'application/json' },
     });
   }
+}
+
+async function handleDebugStatus(tokenPrefix: string, env: Env): Promise<Response> {
+  // Find the device by token prefix
+  let matchedDevice: DeviceRegistration | null = null;
+  let cursor: string | undefined;
+  do {
+    const list = await env.DEVICES.list({ prefix: 'device:', cursor });
+    for (const key of list.keys) {
+      // key.name is "device:<full_token>"
+      const token = key.name.substring('device:'.length);
+      if (token.startsWith(tokenPrefix)) {
+        matchedDevice = await env.DEVICES.get(key.name, 'json') as DeviceRegistration;
+        break;
+      }
+    }
+    if (matchedDevice) break;
+    cursor = list.list_complete ? undefined : list.cursor;
+  } while (cursor);
+
+  if (!matchedDevice) {
+    return new Response(JSON.stringify({ error: 'No device found matching that token prefix' }), {
+      status: 404,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  // Get last notification time
+  const notifiedRaw = await env.DEVICES.get(`notified:${matchedDevice.token}`);
+  const lastNotified = notifiedRaw ? new Date(parseInt(notifiedRaw)).toISOString() : null;
+
+  return new Response(JSON.stringify({
+    device: {
+      tokenPrefix: matchedDevice.token.substring(0, 8),
+      lat: matchedDevice.lat,
+      lon: matchedDevice.lon,
+      gridKey: toGridKey(matchedDevice.lat, matchedDevice.lon),
+      leadTimeMinutes: matchedDevice.leadTimeMinutes,
+      registeredAt: matchedDevice.registeredAt,
+    },
+    lastNotified,
+  }, null, 2), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+async function handleDebugLogs(env: Env): Promise<Response> {
+  const logIndex: string[] = JSON.parse(await env.DEVICES.get('log:index') || '[]');
+
+  // Fetch the last 10 log entries
+  const recentKeys = logIndex.slice(-10);
+  const logs = await Promise.all(
+    recentKeys.map(async (key) => {
+      const raw = await env.DEVICES.get(key);
+      return raw ? JSON.parse(raw) as CronLogEntry : null;
+    })
+  );
+
+  return new Response(JSON.stringify(logs.filter(Boolean).reverse(), null, 2), {
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 async function handleRegister(request: Request, env: Env): Promise<Response> {

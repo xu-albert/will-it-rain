@@ -21,6 +21,25 @@ export interface GridCell {
   devices: DeviceRegistration[];
 }
 
+export interface GridLogEntry {
+  gridKey: string;
+  lat: number;
+  lon: number;
+  deviceCount: number;
+  deviceTokenPrefixes: string[];
+  forecastResult: 'clear' | 'rain' | 'no_data' | 'error';
+  minutesUntilRain?: number;
+  precipChance?: number;
+  precipIntensity?: number;
+  notificationsSent: string[];
+  error?: string;
+}
+
+export interface CronLogEntry {
+  timestamp: string;
+  gridResults: GridLogEntry[];
+}
+
 export interface WeatherKitForecast {
   forecastNextHour?: {
     minutes: Array<{
