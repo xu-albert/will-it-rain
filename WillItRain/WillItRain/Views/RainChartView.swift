@@ -145,16 +145,12 @@ struct PrecipChart: View {
             selectionMarks
         }
         .chartXAxis {
-            AxisMarks(values: .stride(by: strideBy, count: strideCount)) { value in
+            AxisMarks(values: .stride(by: strideBy, count: strideCount)) { _ in
                 AxisGridLine(stroke: StrokeStyle(lineWidth: 0.3))
                     .foregroundStyle(.white.opacity(0.1))
-                AxisValueLabel {
-                    if let date = value.as(Date.self) {
-                        Text(axisLabel(date))
-                            .font(.system(size: 10))
-                            .foregroundColor(.white.opacity(0.7))
-                    }
-                }
+                AxisValueLabel(format: strideBy == .minute ? .dateTime.hour().minute() : .dateTime.hour(.defaultDigits(amPM: .abbreviated)))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.white.opacity(0.7))
             }
         }
         .chartYAxis {
@@ -261,10 +257,4 @@ struct PrecipChart: View {
         return f.string(from: date)
     }
 
-    private func axisLabel(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = strideBy == .minute ? "m" : "ha"
-        let s = f.string(from: date)
-        return strideBy == .minute ? ":\(s)" : s.lowercased()
-    }
 }
