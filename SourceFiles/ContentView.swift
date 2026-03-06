@@ -211,7 +211,7 @@ struct ContentView: View {
                 Text("Location Access Required")
                     .font(.system(size: 18, weight: .semibold))
                     .foregroundColor(.white)
-                Text("Gonna Rain? needs your location to show local weather. Please enable it in Settings.")
+                Text("Will It Rain needs your location to show local weather. Please enable it in Settings.")
                     .foregroundColor(.white.opacity(0.7))
                     .font(.system(size: 15))
                     .multilineTextAlignment(.center)

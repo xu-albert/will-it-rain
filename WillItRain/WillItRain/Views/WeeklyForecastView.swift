@@ -18,7 +18,7 @@ struct WeeklyForecastView: View {
                     VStack(spacing: 6) {
                         Text("\(Int(day.precipChance * 100))%")
                             .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundColor(day.precipChance > 0 ? .white : .white.opacity(0.35))
+                            .foregroundColor(day.precipChance > 0 ? .white : .white.opacity(0.55))
 
                         RoundedRectangle(cornerRadius: 4)
                             .fill(barColor(for: day.precipChance))
@@ -31,12 +31,12 @@ struct WeeklyForecastView: View {
                         if let high = day.highTemp {
                             Text("\(displayTemp(high))°")
                                 .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(.white.opacity(0.6))
+                                .foregroundColor(.white.opacity(0.75))
                         }
 
                         Text(day.dayName.prefix(3))
                             .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(.white.opacity(0.7))
+                            .foregroundColor(.white.opacity(0.8))
                     }
                     .frame(maxWidth: .infinity)
                 }
@@ -46,9 +46,13 @@ struct WeeklyForecastView: View {
         }
         .padding(.vertical, 12)
         .background(
-            RoundedRectangle(cornerRadius: 16)
-                .fill(.ultraThinMaterial.opacity(0.3))
-                .padding(.horizontal, 8)
+            ZStack {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color.black.opacity(0.15))
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(.ultraThinMaterial.opacity(0.5))
+            }
+            .padding(.horizontal, 8)
         )
     }
 
@@ -68,7 +72,7 @@ struct WeeklyForecastView: View {
         } else if chance > 0 {
             return .cyan.opacity(0.35)
         } else {
-            return .white.opacity(0.08)
+            return .white.opacity(0.12)
         }
     }
 }

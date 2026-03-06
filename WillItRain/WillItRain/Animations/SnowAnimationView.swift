@@ -52,6 +52,7 @@ struct SnowAnimationView: View {
     let intensity: PrecipitationIntensity
 
     @State private var state = SnowState()
+    @State private var lastIntensity: PrecipitationIntensity?
 
     private var flakeCount: Int {
         switch intensity {
@@ -66,6 +67,10 @@ struct SnowAnimationView: View {
         GeometryReader { geo in
             TimelineView(.animation) { timeline in
                 Canvas { context, size in
+                    if intensity != lastIntensity {
+                        state.flakes = []
+                        DispatchQueue.main.async { lastIntensity = intensity }
+                    }
                     state.setup(count: flakeCount, width: size.width, height: size.height)
                     state.update(now: timeline.date, width: size.width, height: size.height)
 

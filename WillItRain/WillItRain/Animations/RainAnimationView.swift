@@ -44,6 +44,7 @@ struct RainAnimationView: View {
     let intensity: PrecipitationIntensity
 
     @State private var state = RainState()
+    @State private var lastIntensity: PrecipitationIntensity?
 
     private var dropCount: Int {
         switch intensity {
@@ -58,6 +59,10 @@ struct RainAnimationView: View {
         GeometryReader { geo in
             TimelineView(.animation) { timeline in
                 Canvas { context, size in
+                    if intensity != lastIntensity {
+                        state.drops = []
+                        DispatchQueue.main.async { lastIntensity = intensity }
+                    }
                     state.setup(count: dropCount, width: size.width, height: size.height)
                     state.update(now: timeline.date, width: size.width, height: size.height)
 

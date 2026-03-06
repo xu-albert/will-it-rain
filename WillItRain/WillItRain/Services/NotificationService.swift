@@ -7,7 +7,7 @@ final class NotificationService {
 
     func requestPermission() async -> Bool {
         do {
-            return try await center.requestAuthorization(options: [.alert, .sound, .badge])
+            return try await center.requestAuthorization(options: [.alert, .sound])
         } catch {
             return false
         }

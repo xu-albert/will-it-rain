@@ -219,17 +219,11 @@ struct RainForecast {
         if minutes < 60 {
             return "\(minutes) min"
         }
-        let totalHours = minutes / 60
+        let h = minutes / 60
         let m = minutes % 60
-        if totalHours >= 48 {
-            let d = totalHours / 24
-            let h = totalHours % 24
-            if h == 0 { return "\(d)d" }
-            return "\(d)d \(h)h"
-        }
         if m == 0 {
-            return "\(totalHours)h"
+            return "\(h)h"
         }
-        return "\(totalHours)h \(m)m"
+        return "\(h)h \(m)m"
     }
 }
