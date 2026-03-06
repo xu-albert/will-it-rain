@@ -19,6 +19,8 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var currentCondition: WeatherCondition = .clear
     @State private var debugConditionOverride: Bool = false
+    @State private var debugIntensity: PrecipitationIntensity = .moderate
+    @State private var debugShowHail: Bool = false
     @State private var tick: Date = Date()
 
     private let weatherService = WeatherService()
@@ -282,38 +284,76 @@ struct ContentView: View {
     #if DEBUG
     @ViewBuilder
     private var debugPrecipitationOverlay: some View {
-        switch currentCondition {
-        case .raining, .rainingNight:
-            RainAnimationView(intensity: .moderate)
-        case .snowing, .snowingNight:
-            SnowAnimationView(intensity: .moderate)
-        default:
-            EmptyView()
+        if debugShowHail {
+            HailAnimationView(intensity: debugIntensity)
+        } else {
+            switch currentCondition {
+            case .raining, .rainingNight:
+                RainAnimationView(intensity: debugIntensity)
+            case .snowing, .snowingNight:
+                SnowAnimationView(intensity: debugIntensity)
+            default:
+                EmptyView()
+            }
         }
     }
 
+    private let debugIntensities: [PrecipitationIntensity] = [.light, .moderate, .heavy]
+
     private var debugConditionPicker: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(WeatherCondition.allCases, id: \.self) { condition in
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.5)) {
-                            debugConditionOverride = true
-                            currentCondition = condition
+        VStack(spacing: 6) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(WeatherCondition.allCases, id: \.self) { condition in
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.5)) {
+                                debugConditionOverride = true
+                                currentCondition = condition
+                            }
+                        } label: {
+                            Text(condition.debugLabel)
+                                .font(.system(size: 11, weight: currentCondition == condition ? .bold : .medium))
+                                .foregroundColor(currentCondition == condition ? .white : .white.opacity(0.6))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(
+                                    Capsule().fill(currentCondition == condition ? .white.opacity(0.3) : .white.opacity(0.1))
+                                )
                         }
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+
+            HStack(spacing: 8) {
+                ForEach(debugIntensities, id: \.self) { intensity in
+                    Button {
+                        debugIntensity = intensity
                     } label: {
-                        Text(condition.debugLabel)
-                            .font(.system(size: 11, weight: currentCondition == condition ? .bold : .medium))
-                            .foregroundColor(currentCondition == condition ? .white : .white.opacity(0.6))
+                        Text(intensity.rawValue)
+                            .font(.system(size: 11, weight: debugIntensity == intensity ? .bold : .medium))
+                            .foregroundColor(debugIntensity == intensity ? .white : .white.opacity(0.6))
                             .padding(.horizontal, 10)
                             .padding(.vertical, 6)
                             .background(
-                                Capsule().fill(currentCondition == condition ? .white.opacity(0.3) : .white.opacity(0.1))
+                                Capsule().fill(debugIntensity == intensity ? .white.opacity(0.3) : .white.opacity(0.1))
                             )
                     }
                 }
+
+                Button {
+                    debugShowHail.toggle()
+                } label: {
+                    Text("Hail")
+                        .font(.system(size: 11, weight: debugShowHail ? .bold : .medium))
+                        .foregroundColor(debugShowHail ? .white : .white.opacity(0.6))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule().fill(debugShowHail ? .white.opacity(0.3) : .white.opacity(0.1))
+                        )
+                }
             }
-            .padding(.horizontal, 16)
         }
         .padding(.bottom, 4)
     }
