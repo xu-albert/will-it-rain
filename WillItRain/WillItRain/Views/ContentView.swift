@@ -19,6 +19,7 @@ struct ContentView: View {
     @State private var appState: AppState = .loading
     @StateObject private var settings = NotificationSettings()
     @State private var showSettings = false
+    @State private var showTravelLocationPrompt = false
     @State private var currentCondition: WeatherCondition = .clear
     @State private var tick: Date = Date()
 
@@ -55,6 +56,15 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView(settings: settings)
                 .presentationDetents([.medium])
+        }
+        .alert("Get rain alerts everywhere?", isPresented: $showTravelLocationPrompt) {
+            Button("Enable") {
+                locationService.requestAlwaysPermission()
+                locationService.startMonitoringSignificantLocationChanges()
+            }
+            Button("Not Now", role: .cancel) { }
+        } message: {
+            Text("Consider allowing background location so you get rain notifications everywhere, even if you don't open the app to update your location.")
         }
     }
 
@@ -191,7 +201,7 @@ struct ContentView: View {
                 Text("Location Access Required")
                     .font(.system(size: 18, weight: .semibold))
                     .foregroundColor(.white)
-                Text("Will It Rain needs your location to show local weather. Please enable it in Settings.")
+                Text("Gonna Rain? needs your location to show local weather. Please enable it in Settings.")
                     .foregroundColor(.white.opacity(0.7))
                     .font(.system(size: 15))
                     .multilineTextAlignment(.center)
@@ -244,6 +254,11 @@ struct ContentView: View {
             appState = .loaded(forecast)
 
             NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: settings)
+
+            // Check if user has traveled — prompt for "Always" location if so
+            if locationService.hasUserTraveled(from: location) {
+                showTravelLocationPrompt = true
+            }
 
             // Register for remote push notifications
             let granted = await NotificationService.shared.requestPermission()

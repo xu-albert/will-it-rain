@@ -16,6 +16,14 @@ export default {
       return handleUnregister(request, env);
     }
 
+    if (request.method === 'POST' && url.pathname === '/test-rain') {
+      return handleTestRain(request, env);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/test-cron') {
+      return handleTestCron(request, env);
+    }
+
     return new Response('Not found', { status: 404 });
   },
 
@@ -39,7 +47,7 @@ export default {
 
         if (!rainStart) return;
 
-        const rainStartTime = new Date(rainStart.startDate).getTime();
+        const rainStartTime = new Date(rainStart.startTime).getTime();
         const minutesUntilRain = Math.round((rainStartTime - now) / 60000);
 
         // Notify each device in this grid if rain is within their lead time
@@ -70,6 +78,83 @@ export default {
     await Promise.all(promises);
   },
 };
+
+async function handleTestRain(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { token?: string; minutesUntilRain?: number };
+
+  if (!body.token) {
+    return new Response(JSON.stringify({ error: 'Missing token' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  const minutesUntilRain = body.minutesUntilRain ?? 10;
+
+  try {
+    await sendRainAlert(body.token, minutesUntilRain, env);
+    return new Response(JSON.stringify({ ok: true, minutesUntilRain }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: String(err) }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+async function handleTestCron(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { token?: string; lat?: number; lon?: number };
+
+  if (!body.token || body.lat == null || body.lon == null) {
+    return new Response(JSON.stringify({ error: 'Missing token, lat, or lon' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  try {
+    const forecast = await fetchForecast(body.lat, body.lon, env);
+    const minutes = forecast.forecastNextHour?.minutes;
+
+    if (!minutes || minutes.length === 0) {
+      return new Response(JSON.stringify({ ok: true, result: 'no_forecast_data' }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    const now = Date.now();
+    const rainStart = minutes.find(
+      (m) => m.precipitationChance > 0.3 && m.precipitationIntensity > 0
+    );
+
+    if (!rainStart) {
+      return new Response(JSON.stringify({ ok: true, result: 'no_rain', minutesChecked: minutes.length }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    const rainStartTime = new Date(rainStart.startTime).getTime();
+    const minutesUntilRain = Math.round((rainStartTime - now) / 60000);
+
+    await sendRainAlert(body.token, minutesUntilRain, env);
+    return new Response(JSON.stringify({
+      ok: true,
+      result: 'rain_detected',
+      minutesUntilRain,
+      precipitationChance: rainStart.precipitationChance,
+      precipitationIntensity: rainStart.precipitationIntensity,
+    }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: String(err) }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+}
 
 async function handleRegister(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { token?: string; lat?: number; lon?: number; leadTimeMinutes?: number };

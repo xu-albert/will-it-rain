@@ -24,7 +24,7 @@ export interface GridCell {
 export interface WeatherKitForecast {
   forecastNextHour?: {
     minutes: Array<{
-      startDate: string;
+      startTime: string;
       precipitationChance: number;
       precipitationIntensity: number;
     }>;

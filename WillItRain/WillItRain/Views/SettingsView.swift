@@ -28,6 +28,26 @@ struct SettingsView: View {
                     Toggle("Use Celsius", isOn: $settings.useCelsius)
                 }
 
+                Section {
+                    Button {
+                        if let url = URL(string: UIApplication.openSettingsURLString) {
+                            UIApplication.shared.open(url)
+                        }
+                    } label: {
+                        HStack {
+                            Text("Location & Permissions")
+                                .foregroundColor(.primary)
+                            Spacer()
+                            Image(systemName: "arrow.up.forward.app")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("Location Settings")
+                } footer: {
+                    Text("Change location settings to \"Always Allow\" to get precipitation alerts everywhere, even if you never open the app.")
+                }
+
                 Section("Quiet Hours") {
                     Toggle("Enable Quiet Hours", isOn: $settings.quietHoursEnabled)
 
