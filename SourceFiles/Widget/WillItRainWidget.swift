@@ -79,7 +79,7 @@ struct WillItRainSmallWidget: Widget {
         StaticConfiguration(kind: kind, provider: RainWidgetProvider()) { entry in
             SmallWidgetView(entry: entry)
         }
-        .configurationDisplayName("Will It Rain?")
+        .configurationDisplayName("Gonna Rain?")
         .description("Quick precipitation status.")
         .supportedFamilies([.systemSmall])
     }
@@ -92,7 +92,7 @@ struct WillItRainMediumWidget: Widget {
         StaticConfiguration(kind: kind, provider: RainWidgetProvider()) { entry in
             MediumWidgetView(entry: entry)
         }
-        .configurationDisplayName("Will It Rain? (Wide)")
+        .configurationDisplayName("Gonna Rain? (Wide)")
         .description("Status with precipitation chart.")
         .supportedFamilies([.systemMedium])
     }

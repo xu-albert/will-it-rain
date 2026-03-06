@@ -9,6 +9,12 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>
+		<string>location</string>
+		<string>remote-notification</string>
 	</array>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Gonna Rain? uses your location in the background to notify you when rain is approaching, even when the app is closed.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Gonna Rain? uses your location to show weather and rain forecasts for your area.</string>
 </dict>
 </plist>
