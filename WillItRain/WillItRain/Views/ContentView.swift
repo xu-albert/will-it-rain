@@ -64,7 +64,17 @@ struct ContentView: View {
             debugConditionPicker
         }
         #endif
-        .task { await fetchWeather() }
+        .task {
+            if let scenario = ScreenshotScenario.from(launchArgs: CommandLine.arguments) {
+                let forecast = scenario.forecast
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    currentCondition = scenario.condition
+                }
+                appState = .loaded(forecast)
+            } else {
+                await fetchWeather()
+            }
+        }
         .onReceive(uiTimer) { tick = $0 }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             if case .error(.locationDenied) = appState {
@@ -172,11 +182,11 @@ struct ContentView: View {
             WeeklyForecastView(days: forecast.dailySummaries, useCelsius: settings.useCelsius)
                 .padding(.bottom, 20)
 
-            // Attribution
+            // Apple Weather attribution (required by WeatherKit guidelines 5.2.5)
             Link(destination: URL(string: "https://weatherkit.apple.com/legal-attribution.html")!) {
                 HStack(spacing: 4) {
-                    Image(systemName: "bolt.fill")
-                        .font(.system(size: 10))
+                    Image(systemName: "apple.logo")
+                        .font(.system(size: 12))
                     Text("Weather")
                         .font(.system(size: 12, weight: .medium))
                 }
