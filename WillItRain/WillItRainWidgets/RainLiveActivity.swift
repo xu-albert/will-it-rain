@@ -140,12 +140,16 @@ private struct HeroCountdownText: View {
     var body: some View {
         if let target = state.countdownTarget, target > .now {
             HStack(alignment: .firstTextBaseline, spacing: 3) {
+                // No .fixedSize here: forcing ideal-width measurement of the
+                // auto-ticking timer text crashes the extension's layout pass.
+                // Cap generously and scale down rather than truncate or wrap.
                 Text(timerInterval: Date.now...target, countsDown: true, showsHours: false)
                     .font(.system(size: fontSize, weight: .heavy))
                     .monospacedDigit()
                     .foregroundStyle(.white)
-                    .frame(maxWidth: fontSize * 2.6)
-                    .multilineTextAlignment(.trailing)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .frame(maxWidth: fontSize * 3.4, alignment: .leading)
                 Text("min")
                     .font(.system(size: fontSize * 0.52, weight: .bold))
                     .foregroundStyle(.white.opacity(0.72))

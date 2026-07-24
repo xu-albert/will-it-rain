@@ -69,6 +69,12 @@ struct ContentView: View {
         }
         #endif
         .task {
+            #if DEBUG
+            if CommandLine.arguments.contains("-liveActivityScenario") {
+                await LiveActivityService.startDebugScenarioIfRequested(launchArgs: CommandLine.arguments)
+                return
+            }
+            #endif
             if let scenario = ScreenshotScenario.from(launchArgs: CommandLine.arguments) {
                 let forecast = scenario.forecast
                 withAnimation(.easeInOut(duration: 0.3)) {
