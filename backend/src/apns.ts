@@ -40,20 +40,18 @@ export async function sendRainAlert(
   intensity: Intensity = 'light'
 ): Promise<void> {
   const rain = intensity === 'light' ? 'Rain' : `${intensity[0].toUpperCase()}${intensity.slice(1)} rain`;
-  const advice =
-    intensity === 'heavy' ? ' Plan for a downpour.' : intensity === 'moderate' ? ' Bring a jacket.' : ' Grab an umbrella.';
 
   let title: string;
   let body: string;
   if (minutesUntilRain <= 0) {
     title = 'Rain starting now';
-    body = `${rain} is beginning in your area.${advice}`;
+    body = `${rain} is beginning in your area.`;
   } else if (minutesUntilRain <= 5) {
     title = 'Rain in a few minutes';
-    body = `${rain} starts in the next few minutes.${advice}`;
+    body = `${rain} starts in the next few minutes.`;
   } else {
     title = `Rain in ~${minutesUntilRain} min`;
-    body = `${rain} expected in about ${minutesUntilRain} minutes.${advice}`;
+    body = `${rain} expected in about ${minutesUntilRain} minutes.`;
   }
   await sendNotification(deviceToken, { title, body }, 1, env);
 }
@@ -65,8 +63,8 @@ export async function sendRainEndAlert(
 ): Promise<void> {
   const body =
     minutesUntilEnd <= 5
-      ? 'The rain should ease off in the next few minutes.'
-      : `The rain should ease off in about ${minutesUntilEnd} minutes.`;
+      ? 'The rain should stop in the next few minutes.'
+      : `The rain should stop in about ${minutesUntilEnd} minutes.`;
   await sendNotification(deviceToken, { title: 'Rain ending soon', body }, 0, env);
 }
 

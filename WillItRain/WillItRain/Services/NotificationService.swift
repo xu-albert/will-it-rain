@@ -77,7 +77,7 @@ final class NotificationService {
                         let type = current.type.rawValue
                         scheduleImmediate(
                             title: "\(type) ending soon",
-                            body: "\(type) should ease off around \(formatter.string(from: current.end)).",
+                            body: "\(type) should stop around \(formatter.string(from: current.end)).",
                             identifier: "precip-end"
                         )
                         settings.lastNotifiedPrecipEnd = current.end
