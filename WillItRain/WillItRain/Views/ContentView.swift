@@ -278,6 +278,7 @@ struct ContentView: View {
             appState = .loaded(forecast)
 
             NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: settings)
+            LiveActivityService.shared.sync(forecast: forecast, settings: settings)
 
             // Check if user has traveled — prompt for "Always" location if so
             if locationService.hasUserTraveled(from: location) {

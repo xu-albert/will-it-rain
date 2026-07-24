@@ -48,6 +48,43 @@ final class PushRegistrationService {
         }
     }
 
+    /// Send a Live Activity push token to the backend so it can push
+    /// content-state updates (apns-push-type: liveactivity).
+    func registerLiveActivityToken(_ activityToken: String) async {
+        guard let token = UserDefaults.standard.string(forKey: "pushDeviceToken"),
+              let url = URL(string: "\(baseURL)/register-activity") else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONEncoder().encode(
+            ["token": token, "activityToken": activityToken]
+        )
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                print("[Push] Live Activity token registered")
+            } else {
+                print("[Push] Live Activity token registration returned non-200")
+            }
+        } catch {
+            print("[Push] Live Activity token registration failed: \(error)")
+        }
+    }
+
+    /// Tell the backend the current Live Activity ended.
+    func unregisterLiveActivity() async {
+        guard let token = UserDefaults.standard.string(forKey: "pushDeviceToken"),
+              let url = URL(string: "\(baseURL)/unregister-activity") else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONEncoder().encode(["token": token])
+        _ = try? await URLSession.shared.data(for: request)
+    }
+
     func unregister() async {
         guard let token = UserDefaults.standard.string(forKey: "pushDeviceToken"),
               let url = URL(string: "\(baseURL)/unregister") else { return }
