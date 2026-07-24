@@ -85,6 +85,14 @@ final class WeatherService {
         }
     }
 
+    /// A point counts as precipitation when a specific amount is predicted (`intensity != .none`)
+    /// OR when rain is more likely than not (`probability >= 0.5`). Keying off amount alone made the
+    /// app show "Clear" when WeatherKit reported a high chance but a low probability-weighted amount —
+    /// the "says nothing's happening when it's going to rain" bug. Adding the chance gate only *adds*
+    /// detections (never removes), and 0.5 keeps marginal <50% forecasts from crying wolf. This makes
+    /// the in-app status agree with the backend, which already gates on precipitation chance.
+    private static let likelyRainProbability = 0.5
+
     private func findPrecipitationPeriods(from dataPoints: [ChartDataPoint]) -> [PrecipitationPeriod] {
         var periods: [PrecipitationPeriod] = []
         var periodStart: Date?
@@ -92,14 +100,17 @@ final class WeatherService {
         var peakIntensity: PrecipitationIntensity = .none
 
         for point in dataPoints {
-            if point.intensity != .none {
+            let isWet = point.intensity != .none || point.probability >= Self.likelyRainProbability
+            if isWet {
+                // If it's likely to rain but the predicted amount rounds to "none", call it light.
+                let intensity = point.intensity == .none ? .light : point.intensity
                 if periodStart == nil {
                     periodStart = point.date
-                    periodType = point.type
-                    peakIntensity = point.intensity
+                    periodType = point.type == .none ? .rain : point.type
+                    peakIntensity = intensity
                 } else {
-                    if point.intensity > peakIntensity {
-                        peakIntensity = point.intensity
+                    if intensity > peakIntensity {
+                        peakIntensity = intensity
                     }
                     if point.type != .none && point.type != periodType {
                         // Type changed — keep the dominant type

@@ -14,6 +14,8 @@ export interface DeviceRegistration {
   lon: number;
   leadTimeMinutes: number;
   registeredAt: string;
+  rainStartEnabled?: boolean;
+  rainEndEnabled?: boolean;
 }
 
 export interface GridCell {

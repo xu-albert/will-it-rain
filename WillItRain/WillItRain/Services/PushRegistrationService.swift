@@ -14,7 +14,13 @@ final class PushRegistrationService {
     }
 
     /// Register or update location with the backend
-    func registerLocation(lat: Double, lon: Double, leadTimeMinutes: Int) async {
+    func registerLocation(
+        lat: Double,
+        lon: Double,
+        leadTimeMinutes: Int,
+        rainStartEnabled: Bool = true,
+        rainEndEnabled: Bool = true
+    ) async {
         guard let token = UserDefaults.standard.string(forKey: "pushDeviceToken"),
               let url = URL(string: "\(baseURL)/register") else { return }
 
@@ -22,7 +28,14 @@ final class PushRegistrationService {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONEncoder().encode(
-            RegistrationPayload(token: token, lat: lat, lon: lon, leadTimeMinutes: leadTimeMinutes)
+            RegistrationPayload(
+                token: token,
+                lat: lat,
+                lon: lon,
+                leadTimeMinutes: leadTimeMinutes,
+                rainStartEnabled: rainStartEnabled,
+                rainEndEnabled: rainEndEnabled
+            )
         )
 
         do {
@@ -54,4 +67,6 @@ private struct RegistrationPayload: Encodable {
     let lat: Double
     let lon: Double
     let leadTimeMinutes: Int
+    let rainStartEnabled: Bool
+    let rainEndEnabled: Bool
 }

@@ -293,7 +293,9 @@ struct ContentView: View {
                 await PushRegistrationService.shared.registerLocation(
                     lat: location.coordinate.latitude,
                     lon: location.coordinate.longitude,
-                    leadTimeMinutes: settings.leadTime
+                    leadTimeMinutes: settings.leadTime,
+                    rainStartEnabled: settings.rainStartEnabled,
+                    rainEndEnabled: settings.rainEndEnabled
                 )
             }
 

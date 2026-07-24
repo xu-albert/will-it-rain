@@ -1,7 +1,7 @@
 import { Env, DeviceRegistration } from './types';
 import { getDevicesByGrid, gridCenter, toGridKey } from './grid';
 import { fetchForecast } from './weatherkit';
-import { sendRainAlert } from './apns';
+import { sendRainAlert, sendRainEndAlert } from './apns';
 
 export default {
   // HTTP API for device registration
@@ -39,34 +39,48 @@ export default {
         const minutes = forecast.forecastNextHour?.minutes;
         if (!minutes || minutes.length === 0) return;
 
-        // Find first minute with precipitation
         const now = Date.now();
-        const rainStart = minutes.find(
-          (m) => m.precipitationChance > 0.3 && m.precipitationIntensity > 0
-        );
+        const isWet = (m: { precipitationChance: number; precipitationIntensity: number }) =>
+          m.precipitationChance > 0.3 && m.precipitationIntensity > 0;
+        const rainingNow = isWet(minutes[0]);
 
-        if (!rainStart) return;
+        // Rain START: first wet minute ahead — only relevant if it isn't already raining.
+        const rainStart = rainingNow ? undefined : minutes.find(isWet);
+        // Rain END: if it's raining now, the first upcoming dry minute (rain tapering off).
+        const rainEnd = rainingNow ? minutes.find((m) => !isWet(m)) : undefined;
 
-        const rainStartTime = new Date(rainStart.startTime).getTime();
-        const minutesUntilRain = Math.round((rainStartTime - now) / 60000);
+        if (!rainStart && !rainEnd) return;
 
-        // Notify each device in this grid if rain is within their lead time
+        // At most one push per device per event type, deduped for 30 min via KV.
+        const notifyOnce = async (
+          device: DeviceRegistration,
+          kind: 'start' | 'end',
+          send: () => Promise<void>
+        ) => {
+          const metaKey = `notified-${kind}:${device.token}`;
+          const lastNotified = await env.DEVICES.get(metaKey);
+          if (lastNotified && now - parseInt(lastNotified) < 30 * 60 * 1000) return;
+          try {
+            await send();
+            await env.DEVICES.put(metaKey, now.toString(), { expirationTtl: 3600 });
+          } catch (err) {
+            console.error(`[Cron] Failed to notify device (${kind}): ${err}`);
+          }
+        };
+
         for (const device of grid.devices) {
-          if (minutesUntilRain <= device.leadTimeMinutes && minutesUntilRain >= -5) {
-            // Check if we already notified recently (stored in KV metadata)
-            const metaKey = `notified:${device.token}`;
-            const lastNotified = await env.DEVICES.get(metaKey);
-            if (lastNotified) {
-              const elapsed = now - parseInt(lastNotified);
-              if (elapsed < 30 * 60 * 1000) continue; // Skip if notified within 30 min
+          if (rainStart && device.rainStartEnabled !== false) {
+            const minutesUntilRain = Math.round((new Date(rainStart.startTime).getTime() - now) / 60000);
+            if (minutesUntilRain <= device.leadTimeMinutes && minutesUntilRain >= -5) {
+              await notifyOnce(device, 'start', () => sendRainAlert(device.token, minutesUntilRain, env));
+              console.log(`[Cron] Rain-start grid ${grid.gridKey}, in ${minutesUntilRain}m`);
             }
-
-            try {
-              await sendRainAlert(device.token, minutesUntilRain, env);
-              await env.DEVICES.put(metaKey, now.toString(), { expirationTtl: 3600 });
-              console.log(`[Cron] Notified device in grid ${grid.gridKey}, rain in ${minutesUntilRain}m`);
-            } catch (err) {
-              console.error(`[Cron] Failed to notify device: ${err}`);
+          }
+          if (rainEnd && device.rainEndEnabled !== false) {
+            const minutesUntilEnd = Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000);
+            if (minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
+              await notifyOnce(device, 'end', () => sendRainEndAlert(device.token, env));
+              console.log(`[Cron] Rain-end grid ${grid.gridKey}, in ${minutesUntilEnd}m`);
             }
           }
         }
@@ -157,7 +171,14 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleRegister(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { token?: string; lat?: number; lon?: number; leadTimeMinutes?: number };
+  const body = (await request.json()) as {
+    token?: string;
+    lat?: number;
+    lon?: number;
+    leadTimeMinutes?: number;
+    rainStartEnabled?: boolean;
+    rainEndEnabled?: boolean;
+  };
 
   if (!body.token || body.lat == null || body.lon == null) {
     return new Response(JSON.stringify({ error: 'Missing token, lat, or lon' }), {
@@ -171,6 +192,8 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     lat: body.lat,
     lon: body.lon,
     leadTimeMinutes: body.leadTimeMinutes ?? 20,
+    rainStartEnabled: body.rainStartEnabled ?? true,
+    rainEndEnabled: body.rainEndEnabled ?? true,
     registeredAt: new Date().toISOString(),
   };
 
