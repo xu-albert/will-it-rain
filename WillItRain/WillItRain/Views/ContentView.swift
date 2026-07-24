@@ -59,6 +59,10 @@ struct ContentView: View {
                 errorView(appError)
             }
         }
+        .overlay(alignment: .bottom) {
+            AttributionView()
+                .padding(.bottom, 8)
+        }
         #if DEBUG
         .overlay(alignment: .bottom) {
             debugConditionPicker
@@ -181,18 +185,6 @@ struct ContentView: View {
 
             WeeklyForecastView(days: forecast.dailySummaries, useCelsius: settings.useCelsius)
                 .padding(.bottom, 20)
-
-            // Apple Weather attribution (required by WeatherKit guidelines 5.2.5)
-            Link(destination: URL(string: "https://weatherkit.apple.com/legal-attribution.html")!) {
-                HStack(spacing: 4) {
-                    Image(systemName: "apple.logo")
-                        .font(.system(size: 12))
-                    Text("Weather")
-                        .font(.system(size: 12, weight: .medium))
-                }
-                .foregroundColor(.white.opacity(0.6))
-            }
-            .padding(.bottom, 16)
         }
     }
 
