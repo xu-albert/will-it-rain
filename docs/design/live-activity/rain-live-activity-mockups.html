@@ -1,0 +1,396 @@
+<title>Gonna Rain? — Live Activity & Widget Designs</title>
+<style>
+  :root{
+    /* page chrome — light default */
+    --bg:#E9EEF4; --bg2:#DFE6EF; --panel:#FFFFFF; --ink:#101720; --ink-soft:#54606F;
+    --hair:rgba(16,23,32,.10); --accent:#2E8BFF; --shadow:rgba(20,34,60,.18);
+  }
+  :root{
+    /* device / weather world (fixed across themes) */
+    --rain-top:#26374f; --rain-bot:#0d1730;
+    --sky-top:#6ea6df; --sky-bot:#dcebf8;
+    --dusk-top:#3a4a6b; --dusk-bot:#141d33;
+    --cyan:#57b0ff; --cyan-2:#8fd0ff; --cyan-soft:rgba(87,176,255,.20);
+    --amber:#ffcf5c; --dry:rgba(255,255,255,.14); --track:rgba(255,255,255,.09);
+    --white-1:#f4f8fd; --white-2:rgba(233,242,252,.66); --white-3:rgba(233,242,252,.40);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0B0F16; --bg2:#0f141d; --panel:#141b24; --ink:#EAF1F8; --ink-soft:#9AA7B6;
+      --hair:rgba(255,255,255,.10); --accent:#4EA8FF; --shadow:rgba(0,0,0,.5); }
+  }
+  :root[data-theme="light"]{ --bg:#E9EEF4; --bg2:#DFE6EF; --panel:#FFFFFF; --ink:#101720; --ink-soft:#54606F; --hair:rgba(16,23,32,.10); --accent:#2E8BFF; --shadow:rgba(20,34,60,.18); }
+  :root[data-theme="dark"]{ --bg:#0B0F16; --bg2:#0f141d; --panel:#141b24; --ink:#EAF1F8; --ink-soft:#9AA7B6; --hair:rgba(255,255,255,.10); --accent:#4EA8FF; --shadow:rgba(0,0,0,.5); }
+
+  *{box-sizing:border-box}
+  body{margin:0}
+  .wrap{
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue",Arial,sans-serif;
+    background:
+      radial-gradient(1200px 600px at 80% -5%, color-mix(in srgb,var(--accent) 12%, transparent), transparent 60%),
+      linear-gradient(180deg,var(--bg),var(--bg2));
+    color:var(--ink); min-height:100vh; padding:clamp(20px,5vw,64px);
+    -webkit-font-smoothing:antialiased;
+  }
+  .page{max-width:1080px;margin:0 auto}
+
+  /* header */
+  .eyebrow{font-size:12px;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);margin:0 0 14px}
+  h1{font-size:clamp(30px,5vw,50px);line-height:1.02;letter-spacing:-.02em;font-weight:700;margin:0;text-wrap:balance}
+  .lede{font-size:clamp(15px,2.2vw,18px);line-height:1.55;color:var(--ink-soft);max-width:62ch;margin:16px 0 0}
+  .lede b{color:var(--ink);font-weight:600}
+
+  section{margin-top:clamp(40px,7vw,72px)}
+  .shead{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+  .snum{font-size:12px;font-weight:700;letter-spacing:.12em;color:var(--accent);font-variant-numeric:tabular-nums}
+  h2{font-size:clamp(21px,3vw,28px);letter-spacing:-.015em;font-weight:650;margin:0}
+  .sdesc{color:var(--ink-soft);font-size:15px;line-height:1.55;max-width:60ch;margin:10px 0 26px}
+  .sdesc code{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:.86em;background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--ink);padding:1px 6px;border-radius:5px}
+
+  .stage{display:flex;flex-wrap:wrap;gap:26px;align-items:flex-start}
+  .cap{font-size:13px;color:var(--ink-soft);line-height:1.5;margin:12px 2px 0;max-width:340px}
+  .cap b{color:var(--ink);font-weight:600}
+  .col{display:flex;flex-direction:column}
+
+  /* ---------- Live Activity timeline card ---------- */
+  .la{
+    width:360px;max-width:86vw;border-radius:24px;padding:16px 17px 15px;
+    background:linear-gradient(157deg,var(--rain-top),var(--rain-bot));
+    box-shadow:0 20px 50px -18px var(--shadow), inset 0 0 0 .5px rgba(255,255,255,.08);
+    color:var(--white-1);position:relative;overflow:hidden;
+  }
+  .la.clear{background:linear-gradient(157deg,#3f5a80,#1a2740)}
+  .la-top{display:flex;align-items:center;gap:9px;margin-bottom:12px}
+  .glyph{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;
+    background:linear-gradient(160deg,#59b2ff,#2f7ce0);box-shadow:0 2px 8px rgba(47,124,224,.5);font-size:15px}
+  .app{font-size:13px;font-weight:600;letter-spacing:-.01em}
+  .la-top .spacer{flex:1}
+  .cond{font-size:12px;color:var(--white-2);font-weight:500;display:flex;align-items:center;gap:6px}
+  .cond .dot{width:6px;height:6px;border-radius:50%;background:var(--cyan);box-shadow:0 0 8px var(--cyan)}
+
+  .la-hero{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:14px}
+  .la-lab{font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--white-2);margin-bottom:2px}
+  .countdown{font-size:38px;font-weight:700;letter-spacing:-.02em;line-height:1;font-variant-numeric:tabular-nums;
+    display:flex;align-items:baseline;gap:2px}
+  .countdown .u{font-size:16px;font-weight:600;color:var(--white-2);letter-spacing:0}
+  .heroicon{font-size:30px;filter:drop-shadow(0 3px 10px rgba(87,176,255,.55))}
+
+  /* timeline track */
+  .tl{position:relative;height:46px;margin:2px 2px 0}
+  .tl-track{position:absolute;inset:14px 0 14px;border-radius:9px;background:var(--track);overflow:hidden}
+  .band{position:absolute;top:0;bottom:0;border-radius:9px;
+    background:linear-gradient(180deg,rgba(87,176,255,.16),rgba(87,176,255,.42));
+    box-shadow:inset 0 -2px 0 rgba(143,208,255,.6)}
+  .band::before{content:"";position:absolute;inset:0;border-radius:9px;
+    background:repeating-linear-gradient(115deg,transparent 0 6px,rgba(143,208,255,.16) 6px 7px)}
+  .band.heavy{background:linear-gradient(180deg,rgba(87,176,255,.28),rgba(87,176,255,.62))}
+  .now{position:absolute;top:6px;bottom:6px;width:2px;background:var(--amber);border-radius:2px;
+    box-shadow:0 0 10px rgba(255,207,92,.8)}
+  .puck{position:absolute;top:50%;width:15px;height:15px;border-radius:50%;transform:translate(-50%,-50%);
+    background:var(--amber);box-shadow:0 0 0 4px rgba(255,207,92,.22),0 2px 6px rgba(0,0,0,.4);z-index:3}
+  .puck::after{content:"";position:absolute;inset:0;border-radius:50%;background:var(--amber);
+    animation:pulse 2.4s ease-out infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(255,207,92,.5)}100%{box-shadow:0 0 0 12px rgba(255,207,92,0)}}
+  .flag{position:absolute;top:-3px;transform:translateX(-50%);font-size:10px;font-weight:600;color:var(--cyan-2);white-space:nowrap}
+  .flag .tick{display:block;width:1px;height:8px;background:var(--cyan-2);margin:2px auto 0;opacity:.7}
+  .axis{position:absolute;left:0;right:0;bottom:-2px;display:flex;justify-content:space-between;
+    font-size:9.5px;color:var(--white-3);font-weight:500;font-variant-numeric:tabular-nums}
+  .la-sub{margin-top:13px;font-size:12.5px;color:var(--white-2);font-weight:500;display:flex;gap:6px;align-items:center}
+  .la-sub b{color:var(--white-1);font-weight:600}
+
+  /* ---------- iPhone lock screen frame ---------- */
+  .phone{width:300px;max-width:82vw;aspect-ratio:300/620;border-radius:52px;padding:11px;
+    background:linear-gradient(160deg,#2b2f38,#0a0c10);box-shadow:0 30px 70px -24px var(--shadow),inset 0 0 0 2px rgba(255,255,255,.06)}
+  .screen{width:100%;height:100%;border-radius:42px;overflow:hidden;position:relative;
+    background:linear-gradient(180deg,var(--dusk-top),var(--dusk-bot))}
+  .screen::before{content:"";position:absolute;inset:0;background:
+    radial-gradient(120% 60% at 50% 8%,rgba(255,214,150,.14),transparent 55%),
+    radial-gradient(90% 50% at 80% 100%,rgba(60,90,150,.35),transparent)}
+  .di{position:absolute;top:12px;left:50%;transform:translateX(-50%);width:86px;height:26px;border-radius:14px;background:#000;z-index:5}
+  .lk-time{position:absolute;top:64px;left:0;right:0;text-align:center;color:#fff;z-index:2}
+  .lk-date{font-size:13px;font-weight:600;opacity:.82;letter-spacing:.02em}
+  .lk-clock{font-size:66px;font-weight:600;letter-spacing:-.02em;line-height:1;margin-top:2px}
+  .lk-la{position:absolute;left:14px;right:14px;bottom:88px;z-index:3}
+  .lk-la .la{width:100%;transform:scale(1);box-shadow:0 16px 40px -16px rgba(0,0,0,.6)}
+  .lk-foot{position:absolute;bottom:26px;left:0;right:0;display:flex;justify-content:space-between;padding:0 34px;z-index:2}
+  .lk-foot span{width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.16);display:grid;place-items:center;font-size:18px;backdrop-filter:blur(4px)}
+  .bar{position:absolute;bottom:9px;left:50%;transform:translateX(-50%);width:112px;height:5px;border-radius:3px;background:rgba(255,255,255,.8)}
+
+  /* ---------- Dynamic Island ---------- */
+  .di-stage{display:flex;flex-wrap:wrap;gap:22px}
+  .di-wrap{display:flex;flex-direction:column;align-items:center;gap:12px}
+  .di-strip{background:linear-gradient(180deg,#1b1e24,#0b0d11);padding:20px 22px;border-radius:22px;
+    box-shadow:inset 0 0 0 .5px rgba(255,255,255,.06)}
+  .pill{background:#000;border-radius:22px;color:#fff;display:flex;align-items:center}
+  .pill.min{height:36px;width:120px;justify-content:space-between;padding:0 6px}
+  .pill.min .l{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-size:14px}
+  .pill.min .r{padding-right:9px;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--cyan-2)}
+  .pill.tiny{height:34px;width:34px;justify-content:center;font-size:15px}
+  .pill.exp{width:288px;border-radius:26px;flex-direction:column;align-items:stretch;padding:15px 16px 14px;gap:11px}
+  .exp-top{display:flex;align-items:center;gap:10px}
+  .exp-top .glyph{width:24px;height:24px;font-size:13px}
+  .exp-top .t1{font-size:13px;font-weight:600}
+  .exp-top .cd{margin-left:auto;font-size:20px;font-weight:700;font-variant-numeric:tabular-nums;color:#fff}
+  .exp-top .cd small{font-size:12px;color:var(--white-2);font-weight:600}
+  .exp .tl{height:30px;margin:0}
+  .exp .tl-track{inset:9px 0 9px}
+  .di-label{font-size:11px;color:var(--ink-soft);font-weight:600;letter-spacing:.04em}
+
+  /* ---------- Widgets ---------- */
+  .wgrid{display:flex;flex-wrap:wrap;gap:24px;align-items:flex-start}
+  .widget{border-radius:22px;color:var(--white-1);position:relative;overflow:hidden;
+    background:linear-gradient(157deg,var(--rain-top),var(--rain-bot));
+    box-shadow:0 16px 40px -18px var(--shadow),inset 0 0 0 .5px rgba(255,255,255,.07)}
+  .w-small{width:158px;height:158px;padding:15px}
+  .w-med{width:340px;height:158px;padding:16px 18px}
+  .w-corner{position:absolute;top:13px;right:14px;font-size:19px;opacity:.9;filter:drop-shadow(0 2px 6px rgba(87,176,255,.5))}
+  .w-lab{font-size:10.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--white-2)}
+  .w-big{font-size:34px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1;margin-top:3px}
+  .w-big small{font-size:15px;color:var(--white-2);font-weight:600}
+  .w-loc{font-size:12px;color:var(--white-2);font-weight:500;margin-top:auto;display:flex;align-items:center;gap:5px}
+  .w-small .stack{height:100%;display:flex;flex-direction:column}
+  .mini-bar{height:6px;border-radius:4px;background:var(--track);position:relative;overflow:hidden;margin:12px 0}
+  .mini-bar .b{position:absolute;top:0;bottom:0;background:linear-gradient(90deg,var(--cyan),var(--cyan-2));border-radius:4px}
+  .mini-bar .n{position:absolute;top:-3px;width:2px;height:12px;background:var(--amber);border-radius:2px;box-shadow:0 0 6px var(--amber)}
+  .w-med .row{display:flex;height:100%;gap:16px}
+  .w-med .left{display:flex;flex-direction:column;flex:0 0 40%}
+  .w-med .right{flex:1;display:flex;flex-direction:column;justify-content:center}
+  .hours{display:flex;justify-content:space-between;margin-top:10px}
+  .hr{display:flex;flex-direction:column;align-items:center;gap:5px;font-size:10px;color:var(--white-2);font-variant-numeric:tabular-nums}
+  .hr .drop{width:7px;height:7px;border-radius:50%;background:var(--track)}
+  .hr.wet .drop{background:var(--cyan);box-shadow:0 0 7px var(--cyan)}
+  .hr.now{color:var(--amber);font-weight:700}
+
+  /* lock accessory widgets */
+  .acc-stage{display:flex;flex-wrap:wrap;gap:26px;align-items:center;
+    background:linear-gradient(150deg,#39496a,#151d31);padding:26px;border-radius:22px}
+  .acc{color:#fff}
+  .acc-rect{width:150px}
+  .acc-rect .t{font-size:12px;font-weight:600;opacity:.85;letter-spacing:.02em}
+  .acc-rect .m{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.01em;margin:1px 0 6px;display:flex;align-items:baseline;gap:3px}
+  .acc-rect .m small{font-size:12px;font-weight:600;opacity:.8}
+  .acc-rect .b{height:4px;border-radius:3px;background:rgba(255,255,255,.28);position:relative;overflow:hidden}
+  .acc-rect .b i{position:absolute;left:0;top:0;bottom:0;width:34%;background:#fff;border-radius:3px}
+  .acc-circ{width:74px;height:74px;border-radius:50%;display:grid;place-items:center;position:relative;
+    background:conic-gradient(#fff 0 66%,rgba(255,255,255,.22) 66% 100%);}
+  .acc-circ::before{content:"";position:absolute;inset:6px;border-radius:50%;background:#20293f}
+  .acc-circ .in{position:relative;text-align:center;line-height:1}
+  .acc-circ .in b{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}
+  .acc-circ .in span{font-size:9px;opacity:.8;display:block;margin-top:1px}
+  .acc-inline{display:flex;align-items:center;gap:6px;font-size:15px;font-weight:600}
+  .acc cap,.acc-cap{display:block;font-size:11px;color:rgba(255,255,255,.6);margin-top:9px;font-weight:600;letter-spacing:.03em}
+
+  /* legend / anatomy */
+  .legend{display:flex;flex-wrap:wrap;gap:14px 26px;background:var(--panel);border:1px solid var(--hair);
+    border-radius:16px;padding:18px 20px;margin-top:8px}
+  .leg{display:flex;align-items:center;gap:9px;font-size:13px;color:var(--ink-soft)}
+  .leg b{color:var(--ink);font-weight:600}
+  .sw{width:26px;height:12px;border-radius:4px;flex:none}
+  .sw.band{background:linear-gradient(180deg,rgba(87,176,255,.3),rgba(87,176,255,.7))}
+  .sw.now{width:12px;height:12px;border-radius:50%;background:var(--amber);box-shadow:0 0 0 3px rgba(255,207,92,.25)}
+  .sw.track{background:rgba(120,140,170,.35)}
+  .sw.cyan{background:var(--cyan)}
+
+  .note{margin-top:14px;background:var(--panel);border:1px solid var(--hair);border-left:3px solid var(--accent);
+    border-radius:12px;padding:15px 18px;font-size:13.5px;line-height:1.6;color:var(--ink-soft)}
+  .note b{color:var(--ink);font-weight:600}
+  footer{margin-top:64px;padding-top:22px;border-top:1px solid var(--hair);color:var(--ink-soft);font-size:13px;line-height:1.6}
+
+  @media (prefers-reduced-motion: reduce){ .puck::after{animation:none} }
+  @media (max-width:560px){ .phone{width:260px} }
+</style>
+
+<div class="wrap"><div class="page">
+
+  <p class="eyebrow">Gonna Rain? · Release 2 design</p>
+  <h1>A rain timeline for your lock screen</h1>
+  <p class="lede">Your idea — a <b>DoorDash / Uber-style progress tracker</b> — translated to weather. Instead of "order → kitchen → on the way," the track is the next ~90 minutes of sky: <b>dry now → rain band → clears</b>, with a live-ticking countdown and a marker that creeps toward the rain. The same anatomy scales down into the Dynamic Island and the widgets.</p>
+
+  <div class="legend" aria-label="Timeline anatomy">
+    <span class="leg"><span class="sw now"></span><b>Now</b> — amber marker, moves left→right in real time</span>
+    <span class="leg"><span class="sw band"></span><b>Rain band</b> — width = duration, fill = intensity</span>
+    <span class="leg"><span class="sw track"></span><b>Dry</b> — muted track</span>
+    <span class="leg"><span class="sw cyan"></span><b>Cyan</b> — precipitation accent</span>
+  </div>
+
+  <!-- LOCK SCREEN -->
+  <section>
+    <div class="shead"><span class="snum">01</span><h2>Lock screen Live Activity</h2></div>
+    <p class="sdesc">The full-width card. Countdown ticks on its own via ActivityKit's <code>Text(timerInterval:)</code>; the Worker pushes a fresh content-state whenever the forecast shifts (rain arrives sooner, intensity changes, it clears).</p>
+    <div class="stage">
+      <div class="col">
+        <div class="phone"><div class="screen">
+          <div class="di"></div>
+          <div class="lk-time"><div class="lk-date">Friday, July 24</div><div class="lk-clock">9:41</div></div>
+          <div class="lk-la">
+            <div class="la">
+              <div class="la-top"><div class="glyph">🌧️</div><div class="app">Gonna Rain?</div><div class="spacer"></div><div class="cond"><span class="dot"></span>Light rain incoming</div></div>
+              <div class="la-hero">
+                <div><div class="la-lab">Rain in</div><div class="countdown" data-count="754"><span class="v">12:34</span></div></div>
+                <div class="heroicon">🌧️</div>
+              </div>
+              <div class="tl">
+                <div class="tl-track">
+                  <div class="band" style="left:26%;right:0"></div>
+                </div>
+                <div class="now" style="left:4%"></div>
+                <div class="puck" style="left:4%"></div>
+                <div class="flag" style="left:26%">3:53 PM<span class="tick"></span></div>
+                <div class="axis"><span>Now</span><span>+30</span><span>+60</span><span>+90m</span></div>
+              </div>
+              <div class="la-sub">🌂 <b>Light rain</b> · about 40 min · clears ~<b>4:33 PM</b></div>
+            </div>
+          </div>
+          <div class="lk-foot"><span>🔦</span><span>📷</span></div>
+          <div class="bar"></div>
+        </div></div>
+        <p class="cap"><b>State A — approaching.</b> Marker sits in the dry zone; the rain band starts partway down the track. Glanceable answer: rain in 12 min, lasts ~40.</p>
+      </div>
+
+      <div class="col">
+        <div class="la clear" style="margin-top:0">
+          <div class="la-top"><div class="glyph">🌧️</div><div class="app">Gonna Rain?</div><div class="spacer"></div><div class="cond"><span class="dot"></span>Raining now</div></div>
+          <div class="la-hero">
+            <div><div class="la-lab">Stops in</div><div class="countdown" data-count="1450"><span class="v">24:10</span></div></div>
+            <div class="heroicon">☔️</div>
+          </div>
+          <div class="tl">
+            <div class="tl-track">
+              <div class="band heavy" style="left:0;width:52%"></div>
+            </div>
+            <div class="now" style="left:20%"></div>
+            <div class="puck" style="left:20%"></div>
+            <div class="flag" style="left:52%">4:33 PM<span class="tick"></span></div>
+            <div class="axis"><span>Now</span><span>+30</span><span>+60</span><span>+90m</span></div>
+          </div>
+          <div class="la-sub">☔️ <b>Moderate rain</b> · easing off · dry by <b>4:33 PM</b></div>
+        </div>
+        <p class="cap"><b>State B — raining now.</b> Marker is <em>inside</em> the band, label flips to "Stops in," band fills toward the clear edge. Same component, different data.</p>
+        <div class="la" style="margin-top:22px;background:linear-gradient(157deg,#3f5a80,#22314c)">
+          <div class="la-top"><div class="glyph">☀️</div><div class="app">Gonna Rain?</div><div class="spacer"></div><div class="cond" style="color:var(--white-2)">Clear</div></div>
+          <div class="la-hero"><div><div class="la-lab">Next rain</div><div class="countdown" style="font-size:26px">Tomorrow AM</div></div><div class="heroicon">🌤️</div></div>
+          <div class="la-sub">No rain expected for the next <b>18 hours</b> — activity auto-ends.</div>
+        </div>
+        <p class="cap"><b>State C — cleared.</b> Once dry with nothing incoming, the activity shows a quiet "all clear" then dismisses itself (staleDate).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- DYNAMIC ISLAND -->
+  <section>
+    <div class="shead"><span class="snum">02</span><h2>Dynamic Island</h2></div>
+    <p class="sdesc">The same event, collapsed. Minimal is a raindrop; compact adds the countdown; long-press expands to a mini timeline. On iPhones without the island, compact/minimal fall back to the notch-adjacent leading/trailing slots automatically.</p>
+    <div class="di-strip"><div class="di-stage">
+      <div class="di-wrap">
+        <div class="pill tiny">🌧️</div>
+        <div class="di-label">Minimal</div>
+      </div>
+      <div class="di-wrap">
+        <div class="pill min"><div class="l">🌧️</div><div class="r" data-count="754">12m</div></div>
+        <div class="di-label">Compact</div>
+      </div>
+      <div class="di-wrap">
+        <div class="pill exp">
+          <div class="exp-top"><div class="glyph">🌧️</div><div class="t1">Rain incoming</div><div class="cd" data-count="754">12:34<small> min</small></div></div>
+          <div class="tl">
+            <div class="tl-track"><div class="band" style="left:26%;right:0"></div></div>
+            <div class="now" style="left:4%"></div><div class="puck" style="left:4%"></div>
+            <div class="axis"><span>Now</span><span>+45</span><span>+90m</span></div>
+          </div>
+        </div>
+        <div class="di-label">Expanded (long-press)</div>
+      </div>
+    </div></div>
+  </section>
+
+  <!-- WIDGETS -->
+  <section>
+    <div class="shead"><span class="snum">03</span><h2>Home screen widgets</h2></div>
+    <p class="sdesc">Fed by an App Group the app writes each forecast into, refreshed on a WidgetKit timeline. Same timeline motif compressed into a bar. These are always-on (no activity required).</p>
+    <div class="wgrid">
+      <div class="col">
+        <div class="widget w-small"><div class="stack">
+          <div class="w-corner">🌧️</div>
+          <div class="w-lab">Rain in</div>
+          <div class="w-big">12<small> min</small></div>
+          <div class="mini-bar"><div class="b" style="left:26%;right:0"></div><div class="n" style="left:4%"></div></div>
+          <div class="w-loc">📍 San Francisco</div>
+        </div></div>
+        <p class="cap"><b>Small.</b> The one-glance number + a compressed track.</p>
+      </div>
+      <div class="col">
+        <div class="widget w-med">
+          <div class="w-corner">🌧️</div>
+          <div class="row">
+            <div class="left"><div class="w-lab">Rain in</div><div class="w-big">12<small> min</small></div><div class="w-loc" style="margin-top:8px">📍 San Francisco</div></div>
+            <div class="right">
+              <div class="mini-bar"><div class="b" style="left:26%;right:0"></div><div class="n" style="left:4%"></div></div>
+              <div class="hours">
+                <div class="hr now"><div class="drop"></div>now</div>
+                <div class="hr wet"><div class="drop"></div>4p</div>
+                <div class="hr wet"><div class="drop"></div>5p</div>
+                <div class="hr"><div class="drop"></div>6p</div>
+                <div class="hr"><div class="drop"></div>7p</div>
+                <div class="hr"><div class="drop"></div>8p</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p class="cap"><b>Medium.</b> Countdown + timeline + the next few hours as wet/dry dots.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- LOCK ACCESSORY -->
+  <section>
+    <div class="shead"><span class="snum">04</span><h2>Lock screen widgets</h2></div>
+    <p class="sdesc">The small tintable widgets under the clock (iOS 16+). Rendered monochrome by the system, so they lean on shape — a bar, a ring gauge, one line.</p>
+    <div class="acc-stage">
+      <div class="acc acc-rect">
+        <div class="t">🌧 Rain soon</div>
+        <div class="m">12<small>min</small> · 40<small>min</small></div>
+        <div class="b"><i></i></div>
+        <span class="acc-cap">Rectangular</span>
+      </div>
+      <div class="col" style="align-items:center">
+        <div class="acc acc-circ"><div class="in"><b>12</b><span>MIN</span></div></div>
+        <span class="acc-cap" style="text-align:center">Circular — ring counts down to rain</span>
+      </div>
+      <div class="col" style="align-items:flex-start">
+        <div class="acc acc-inline">🌧 Rain in 12m</div>
+        <span class="acc-cap">Inline (beside the clock)</span>
+      </div>
+    </div>
+  </section>
+
+  <div class="note">
+    <b>How it stays live (your "remote push" pick):</b> the app requests a push-to-start token + a per-activity push token and hands them to the Worker. The existing cron already detects rain per grid cell — it gains one job: send an <b>ActivityKit</b> push (<code>apns-push-type: liveactivity</code>) with the new content-state. So the card updates even with the app fully suspended, and the countdown ticks locally in between. Widgets refresh from the shared App Group on WidgetKit's own schedule.
+  </div>
+
+  <footer>
+    <b>What I need from you:</b> react to the timeline treatment — is the horizontal "next 90 min" track the right metaphor, or would you rather the countdown number be the hero and the track a thin accent? Anything on color (I leaned into your rain gradient with an amber "now" marker for contrast). Once you sign off on the look, I'll write the spec + plan and build target B/C against it.<br><br>
+    Mockup — not final pixels. Countdown values ticking live to show the real behavior.
+  </footer>
+
+</div></div>
+
+<script>
+  function fmt(s){ if(s>=3600){return Math.round(s/60)+'m';} var m=Math.floor(s/60),ss=s%60; return m+':'+String(ss).padStart(2,'0'); }
+  function fmtShort(s){ return Math.max(0,Math.round(s/60))+'m'; }
+  var els=[...document.querySelectorAll('[data-count]')].map(function(el){
+    return {el:el, s:parseInt(el.getAttribute('data-count'),10), short: el.classList.contains('r')|| (el.textContent.trim().endsWith('m')&&!el.textContent.includes(':'))};
+  });
+  function tick(){
+    els.forEach(function(o){
+      if(o.s>0)o.s--;
+      var target=o.el.querySelector('.v')||o.el;
+      if(o.short){ target.textContent=fmtShort(o.s); }
+      else{
+        // preserve any trailing <small>
+        var small=o.el.querySelector('small');
+        if(small){ o.el.childNodes[0].nodeValue=fmt(o.s); }
+        else target.textContent=fmt(o.s);
+      }
+    });
+  }
+  setInterval(tick,1000);
+</script>
