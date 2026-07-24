@@ -1,4 +1,4 @@
-import { Env } from './types';
+import { Env, LiveActivityContentState } from './types';
 
 // Generate JWT for APNs authentication (same key as WeatherKit but different use)
 // APNs provider tokens may be reused for up to 1 hour; regenerating one per push
@@ -98,6 +98,60 @@ async function sendNotification(
     body: JSON.stringify({
       aps: { alert, badge, sound: 'default' },
     }),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`APNs error ${resp.status}: ${text}`);
+  }
+}
+
+// ActivityKit decodes a Live Activity push's "content-state" with a default
+// JSONDecoder, whose date strategy is `.deferredToDate` — NOT Unix epoch seconds.
+// Foundation's reference date is 2001-01-01T00:00:00Z, which is 978307200 seconds
+// after the Unix epoch. Any `Date?` field inside content-state (e.g. countdownTarget)
+// must be encoded as seconds-since-2001, or ActivityKit will fail to decode the push.
+// (The outer `aps` fields — timestamp/stale-date/dismissal-date — are unrelated to
+// content-state and use ordinary Unix epoch seconds, per Apple's APNs docs.)
+const APPLE_REFERENCE_DATE_OFFSET_SECONDS = 978307200;
+
+export function encodeActivityDate(date: Date): number {
+  return date.getTime() / 1000 - APPLE_REFERENCE_DATE_OFFSET_SECONDS;
+}
+
+export type LiveActivityEvent = 'update' | 'end';
+
+export async function sendLiveActivityUpdate(
+  activityToken: string,
+  contentState: LiveActivityContentState,
+  env: Env,
+  event: LiveActivityEvent = 'update'
+): Promise<void> {
+  const token = await generateAPNsJWT(env);
+
+  const host = env.APNS_ENV === 'sandbox' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  const aps: Record<string, unknown> = {
+    timestamp: nowSeconds,
+    event,
+    'content-state': contentState,
+    'stale-date': nowSeconds + 45 * 60,
+  };
+  if (event === 'end') {
+    aps['dismissal-date'] = nowSeconds + 5 * 60;
+  }
+
+  const resp = await fetch(`https://${host}/3/device/${activityToken}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `bearer ${token}`,
+      'apns-topic': `${env.APNS_TOPIC}.push-type.liveactivity`,
+      'apns-push-type': 'liveactivity',
+      'apns-priority': '10',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ aps }),
   });
 
   if (!resp.ok) {
