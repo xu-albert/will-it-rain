@@ -25,23 +25,49 @@ async function generateAPNsJWT(env: Env): Promise<string> {
   return `${signingInput}.${b64url(signature)}`;
 }
 
+export type Intensity = 'light' | 'moderate' | 'heavy';
+
+export function intensityFromMmPerHr(mmPerHr: number): Intensity {
+  if (mmPerHr < 2.5) return 'light';
+  if (mmPerHr < 7.5) return 'moderate';
+  return 'heavy';
+}
+
 export async function sendRainAlert(
   deviceToken: string,
   minutesUntilRain: number,
-  env: Env
+  env: Env,
+  intensity: Intensity = 'light'
 ): Promise<void> {
-  const body =
-    minutesUntilRain <= 0
-      ? 'Rain is starting now!'
-      : minutesUntilRain <= 5
-        ? 'Rain starting in the next few minutes'
-        : `Rain expected in ~${minutesUntilRain} minutes`;
+  const rain = intensity === 'light' ? 'Rain' : `${intensity[0].toUpperCase()}${intensity.slice(1)} rain`;
+  const advice =
+    intensity === 'heavy' ? ' Plan for a downpour.' : intensity === 'moderate' ? ' Bring a jacket.' : ' Grab an umbrella.';
 
-  await sendNotification(deviceToken, { title: 'Rain Incoming', body }, 1, env);
+  let title: string;
+  let body: string;
+  if (minutesUntilRain <= 0) {
+    title = 'Rain starting now';
+    body = `${rain} is beginning in your area.${advice}`;
+  } else if (minutesUntilRain <= 5) {
+    title = 'Rain in a few minutes';
+    body = `${rain} starts in the next few minutes.${advice}`;
+  } else {
+    title = `Rain in ~${minutesUntilRain} min`;
+    body = `${rain} expected in about ${minutesUntilRain} minutes.${advice}`;
+  }
+  await sendNotification(deviceToken, { title, body }, 1, env);
 }
 
-export async function sendRainEndAlert(deviceToken: string, env: Env): Promise<void> {
-  await sendNotification(deviceToken, { title: 'Rain Ending', body: 'Rain is expected to stop soon' }, 0, env);
+export async function sendRainEndAlert(
+  deviceToken: string,
+  env: Env,
+  minutesUntilEnd = 0
+): Promise<void> {
+  const body =
+    minutesUntilEnd <= 5
+      ? 'The rain should ease off in the next few minutes.'
+      : `The rain should ease off in about ${minutesUntilEnd} minutes.`;
+  await sendNotification(deviceToken, { title: 'Rain ending soon', body }, 0, env);
 }
 
 async function sendNotification(

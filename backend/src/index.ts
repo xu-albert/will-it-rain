@@ -1,7 +1,7 @@
 import { Env, DeviceRegistration } from './types';
 import { getDevicesByGrid, gridCenter, toGridKey } from './grid';
 import { fetchForecast } from './weatherkit';
-import { sendRainAlert, sendRainEndAlert } from './apns';
+import { sendRainAlert, sendRainEndAlert, intensityFromMmPerHr } from './apns';
 
 export default {
   // HTTP API for device registration
@@ -72,14 +72,16 @@ export default {
           if (rainStart && device.rainStartEnabled !== false) {
             const minutesUntilRain = Math.round((new Date(rainStart.startTime).getTime() - now) / 60000);
             if (minutesUntilRain <= device.leadTimeMinutes && minutesUntilRain >= -5) {
-              await notifyOnce(device, 'start', () => sendRainAlert(device.token, minutesUntilRain, env));
+              await notifyOnce(device, 'start', () =>
+                sendRainAlert(device.token, minutesUntilRain, env, intensityFromMmPerHr(rainStart.precipitationIntensity))
+              );
               console.log(`[Cron] Rain-start grid ${grid.gridKey}, in ${minutesUntilRain}m`);
             }
           }
           if (rainEnd && device.rainEndEnabled !== false) {
             const minutesUntilEnd = Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000);
             if (minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
-              await notifyOnce(device, 'end', () => sendRainEndAlert(device.token, env));
+              await notifyOnce(device, 'end', () => sendRainEndAlert(device.token, env, minutesUntilEnd));
               console.log(`[Cron] Rain-end grid ${grid.gridKey}, in ${minutesUntilEnd}m`);
             }
           }
