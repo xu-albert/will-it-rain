@@ -118,6 +118,12 @@ struct DaySummary: Identifiable {
         f.dateFormat = "EEE"
         return f.string(from: date)
     }
+
+    var dayAbbreviation: String {
+        let f = DateFormatter()
+        f.dateFormat = "EEE"
+        return f.string(from: date)
+    }
 }
 
 struct RainForecast {

@@ -34,7 +34,7 @@ struct WeeklyForecastView: View {
                                 .foregroundColor(.white.opacity(0.75))
                         }
 
-                        Text(day.dayName.prefix(3))
+                        Text(day.dayAbbreviation)
                             .font(.system(size: 12, weight: .medium))
                             .foregroundColor(.white.opacity(0.8))
                     }
