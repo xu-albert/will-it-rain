@@ -69,6 +69,12 @@ struct ContentView: View {
         }
         #endif
         .task {
+            #if DEBUG
+            if CommandLine.arguments.contains("-liveActivityScenario") {
+                await LiveActivityService.startDebugScenarioIfRequested(launchArgs: CommandLine.arguments)
+                return
+            }
+            #endif
             if let scenario = ScreenshotScenario.from(launchArgs: CommandLine.arguments) {
                 let forecast = scenario.forecast
                 withAnimation(.easeInOut(duration: 0.3)) {
@@ -278,6 +284,7 @@ struct ContentView: View {
             appState = .loaded(forecast)
 
             NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: settings)
+            LiveActivityService.shared.sync(forecast: forecast, settings: settings)
 
             // Check if user has traveled — prompt for "Always" location if so
             if locationService.hasUserTraveled(from: location) {
@@ -293,7 +300,9 @@ struct ContentView: View {
                 await PushRegistrationService.shared.registerLocation(
                     lat: location.coordinate.latitude,
                     lon: location.coordinate.longitude,
-                    leadTimeMinutes: settings.leadTime
+                    leadTimeMinutes: settings.leadTime,
+                    rainStartEnabled: settings.rainStartEnabled,
+                    rainEndEnabled: settings.rainEndEnabled
                 )
             }
 

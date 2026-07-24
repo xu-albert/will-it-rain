@@ -57,6 +57,7 @@ struct WillItRainApp: App {
 
                 let settings = NotificationSettings()
                 NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: settings)
+                LiveActivityService.shared.sync(forecast: forecast, settings: settings)
 
                 let nextInterval = forecast.nextPollInterval(leadTimeMinutes: settings.leadTime)
                 scheduleBackgroundRefresh(after: nextInterval)

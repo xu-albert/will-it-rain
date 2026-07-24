@@ -39,9 +39,12 @@ final class NotificationService {
                     if settings.isSameEvent(pending, next.start)
                         && !settings.isSameEvent(settings.lastNotifiedPrecipStart, next.start) {
                         let type = next.type.rawValue
+                        let typeLower = type.lowercased()
+                        let intensity = next.peakIntensity == .none ? "" : "\(next.peakIntensity.rawValue) "
+                        let mins = max(1, Int(next.start.timeIntervalSince(now) / 60))
                         scheduleImmediate(
-                            title: "\(type) Expected",
-                            body: "\(type) expected from \(formatter.string(from: next.start)) to \(formatter.string(from: next.end))",
+                            title: mins <= 5 ? "\(type) starting soon" : "\(type) in ~\(mins) min",
+                            body: "\(intensity)\(typeLower) expected around \(formatter.string(from: next.start)), lasting to \(formatter.string(from: next.end)).",
                             identifier: "precip-start"
                         )
                         settings.lastNotifiedPrecipStart = next.start
@@ -73,8 +76,8 @@ final class NotificationService {
                         && !settings.isSameEvent(settings.lastNotifiedPrecipEnd, current.end) {
                         let type = current.type.rawValue
                         scheduleImmediate(
-                            title: "\(type) Ending Soon",
-                            body: "\(type) ending around \(formatter.string(from: current.end))",
+                            title: "\(type) ending soon",
+                            body: "\(type) should stop around \(formatter.string(from: current.end)).",
                             identifier: "precip-end"
                         )
                         settings.lastNotifiedPrecipEnd = current.end
@@ -101,11 +104,11 @@ final class NotificationService {
            let next = forecast.nextPrecipitationPeriod,
            next.start.timeIntervalSince(now) <= 60 * 60,
            !settings.isSameEvent(settings.lastNotifiedPrecipStart, next.start) {
-            let mins = Int(next.start.timeIntervalSince(now) / 60)
+            let mins = max(1, Int(next.start.timeIntervalSince(now) / 60))
             let type = next.type.rawValue
             scheduleImmediate(
-                title: "Brief Gap",
-                body: "\(type) returns in \(mins) min",
+                title: "More \(type.lowercased()) coming",
+                body: "\(type) returns in about \(mins) min.",
                 identifier: "precip-resume"
             )
             settings.lastNotifiedPrecipStart = next.start

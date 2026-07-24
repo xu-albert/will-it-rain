@@ -1,0 +1,52 @@
+{
+  "description": "App Store screenshot configurations for Gonna Rain?",
+  "note": "Run with: ./screenshots/take_screenshots.sh",
+  "scenarios": [
+    {
+      "id": "nyc-rain",
+      "name": "NYC Rain",
+      "description": "Currently raining in New York, stops in ~40 min",
+      "filename_prefix": "nyc_rain",
+      "launch_arg": "nyc-rain"
+    },
+    {
+      "id": "chicago-snow-night",
+      "name": "Chicago Snow Night",
+      "description": "Snowing at night in Chicago",
+      "filename_prefix": "chicago_snow_night",
+      "launch_arg": "chicago-snow-night"
+    },
+    {
+      "id": "sf-clear",
+      "name": "SF Clear",
+      "description": "Clear skies in San Francisco",
+      "filename_prefix": "sf_clear",
+      "launch_arg": "sf-clear"
+    },
+    {
+      "id": "seattle-rain-soon",
+      "name": "Seattle Rain Soon",
+      "description": "Rain starting in ~25 min in Seattle",
+      "filename_prefix": "seattle_rain_soon",
+      "launch_arg": "seattle-rain-soon"
+    }
+  ],
+  "simulators": {
+    "6.7": {
+      "name": "iPhone 16 Pro Max",
+      "udid": "CD425710-939D-4E4D-A878-6B4283B72760",
+      "display_size": "6.7-inch",
+      "note": "Required for App Store (6.7\" display)"
+    },
+    "6.1": {
+      "name": "iPhone 16 Pro",
+      "udid": "596FA2B9-8F2D-4E57-BEF5-29F2C3DB6A1B",
+      "display_size": "6.1-inch",
+      "note": "Optional for App Store (6.1\" display)"
+    }
+  },
+  "settings_screenshot": {
+    "note": "Settings sheet requires manual capture or UI test - not automatable via launch args alone",
+    "filename_prefix": "settings"
+  }
+}

@@ -14,7 +14,13 @@ final class PushRegistrationService {
     }
 
     /// Register or update location with the backend
-    func registerLocation(lat: Double, lon: Double, leadTimeMinutes: Int) async {
+    func registerLocation(
+        lat: Double,
+        lon: Double,
+        leadTimeMinutes: Int,
+        rainStartEnabled: Bool = true,
+        rainEndEnabled: Bool = true
+    ) async {
         guard let token = UserDefaults.standard.string(forKey: "pushDeviceToken"),
               let url = URL(string: "\(baseURL)/register") else { return }
 
@@ -22,7 +28,14 @@ final class PushRegistrationService {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONEncoder().encode(
-            RegistrationPayload(token: token, lat: lat, lon: lon, leadTimeMinutes: leadTimeMinutes)
+            RegistrationPayload(
+                token: token,
+                lat: lat,
+                lon: lon,
+                leadTimeMinutes: leadTimeMinutes,
+                rainStartEnabled: rainStartEnabled,
+                rainEndEnabled: rainEndEnabled
+            )
         )
 
         do {
@@ -33,6 +46,43 @@ final class PushRegistrationService {
         } catch {
             print("[Push] Registration failed: \(error)")
         }
+    }
+
+    /// Send a Live Activity push token to the backend so it can push
+    /// content-state updates (apns-push-type: liveactivity).
+    func registerLiveActivityToken(_ activityToken: String) async {
+        guard let token = UserDefaults.standard.string(forKey: "pushDeviceToken"),
+              let url = URL(string: "\(baseURL)/register-activity") else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONEncoder().encode(
+            ["token": token, "activityToken": activityToken]
+        )
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                print("[Push] Live Activity token registered")
+            } else {
+                print("[Push] Live Activity token registration returned non-200")
+            }
+        } catch {
+            print("[Push] Live Activity token registration failed: \(error)")
+        }
+    }
+
+    /// Tell the backend the current Live Activity ended.
+    func unregisterLiveActivity() async {
+        guard let token = UserDefaults.standard.string(forKey: "pushDeviceToken"),
+              let url = URL(string: "\(baseURL)/unregister-activity") else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONEncoder().encode(["token": token])
+        _ = try? await URLSession.shared.data(for: request)
     }
 
     func unregister() async {
@@ -54,4 +104,6 @@ private struct RegistrationPayload: Encodable {
     let lat: Double
     let lon: Double
     let leadTimeMinutes: Int
+    let rainStartEnabled: Bool
+    let rainEndEnabled: Bool
 }

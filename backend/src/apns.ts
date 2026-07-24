@@ -1,9 +1,16 @@
-import { Env } from './types';
+import { Env, LiveActivityContentState } from './types';
 
 // Generate JWT for APNs authentication (same key as WeatherKit but different use)
+// APNs provider tokens may be reused for up to 1 hour; regenerating one per push
+// trips APNs "TooManyProviderTokenUpdates" (429). Cache and refresh every ~40 min.
+let cachedAPNsJWT: { token: string; iat: number } | null = null;
+
 async function generateAPNsJWT(env: Env): Promise<string> {
-  const header = { alg: 'ES256', kid: env.APPLE_KEY_ID };
   const now = Math.floor(Date.now() / 1000);
+  if (cachedAPNsJWT && now - cachedAPNsJWT.iat < 40 * 60) {
+    return cachedAPNsJWT.token;
+  }
+  const header = { alg: 'ES256', kid: env.APPLE_KEY_ID };
   const payload = { iss: env.APPLE_TEAM_ID, iat: now };
 
   const b64url = (buf: ArrayBuffer) =>
@@ -22,26 +29,52 @@ async function generateAPNsJWT(env: Env): Promise<string> {
   const key = await crypto.subtle.importKey('pkcs8', keyData, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
   const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, new TextEncoder().encode(signingInput));
 
-  return `${signingInput}.${b64url(signature)}`;
+  const token = `${signingInput}.${b64url(signature)}`;
+  cachedAPNsJWT = { token, iat: now };
+  return token;
+}
+
+export type Intensity = 'light' | 'moderate' | 'heavy';
+
+export function intensityFromMmPerHr(mmPerHr: number): Intensity {
+  if (mmPerHr < 2.5) return 'light';
+  if (mmPerHr < 7.5) return 'moderate';
+  return 'heavy';
 }
 
 export async function sendRainAlert(
   deviceToken: string,
   minutesUntilRain: number,
-  env: Env
+  env: Env,
+  intensity: Intensity = 'light'
 ): Promise<void> {
-  const body =
-    minutesUntilRain <= 0
-      ? 'Rain is starting now!'
-      : minutesUntilRain <= 5
-        ? 'Rain starting in the next few minutes'
-        : `Rain expected in ~${minutesUntilRain} minutes`;
+  const rain = intensity === 'light' ? 'Rain' : `${intensity[0].toUpperCase()}${intensity.slice(1)} rain`;
 
-  await sendNotification(deviceToken, { title: 'Rain Incoming', body }, 1, env);
+  let title: string;
+  let body: string;
+  if (minutesUntilRain <= 0) {
+    title = 'Rain starting now';
+    body = `${rain} is beginning in your area.`;
+  } else if (minutesUntilRain <= 5) {
+    title = 'Rain in a few minutes';
+    body = `${rain} starts in the next few minutes.`;
+  } else {
+    title = `Rain in ~${minutesUntilRain} min`;
+    body = `${rain} expected in about ${minutesUntilRain} minutes.`;
+  }
+  await sendNotification(deviceToken, { title, body }, 1, env);
 }
 
-export async function sendRainEndAlert(deviceToken: string, env: Env): Promise<void> {
-  await sendNotification(deviceToken, { title: 'Rain Ending', body: 'Rain is expected to stop soon' }, 0, env);
+export async function sendRainEndAlert(
+  deviceToken: string,
+  env: Env,
+  minutesUntilEnd = 0
+): Promise<void> {
+  const body =
+    minutesUntilEnd <= 5
+      ? 'The rain should stop in the next few minutes.'
+      : `The rain should stop in about ${minutesUntilEnd} minutes.`;
+  await sendNotification(deviceToken, { title: 'Rain ending soon', body }, 0, env);
 }
 
 async function sendNotification(
@@ -65,6 +98,60 @@ async function sendNotification(
     body: JSON.stringify({
       aps: { alert, badge, sound: 'default' },
     }),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`APNs error ${resp.status}: ${text}`);
+  }
+}
+
+// ActivityKit decodes a Live Activity push's "content-state" with a default
+// JSONDecoder, whose date strategy is `.deferredToDate` — NOT Unix epoch seconds.
+// Foundation's reference date is 2001-01-01T00:00:00Z, which is 978307200 seconds
+// after the Unix epoch. Any `Date?` field inside content-state (e.g. countdownTarget)
+// must be encoded as seconds-since-2001, or ActivityKit will fail to decode the push.
+// (The outer `aps` fields — timestamp/stale-date/dismissal-date — are unrelated to
+// content-state and use ordinary Unix epoch seconds, per Apple's APNs docs.)
+const APPLE_REFERENCE_DATE_OFFSET_SECONDS = 978307200;
+
+export function encodeActivityDate(date: Date): number {
+  return date.getTime() / 1000 - APPLE_REFERENCE_DATE_OFFSET_SECONDS;
+}
+
+export type LiveActivityEvent = 'update' | 'end';
+
+export async function sendLiveActivityUpdate(
+  activityToken: string,
+  contentState: LiveActivityContentState,
+  env: Env,
+  event: LiveActivityEvent = 'update'
+): Promise<void> {
+  const token = await generateAPNsJWT(env);
+
+  const host = env.APNS_ENV === 'sandbox' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  const aps: Record<string, unknown> = {
+    timestamp: nowSeconds,
+    event,
+    'content-state': contentState,
+    'stale-date': nowSeconds + 45 * 60,
+  };
+  if (event === 'end') {
+    aps['dismissal-date'] = nowSeconds + 5 * 60;
+  }
+
+  const resp = await fetch(`https://${host}/3/device/${activityToken}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `bearer ${token}`,
+      'apns-topic': `${env.APNS_TOPIC}.push-type.liveactivity`,
+      'apns-push-type': 'liveactivity',
+      'apns-priority': '10',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ aps }),
   });
 
   if (!resp.ok) {
