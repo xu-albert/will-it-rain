@@ -1,9 +1,16 @@
 import { Env } from './types';
 
 // Generate JWT for APNs authentication (same key as WeatherKit but different use)
+// APNs provider tokens may be reused for up to 1 hour; regenerating one per push
+// trips APNs "TooManyProviderTokenUpdates" (429). Cache and refresh every ~40 min.
+let cachedAPNsJWT: { token: string; iat: number } | null = null;
+
 async function generateAPNsJWT(env: Env): Promise<string> {
-  const header = { alg: 'ES256', kid: env.APPLE_KEY_ID };
   const now = Math.floor(Date.now() / 1000);
+  if (cachedAPNsJWT && now - cachedAPNsJWT.iat < 40 * 60) {
+    return cachedAPNsJWT.token;
+  }
+  const header = { alg: 'ES256', kid: env.APPLE_KEY_ID };
   const payload = { iss: env.APPLE_TEAM_ID, iat: now };
 
   const b64url = (buf: ArrayBuffer) =>
@@ -22,7 +29,9 @@ async function generateAPNsJWT(env: Env): Promise<string> {
   const key = await crypto.subtle.importKey('pkcs8', keyData, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
   const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, new TextEncoder().encode(signingInput));
 
-  return `${signingInput}.${b64url(signature)}`;
+  const token = `${signingInput}.${b64url(signature)}`;
+  cachedAPNsJWT = { token, iat: now };
+  return token;
 }
 
 export type Intensity = 'light' | 'moderate' | 'heavy';
