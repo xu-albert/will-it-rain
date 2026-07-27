@@ -34,6 +34,41 @@ async function generateAPNsJWT(env: Env): Promise<string> {
   return token;
 }
 
+// APNs rejections carry a machine-readable `reason` that decides whether the
+// token is worth keeping. Callers need the status and reason to tell "this
+// device is gone" apart from "APNs is having a bad day", so surface both
+// instead of collapsing them into a string.
+export class APNsError extends Error {
+  constructor(
+    readonly status: number,
+    readonly reason: string
+  ) {
+    super(`APNs error ${status}: ${reason}`);
+    this.name = 'APNsError';
+  }
+
+  // 410 is APNs telling us definitively that the token is no longer valid.
+  get isUnregistered(): boolean {
+    return this.status === 410 || this.reason.includes('Unregistered');
+  }
+
+  // BadDeviceToken is ambiguous: it's what a genuinely dead token returns, but
+  // also what *every* token returns if APNS_ENV points at the wrong APNs host.
+  // Callers must not treat a single occurrence as proof the device is gone.
+  get isBadDeviceToken(): boolean {
+    return this.reason.includes('BadDeviceToken');
+  }
+}
+
+function parseAPNsReason(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { reason?: string };
+    return parsed.reason ?? body;
+  } catch {
+    return body;
+  }
+}
+
 export type Intensity = 'light' | 'moderate' | 'heavy';
 
 export function intensityFromMmPerHr(mmPerHr: number): Intensity {
@@ -101,8 +136,7 @@ async function sendNotification(
   });
 
   if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`APNs error ${resp.status}: ${text}`);
+    throw new APNsError(resp.status, parseAPNsReason(await resp.text()));
   }
 }
 
@@ -155,7 +189,6 @@ export async function sendLiveActivityUpdate(
   });
 
   if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`APNs error ${resp.status}: ${text}`);
+    throw new APNsError(resp.status, parseAPNsReason(await resp.text()));
   }
 }

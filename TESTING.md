@@ -52,19 +52,44 @@ There are several device tokens (old reinstalls each make a new one). To find
 
 ## C. Fire a real end-to-end push to your phone
 
+**Both test endpoints now require the `X-Admin-Token` header.** They send real
+pushes and spend real WeatherKit quota, and the Worker URL is extractable from
+the shipped app, so they can't stay open. Without a correct header they return
+`401`. The secret lives in the Worker as `ADMIN_TOKEN` — set it with
+`npx wrangler secret put ADMIN_TOKEN` and keep the value in your password
+manager (never in this file).
+
 ```bash
+export ADMIN_TOKEN='<the-secret>'
+
 # Direct — forces a "rain in 10 min" push:
 curl -X POST https://will-it-rain.albertwxu.workers.dev/test-rain \
   -H "Content-Type: application/json" \
+  -H "X-Admin-Token: $ADMIN_TOKEN" \
   -d '{"token":"<your-token>","minutesUntilRain":10}'
 #   -> {"ok":true,...} AND your phone buzzes  = works, production confirmed
 #   -> {"error":"...BadDeviceToken..."}       = that token is stale/wrong env
+#   -> {"error":"Unauthorized"} (401)         = missing/wrong X-Admin-Token
 
 # Full cron path for your location (only pushes if it detects rain within lead time):
 curl -X POST https://will-it-rain.albertwxu.workers.dev/test-cron \
   -H "Content-Type: application/json" \
+  -H "X-Admin-Token: $ADMIN_TOKEN" \
   -d '{"token":"<your-token>","lat":37.7749,"lon":-122.4194}'
 ```
+
+### Dead token cleanup (automatic since 2026-07-27)
+
+The cron no longer keeps pushing to tokens APNs has rejected:
+
+- **410 Unregistered** → the device record is deleted immediately.
+- **BadDeviceToken** → a strike counter (`apnsfail:<token>`, 24h TTL). The
+  device is dropped on the 5th strike. It is deliberately not 1, because a
+  wrong `APNS_ENV` makes *every* device return BadDeviceToken, and a single
+  bad tick must not be able to wipe the whole device list. The app re-registers
+  on every foreground, so an over-eager delete heals itself.
+- A rejected **Live Activity** push clears only `activityToken`, leaving the
+  device registered for ordinary rain alerts.
 
 ## D. Watch the Worker live
 

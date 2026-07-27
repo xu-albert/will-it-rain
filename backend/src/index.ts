@@ -1,10 +1,56 @@
 import { Env, DeviceRegistration, LiveActivityContentState } from './types';
 import { getDevicesByGrid, gridCenter, toGridKey } from './grid';
 import { fetchForecast } from './weatherkit';
-import { sendRainAlert, sendRainEndAlert, sendLiveActivityUpdate, encodeActivityDate, intensityFromMmPerHr } from './apns';
+import {
+  APNsError,
+  sendRainAlert,
+  sendRainEndAlert,
+  sendLiveActivityUpdate,
+  encodeActivityDate,
+  intensityFromMmPerHr,
+} from './apns';
+import {
+  asBoolean,
+  clampLeadTimeMinutes,
+  isValidLatitude,
+  isValidLongitude,
+  isValidActivityToken,
+  isValidDeviceToken,
+  secureEquals,
+} from './validate';
 
 // Live Activity segment math is normalized over this window, matching the widget's ring.
 const ACTIVITY_WINDOW_MINUTES = 90;
+
+// How many BadDeviceToken rejections a device may collect before we drop it.
+// See recordPushFailure for why this isn't 1.
+const BAD_TOKEN_STRIKES = 5;
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+// A malformed body should be a 400, not an unhandled throw that surfaces as a
+// generic Worker 500.
+async function readJson<T>(request: Request): Promise<T | null> {
+  try {
+    return (await request.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+// /test-rain and /test-cron send real pushes and burn real WeatherKit quota, so
+// they require a shared secret. Fails closed: if ADMIN_TOKEN was never set, the
+// endpoints are unusable rather than open.
+function isAuthorizedAdmin(request: Request, env: Env): boolean {
+  const provided = request.headers.get('X-Admin-Token');
+  if (!env.ADMIN_TOKEN || !provided) return false;
+  return secureEquals(provided, env.ADMIN_TOKEN);
+}
 
 export default {
   // HTTP API for device registration
@@ -28,10 +74,12 @@ export default {
     }
 
     if (request.method === 'POST' && url.pathname === '/test-rain') {
+      if (!isAuthorizedAdmin(request, env)) return json({ error: 'Unauthorized' }, 401);
       return handleTestRain(request, env);
     }
 
     if (request.method === 'POST' && url.pathname === '/test-cron') {
+      if (!isAuthorizedAdmin(request, env)) return json({ error: 'Unauthorized' }, 401);
       return handleTestCron(request, env);
     }
 
@@ -76,6 +124,7 @@ export default {
             await env.DEVICES.put(metaKey, now.toString(), { expirationTtl: 3600 });
           } catch (err) {
             console.error(`[Cron] Failed to notify device (${kind}): ${err}`);
+            await recordPushFailure(device.token, err, env);
           }
         };
 
@@ -115,6 +164,7 @@ export default {
                   console.log(`[Activity] Sent rain-start update, grid ${grid.gridKey}`);
                 } catch (err) {
                   console.error(`[Activity] push failed: ${err}`);
+                  await discardDeadActivityToken(device.token, err, env);
                 }
               }
             }
@@ -172,6 +222,7 @@ export default {
                 }
               } catch (err) {
                 console.error(`[Activity] push failed: ${err}`);
+                await discardDeadActivityToken(device.token, err, env);
               }
             }
           }
@@ -217,6 +268,17 @@ function computeSegments(
 }
 
 
+// A rejected Live Activity push means the activity itself is over — the user
+// dismissed it, or it aged out — not that the device is gone. Drop only the
+// activity token so the device keeps receiving ordinary rain alerts, and stop
+// pushing to a token APNs has already refused.
+async function discardDeadActivityToken(deviceToken: string, err: unknown, env: Env): Promise<void> {
+  if (!(err instanceof APNsError)) return;
+  if (!err.isUnregistered && !err.isBadDeviceToken) return;
+  await clearActivityToken(deviceToken, env);
+  console.log(`[Activity] Cleared dead activity token (${err.reason})`);
+}
+
 // Drop the stored activity token once its Live Activity has been ended.
 async function clearActivityToken(deviceToken: string, env: Env): Promise<void> {
   const key = `device:${deviceToken}`;
@@ -230,38 +292,35 @@ async function clearActivityToken(deviceToken: string, env: Env): Promise<void> 
 }
 
 async function handleTestRain(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { token?: string; minutesUntilRain?: number };
+  const body = await readJson<{ token?: unknown; minutesUntilRain?: unknown }>(request);
+  if (!body) return json({ error: 'Malformed JSON body' }, 400);
 
-  if (!body.token) {
-    return new Response(JSON.stringify({ error: 'Missing token' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  if (!isValidDeviceToken(body.token)) {
+    return json({ error: 'Invalid or missing token' }, 400);
   }
 
-  const minutesUntilRain = body.minutesUntilRain ?? 10;
+  const minutesUntilRain =
+    typeof body.minutesUntilRain === 'number' && Number.isFinite(body.minutesUntilRain)
+      ? Math.round(body.minutesUntilRain)
+      : 10;
 
   try {
     await sendRainAlert(body.token, minutesUntilRain, env);
-    return new Response(JSON.stringify({ ok: true, minutesUntilRain }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return json({ ok: true, minutesUntilRain });
   } catch (err) {
-    return new Response(JSON.stringify({ error: String(err) }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return json({ error: String(err) }, 500);
   }
 }
 
 async function handleTestCron(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { token?: string; lat?: number; lon?: number };
+  const body = await readJson<{ token?: unknown; lat?: unknown; lon?: unknown }>(request);
+  if (!body) return json({ error: 'Malformed JSON body' }, 400);
 
-  if (!body.token || body.lat == null || body.lon == null) {
-    return new Response(JSON.stringify({ error: 'Missing token, lat, or lon' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  if (!isValidDeviceToken(body.token)) {
+    return json({ error: 'Invalid or missing token' }, 400);
+  }
+  if (!isValidLatitude(body.lat) || !isValidLongitude(body.lon)) {
+    return json({ error: 'Invalid or missing lat/lon' }, 400);
   }
 
   try {
@@ -307,87 +366,115 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleRegister(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as {
-    token?: string;
-    lat?: number;
-    lon?: number;
-    leadTimeMinutes?: number;
-    rainStartEnabled?: boolean;
-    rainEndEnabled?: boolean;
-  };
+  const body = await readJson<{
+    token?: unknown;
+    lat?: unknown;
+    lon?: unknown;
+    leadTimeMinutes?: unknown;
+    rainStartEnabled?: unknown;
+    rainEndEnabled?: unknown;
+  }>(request);
+  if (!body) return json({ error: 'Malformed JSON body' }, 400);
 
-  if (!body.token || body.lat == null || body.lon == null) {
-    return new Response(JSON.stringify({ error: 'Missing token, lat, or lon' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  if (!isValidDeviceToken(body.token)) {
+    return json({ error: 'Invalid or missing token' }, 400);
+  }
+  if (!isValidLatitude(body.lat) || !isValidLongitude(body.lon)) {
+    return json({ error: 'Invalid or missing lat/lon' }, 400);
   }
 
   const registration: DeviceRegistration = {
     token: body.token,
     lat: body.lat,
     lon: body.lon,
-    leadTimeMinutes: body.leadTimeMinutes ?? 20,
-    rainStartEnabled: body.rainStartEnabled ?? true,
-    rainEndEnabled: body.rainEndEnabled ?? true,
+    leadTimeMinutes: clampLeadTimeMinutes(body.leadTimeMinutes),
+    rainStartEnabled: asBoolean(body.rainStartEnabled, true),
+    rainEndEnabled: asBoolean(body.rainEndEnabled, true),
     registeredAt: new Date().toISOString(),
   };
 
   // Key by device token for easy lookup/update
   try {
-    const key = `device:${body.token}`;
-    const value = JSON.stringify(registration);
-    console.log(`[Register] Writing key=${key} value=${value}`);
-    await env.DEVICES.put(key, value);
-    console.log(`[Register] Write successful`);
+    // Location and push token are the two pieces of user data here — log that a
+    // write happened, not what was written.
+    await env.DEVICES.put(`device:${body.token}`, JSON.stringify(registration));
+    console.log(`[Register] Stored registration for grid ${toGridKey(body.lat, body.lon)}`);
   } catch (err) {
     console.error(`[Register] KV write failed: ${err}`);
-    return new Response(JSON.stringify({ error: 'KV write failed', details: String(err) }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return json({ error: 'KV write failed' }, 500);
   }
 
-  return new Response(JSON.stringify({ ok: true, gridKey: toGridKey(body.lat, body.lon) }), {
-    headers: { 'Content-Type': 'application/json' },
-  });
+  return json({ ok: true, gridKey: toGridKey(body.lat, body.lon) });
 }
 
 async function handleUnregister(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { token?: string };
-  if (!body.token) {
-    return new Response(JSON.stringify({ error: 'Missing token' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  const body = await readJson<{ token?: unknown }>(request);
+  if (!body) return json({ error: 'Malformed JSON body' }, 400);
+  if (!isValidDeviceToken(body.token)) {
+    return json({ error: 'Invalid or missing token' }, 400);
   }
 
-  await env.DEVICES.delete(`device:${body.token}`);
-  await env.DEVICES.delete(`notified:${body.token}`);
+  await removeDevice(body.token, env);
 
-  return new Response(JSON.stringify({ ok: true }), {
-    headers: { 'Content-Type': 'application/json' },
-  });
+  return json({ ok: true });
+}
+
+// Drops a device and every key keyed off its token. The dedup keys the cron
+// writes are `notified-start:` / `notified-end:`; an earlier version deleted a
+// `notified:` key that nothing has ever written.
+async function removeDevice(deviceToken: string, env: Env): Promise<void> {
+  await Promise.all([
+    env.DEVICES.delete(`device:${deviceToken}`),
+    env.DEVICES.delete(`notified-start:${deviceToken}`),
+    env.DEVICES.delete(`notified-end:${deviceToken}`),
+    env.DEVICES.delete(`apnsfail:${deviceToken}`),
+  ]);
+}
+
+// Decides whether a push failure means the device is gone.
+//
+// A 410 is APNs stating outright that the token is dead, so act on it at once.
+// BadDeviceToken needs more care: it is also what every single device returns
+// when APNS_ENV points at the wrong APNs host, so treating one as fatal would
+// let a config typo wipe the whole device list in a single cron tick. Requiring
+// several strikes inside the counter's 24h TTL keeps that from happening, and
+// still clears genuinely dead tokens within an hour. The app re-registers on
+// every foreground, so an over-eager delete heals itself.
+async function recordPushFailure(deviceToken: string, err: unknown, env: Env): Promise<void> {
+  if (!(err instanceof APNsError)) return;
+
+  if (err.isUnregistered) {
+    await removeDevice(deviceToken, env);
+    console.log(`[APNs] Dropped unregistered device token`);
+    return;
+  }
+
+  if (!err.isBadDeviceToken) return;
+
+  const key = `apnsfail:${deviceToken}`;
+  const strikes = parseInt((await env.DEVICES.get(key)) ?? '0', 10) + 1;
+  if (strikes >= BAD_TOKEN_STRIKES) {
+    await removeDevice(deviceToken, env);
+    console.log(`[APNs] Dropped device after ${strikes} BadDeviceToken rejections`);
+  } else {
+    await env.DEVICES.put(key, String(strikes), { expirationTtl: 86400 });
+    console.log(`[APNs] BadDeviceToken strike ${strikes}/${BAD_TOKEN_STRIKES}`);
+  }
 }
 
 async function handleRegisterActivity(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { token?: string; activityToken?: string };
+  const body = await readJson<{ token?: unknown; activityToken?: unknown }>(request);
+  if (!body) return json({ error: 'Malformed JSON body' }, 400);
 
-  if (!body.token || !body.activityToken) {
-    return new Response(JSON.stringify({ error: 'Missing token or activityToken' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  if (!isValidDeviceToken(body.token) || !isValidActivityToken(body.activityToken)) {
+    return json({ error: 'Invalid or missing token or activityToken' }, 400);
   }
 
   const key = `device:${body.token}`;
   const existing = await env.DEVICES.get(key, 'json');
   if (!existing) {
     console.log(`[Activity] Register failed: no device for token`);
-    return new Response(JSON.stringify({ error: 'Device not registered' }), {
-      status: 404,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return json({ error: 'Device not registered' }, 404);
   }
 
   const registration = existing as DeviceRegistration;
@@ -397,18 +484,14 @@ async function handleRegisterActivity(request: Request, env: Env): Promise<Respo
   await env.DEVICES.put(key, JSON.stringify(registration));
   console.log(`[Activity] Registered activity token for device`);
 
-  return new Response(JSON.stringify({ ok: true }), {
-    headers: { 'Content-Type': 'application/json' },
-  });
+  return json({ ok: true });
 }
 
 async function handleUnregisterActivity(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { token?: string };
-  if (!body.token) {
-    return new Response(JSON.stringify({ error: 'Missing token' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  const body = await readJson<{ token?: unknown }>(request);
+  if (!body) return json({ error: 'Malformed JSON body' }, 400);
+  if (!isValidDeviceToken(body.token)) {
+    return json({ error: 'Invalid or missing token' }, 400);
   }
 
   const key = `device:${body.token}`;
@@ -421,7 +504,5 @@ async function handleUnregisterActivity(request: Request, env: Env): Promise<Res
     console.log(`[Activity] Unregistered activity token for device`);
   }
 
-  return new Response(JSON.stringify({ ok: true }), {
-    headers: { 'Content-Type': 'application/json' },
-  });
+  return json({ ok: true });
 }
