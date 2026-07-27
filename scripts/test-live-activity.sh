@@ -25,6 +25,16 @@
 #   * The Live Activity is only visible once the app is BACKGROUNDED (compact
 #     Dynamic Island) or the device is locked. A foreground screenshot shows
 #     the app, not the activity.
+#
+# Two passes, because the two presentations need opposite things:
+#
+#   1. Dynamic Island  — needs the app backgrounded. Real ActivityKit render.
+#   2. Lock-screen card — needs the app foregrounded, via the app's
+#      `-liveActivityCards` debug screen. The real lock screen is unreachable
+#      from a script (`simctl` has no lock command; Simulator's Device ▸ Lock
+#      over osascript fails silently too often), and the card is where every
+#      part of the palette that the island does not show actually lives — the
+#      track, its glow, and the ring around the "now" dot.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -47,6 +57,31 @@ SETTLE=4   # seconds for the activity to appear and the countdown to start
 fail() { printf '\033[31mFAIL\033[0m  %s\n' "$1"; }
 pass() { printf '\033[32mok\033[0m    %s\n' "$1"; }
 info() { printf '\033[2m      %s\033[0m\n' "$1"; }
+
+failures=0
+
+# Capture the simulator screen to <path>.
+#
+# The `rm -f` is load-bearing. macOS attaches a per-file access ACL
+# (com.apple.macl) to screenshots, keyed to whichever app created them, and
+# simctl is denied when it tries to overwrite a PNG some *other* process wrote
+# — an earlier run under a different agent, say. It fails with EPERM
+# ("You don't have permission"), not a file-mode error, so `ls` shows nothing
+# wrong. Unlinking first sidesteps the ACL completely.
+#
+# Failure is counted, not fatal: under `set -e` a single denied write used to
+# abort the whole run mid-scenario, which reads like the harness hanging.
+capture_shot() {
+  local path="$1" label="$2"
+  rm -f "$path"
+  if ! xcrun simctl io "$SIM_UDID" screenshot --type=png "$path" >/dev/null 2>&1 \
+     || [ ! -s "$path" ]; then
+    fail "screenshot failed: $label"
+    failures=$((failures + 1))
+    return 0
+  fi
+  pass "wrote $(basename "$path")"
+}
 
 mkdir -p "$OUTDIR"
 
@@ -100,8 +135,9 @@ xcrun simctl install "$SIM_UDID" "$APP_PATH"
 xcrun simctl status_bar "$SIM_UDID" override --time "9:41" \
   --batteryState charged --batteryLevel 100 --wifiBars 3 >/dev/null 2>&1 || true
 
-# --- run scenarios ---------------------------------------------------------
-failures=0
+# --- pass 1: Dynamic Island ------------------------------------------------
+echo
+echo "=== pass 1/2: Dynamic Island ==="
 for code in "${SCENARIOS[@]}"; do
   echo
   echo "--- scenario $code ---"
@@ -152,18 +188,60 @@ for code in "${SCENARIOS[@]}"; do
   fi
   sleep 3
 
-  shot="$OUTDIR/scenario-${code}-island.png"
-  xcrun simctl io "$SIM_UDID" screenshot --type=png "$shot" >/dev/null 2>&1
-
   # Deliberately NOT cropped to the island band. `sips` can only crop from the
   # centre — `--cropOffset` could not be made to reach the top strip at any sign
   # or magnitude, and it silently emits a transparent (apparently blank) image
   # when the window falls outside the source. A misleading blank screenshot is
   # worse than a full one, so keep the whole frame; the island is the top ~150px.
-  pass "wrote scenario-${code}-island.png"
+  capture_shot "$OUTDIR/scenario-${code}-island.png" "island $code"
 done
 
 [ -n "${FILLER:-}" ] && xcrun simctl terminate "$SIM_UDID" "$FILLER" >/dev/null 2>&1
+
+# --- pass 2: lock-screen cards ---------------------------------------------
+#
+# Three cards per shot: any more and the last one runs off the bottom of the
+# screen, which a screenshot cannot tell you about — it just looks like a
+# shorter list.
+echo
+echo "=== pass 2/2: lock-screen cards ==="
+group=()
+capture_group() {
+  [ ${#group[@]} -eq 0 ] && return 0
+  local codes
+  codes=$(IFS=,; echo "${group[*]}")
+  echo
+  echo "--- cards $codes ---"
+
+  xcrun simctl terminate "$SIM_UDID" "$BUNDLE_ID" >/dev/null 2>&1 || true
+  sleep 1
+  local console
+  console=$(mktemp)
+  ( xcrun simctl launch --console-pty "$SIM_UDID" "$BUNDLE_ID" \
+      -liveActivityCards "$codes" >"$console" 2>&1 & ) || true
+  sleep "$SETTLE"
+
+  # The app must confirm it parsed the flag. Without this check a screenshot of
+  # the ordinary app UI would pass silently — exactly the failure that made the
+  # first version of this script report success while capturing a loading screen.
+  if grep -q "Rendering cards" "$console"; then
+    pass "card screen rendered"
+  else
+    fail "card screen did NOT render for $codes"
+    info "$(grep -i 'liveactivity' "$console" | head -3)"
+    info "A Release build strips this screen too — check the configuration."
+    failures=$((failures + 1))
+  fi
+
+  capture_shot "$OUTDIR/cards-$(IFS=-; echo "${group[*]}").png" "cards $codes"
+  group=()
+}
+
+for code in "${SCENARIOS[@]}"; do
+  group+=("$code")
+  [ ${#group[@]} -eq 3 ] && capture_group
+done
+capture_group
 
 xcrun simctl terminate "$SIM_UDID" "$BUNDLE_ID" >/dev/null 2>&1 || true
 xcrun simctl status_bar "$SIM_UDID" clear >/dev/null 2>&1 || true
@@ -172,11 +250,22 @@ echo
 echo "Screenshots: $OUTDIR"
 cat <<'EOF'
 
+  scenario-*-island.png   Dynamic Island (glyph + countdown only)
+  cards-*.png             the lock-screen card — where the palette lives
+
 Now check by eye — these are the assertions a script cannot make:
 
   A,  B,  C   cyan track, droplet glyph
   AS, BS, CS  pale near-white track, snowflake glyph, dark glyph in the header badge
   BX          MUST be identical to B (cyan, droplet) with a TICKING countdown
+
+On the wintry cards specifically (this is the W1b palette):
+  * the track is near-white with a WHITE halo, not a blue one
+  * in BS the track starts at 0, directly under the "now" dot — the blue-grey
+    ring is the only thing keeping those two whites apart. If the dot has
+    dissolved into the track, the ring is too light or has gone missing
+  * the snowflake in the header badge is dark navy. White-on-near-white means
+    someone reused the rain badge colour
 
 BX is the one that matters most. It carries a payload with no `precip` field,
 standing in for a push from a Worker that predates it. If BX renders as snow the

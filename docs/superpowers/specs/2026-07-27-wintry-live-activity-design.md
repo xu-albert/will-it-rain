@@ -51,6 +51,28 @@ divide them while still reading as ice rather than as a dark outline.
 Measured on the rendered mockups, W1b's track sits ~10 luminance points above
 the earlier B3 pick at the same sample points (245 vs 236 at 25% along).
 
+### Track alignment fix (found while verifying W1b on a real render)
+
+The rail and its segments carried `.offset(y: 6)` inside a 16pt frame whose
+ZStack already centres its children on y=8, putting the track's centre at y=14
+while the "now" dot and the hour dots sat at y=8. Measured on an iPhone 16 Pro
+screenshot: dot centre y=1520.5px, track centre y=1538.5px — 18px at 3×, exactly
+6pt. So the track hung below the dots instead of running through them.
+
+This shipped in 1.1 and affects rain equally; the fix removes the offset and is
+worth taking in 1.1.1 for two reasons beyond fidelity to the mockups:
+
+1. It is the premise of the now-dot ring decision above. W1b was chosen by
+   comparing HTML mockups in which the dot sits *inside* the track. On device
+   they barely grazed, so the case the ring exists to handle was not actually
+   occurring — the palette had been picked against a situation the app never
+   rendered.
+2. The hour dots had the same 6pt drift, so on the intermittent card they
+   floated above the bursts they annotate.
+
+Verified after the change: dot centre and track centre differ by 0.0px on both
+the rain and wintry cards.
+
 ## Data model
 
 Add to `Shared/RainActivityAttributes.swift`:
@@ -145,7 +167,9 @@ it is verification-after-ship rather than a release gate.
 | File | Change |
 |---|---|
 | `Shared/RainActivityAttributes.swift` | `Precip` enum, optional `precip` field |
-| `WillItRainWidgets/RainLiveActivity.swift` | Palette switch, snowflake glyph, badge glyph colour |
+| `Shared/LiveActivityCardViews.swift` | Card views + palette, moved out of the widget so the app can render them; track alignment fix |
+| `WillItRainWidgets/RainLiveActivity.swift` | Reduced to the ActivityKit wiring |
+| `WillItRain/Views/LiveActivityCardPreview.swift` | DEBUG `-liveActivityCards` screen for lock-screen capture |
 | `WillItRain/Services/LiveActivityService.swift` | Set `precip`; `.mixed` copy |
 | `WillItRain/Models/RainForecast.swift` | `.mixed` case + icon |
 | `WillItRain/Services/WeatherService.swift` | Map WeatherKit `.mixed` |

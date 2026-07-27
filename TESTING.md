@@ -14,7 +14,7 @@ cd backend && npm test          # typecheck + validator units + endpoint contrac
 |---|---|
 | `backend/test/validate.test.mjs` | Token/coordinate/lead-time validators, incl. every real production device token |
 | `backend/test/endpoints.test.sh` | `/test-*` stay authenticated; `/register` rejects bad input before writing KV |
-| `scripts/test-live-activity.sh` | Rain vs wintry rendering across all three design states + the legacy-payload regression |
+| `scripts/test-live-activity.sh` | Rain vs wintry rendering across all three design states + the legacy-payload regression, in both presentations |
 | `screenshots/take_screenshots.sh` | App Store screenshots |
 
 **Live Activity gotchas the script encodes** (each cost real time to find):
@@ -31,6 +31,18 @@ cd backend && npm test          # typecheck + validator units + endpoint contrac
   from a Worker that predates the field. It must render exactly like `B`. If it
   renders as snow the default is inverted; if the card freezes, someone made the
   field non-optional and ActivityKit can no longer decode.
+- The script runs **two passes**, because the two presentations need opposite
+  things. The Dynamic Island needs the app backgrounded; the lock-screen card
+  needs it foregrounded, via the app's DEBUG `-liveActivityCards A,B,C` screen.
+  The real lock screen is unreachable from a script — `simctl` has no lock
+  command and Simulator's Device ▸ Lock over osascript fails silently too often
+  to trust. So the card renders in-app from the same views the widget uses
+  (`Shared/LiveActivityCardViews.swift`). This matters because everything the
+  wintry palette touches — the track, its glow, the ring around the "now" dot —
+  appears **only** on the card. The island shows a glyph and a countdown.
+- `simctl` cannot overwrite a screenshot that a *different* process created:
+  macOS attaches a per-file access ACL (`com.apple.macl`) and the write fails
+  with EPERM, which `ls` gives no hint of. The script unlinks each target first.
 
 ---
 
