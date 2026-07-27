@@ -21,24 +21,35 @@ knowledge never crosses into the extension.
 and mixed share one "wintry" look. The visual fork is binary, so the data that
 drives it should be too.
 
-**Frost B2** is the chosen palette — a near-white head resolving to a colder
-blue. Selected from five explored options; all are archived in
-`docs/design/live-activity/snow-mockup-v{1,2}.{html,png}` with the alternatives
-intact so the decision can be revisited without rebuilding them.
+**W1b** is the chosen palette — an essentially white track with a white glow
+and the blue tint pulled almost out. Selected over eight explored options; all
+are archived in `docs/design/live-activity/snow-mockup-v{1,2,3}.{html,png}` with
+the alternatives intact so the decision can be revisited without rebuilding
+them. (The earlier picks, B2 then B3, are preserved there too.)
 
-| Role | Rain (unchanged) | Wintry (B2) |
+| Role | Rain (unchanged) | Wintry (W1b) |
 |---|---|---|
-| Track gradient | `#54C3F5` → `#38ADE7` | `#F0F8FF` → `#9FC4DE` |
-| Glow / status dot | `#54C3F5` | `#9FC4DE` |
-| Time flag | `#9DDCFF` | `#DCEEFB` |
+| Track gradient | `#54C3F5` → `#38ADE7` | `#FFFFFF` → `#DCE8F0` |
+| Glow | `#54C3F5` | `#FFFFFF` |
+| Now-dot ring | `white @ 22%` | `#B0CBE0 @ 75%` |
+| Time flag | `#9DDCFF` | `#EAF4FF` |
 | Compact / countdown | `#CFEEFF` | `#E8F4FC` |
-| Keyline tint | `#54C3F5` | `#9FC4DE` |
+| Keyline tint | `#54C3F5` | `#FFFFFF` |
 | Glyph | `drop.fill` | `snowflake` |
 | Glyph colour **inside header badge** | white | `#12233B` |
 
-That last row is not a style preference. The header badge is filled with the
-track gradient; against a near-white wintry badge a white glyph disappears, so
-the wintry badge takes a dark glyph.
+Two rows there are function, not taste:
+
+*Glyph colour inside the badge* — the badge is filled with the track gradient,
+so against a near-white wintry badge a white glyph disappears.
+
+*Now-dot ring* — in the "falling now" state the track segment starts at 0,
+directly beneath the white "now" dot. With a near-white track the two whites
+merge, so the ring has to carry the separation. `#B0CBE0` is deep enough to
+divide them while still reading as ice rather than as a dark outline.
+
+Measured on the rendered mockups, W1b's track sits ~10 luminance points above
+the earlier B3 pick at the same sample points (245 vs 236 at 25% along).
 
 ## Data model
 
@@ -115,7 +126,7 @@ cases, which is the right default for a rain app.
 |---|---|---|
 | Optional decode wrong → activity silently freezes | Push a content-state with **no** `precip` key at a running 1.1.1 activity | Card keeps ticking, renders rain |
 | Old widget, new payload | 1.1 widget receives payload **with** `precip` | Unknown key ignored, no decode failure |
-| Snow never resolves to wintry | New `-liveActivityScenario` snow case | Snowflake + B2 palette in all surfaces |
+| Snow never resolves to wintry | New `-liveActivityScenario` snow case | Snowflake + W1b palette in all surfaces |
 | Copy regressions | Scenario run across rain / snow / sleet / mixed | Correct wording per state A/B/C |
 | Real weather disagrees | Location spoof to a snowing region (Belfast recipe, `TESTING.md`) | Wintry survives a server push |
 

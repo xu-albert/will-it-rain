@@ -3,7 +3,7 @@ import SwiftUI
 import WidgetKit
 
 // Palette from docs/design/live-activity/rain-mockup-v3.html (rain) and
-// snow-mockup-v2.html variant B2 (wintry).
+// snow-mockup-v3.html variant W1b (wintry).
 private enum LA {
     static let bgTop = Color(red: 0x28 / 255, green: 0x39 / 255, blue: 0x4F / 255)
     static let bgBottom = Color(red: 0x15 / 255, green: 0x23 / 255, blue: 0x3D / 255)
@@ -18,7 +18,12 @@ private enum LA {
 /// adding a case here rather than hunting for hard-coded cyan.
 private struct Style {
     let accent: Color        // track head, status dot, keyline
-    let accentDeep: Color    // track tail, glow
+    let accentDeep: Color    // track tail
+    let glow: Color          // halo under the track, status dot, wet hour dots
+    /// Ring around the white "now" dot. It exists to keep that dot legible where
+    /// the track passes underneath it — which happens in the "falling now" state,
+    /// where the segment starts at 0. The paler the track, the more this matters.
+    let nowRing: Color
     let flag: Color          // the little time flag above the track
     let compact: Color       // Dynamic Island compact/minimal foreground
     let glyph: String        // SF Symbol
@@ -33,16 +38,24 @@ private struct Style {
     static let rain = Style(
         accent: Color(red: 0x54 / 255, green: 0xC3 / 255, blue: 0xF5 / 255),
         accentDeep: Color(red: 0x38 / 255, green: 0xAD / 255, blue: 0xE7 / 255),
+        glow: Color(red: 0x54 / 255, green: 0xC3 / 255, blue: 0xF5 / 255),
+        nowRing: .white.opacity(0.22),
         flag: Color(red: 0x9D / 255, green: 0xDC / 255, blue: 0xFF / 255),
         compact: Color(red: 0xCF / 255, green: 0xEE / 255, blue: 0xFF / 255),
         glyph: "drop.fill",
         badgeGlyph: .white
     )
 
+    // "W1b" from docs/design/live-activity/snow-mockup-v3.png: a white glow with
+    // the blue tint pulled almost out of the track, and a blue-grey ring rather
+    // than a dark one — bright enough to read as snow, with the now-dot still
+    // separating from a nearly white track.
     static let wintry = Style(
-        accent: Color(red: 0xF0 / 255, green: 0xF8 / 255, blue: 0xFF / 255),
-        accentDeep: Color(red: 0x9F / 255, green: 0xC4 / 255, blue: 0xDE / 255),
-        flag: Color(red: 0xDC / 255, green: 0xEE / 255, blue: 0xFB / 255),
+        accent: .white,
+        accentDeep: Color(red: 0xDC / 255, green: 0xE8 / 255, blue: 0xF0 / 255),
+        glow: .white,
+        nowRing: Color(red: 0xB0 / 255, green: 0xCB / 255, blue: 0xE0 / 255).opacity(0.75),
+        flag: Color(red: 0xEA / 255, green: 0xF4 / 255, blue: 0xFF / 255),
         compact: Color(red: 0xE8 / 255, green: 0xF4 / 255, blue: 0xFC / 255),
         glyph: "snowflake",
         badgeGlyph: Color(red: 0x12 / 255, green: 0x23 / 255, blue: 0x3B / 255)
@@ -132,7 +145,7 @@ private struct LockScreenActivityView: View {
                 Circle()
                     .fill(style.accent)
                     .frame(width: 6, height: 6)
-                    .shadow(color: style.accentDeep, radius: 3.5)
+                    .shadow(color: style.glow, radius: 3.5)
                 Text(state.statusText)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.55))
@@ -275,7 +288,7 @@ private struct SlimTrackView: View {
                         Capsule()
                             .fill(style.segmentFill)
                             .frame(width: max((seg.end - seg.start) * w, 4), height: 4)
-                            .shadow(color: style.accentDeep.opacity(0.55), radius: 4.5)
+                            .shadow(color: style.glow.opacity(0.55), radius: 4.5)
                             .offset(x: seg.start * w, y: 6)
                     }
                     // hour dots
@@ -283,7 +296,7 @@ private struct SlimTrackView: View {
                         Circle()
                             .fill(isWet(f) ? style.accent : .white.opacity(0.4))
                             .frame(width: 3, height: 3)
-                            .shadow(color: isWet(f) ? style.accentDeep : .clear, radius: 3.5)
+                            .shadow(color: isWet(f) ? style.glow : .clear, radius: 3.5)
                             .position(x: f * w, y: 8)
                     }
                     // now dot (window always starts at now)
@@ -292,7 +305,7 @@ private struct SlimTrackView: View {
                         .frame(width: 10, height: 10)
                         .background {
                             Circle()
-                                .stroke(.white.opacity(0.22), lineWidth: 3)
+                                .stroke(style.nowRing, lineWidth: 3)
                         }
                         .shadow(color: .black.opacity(0.45), radius: 1.5, y: 1)
                         .position(x: 5, y: 8)
