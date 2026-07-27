@@ -112,16 +112,39 @@ So the Worker must send `precip` in the same release. Required changes:
 2. `index.ts` — derive `precip` and include it in both the rain-start and
    rain-end content states.
 
-WeatherKit's `forecastNextHour` response is believed to carry the type in
-`summary[].condition` (values include `clear`, `rain`, `snow`, `sleet`, `hail`,
-`mixed`). The Worker already requests `dataSets=forecastNextHour`
+WeatherKit's `forecastNextHour` response carries the type in
+`summary[].condition`. The Worker already requests `dataSets=forecastNextHour`
 (`weatherkit.ts:40`), so this costs no additional quota.
 
-**This must be confirmed against a live response before code depends on it.**
-Verification step: log `forecastNextHour.summary` from one real `/test-cron`
-call and read it back via `wrangler tail`. If `condition` is absent, fall back to
-mapping from the app only and accept that server pushes clear the wintry state —
-a known, documented limitation rather than a silent bug.
+**Confirmed against live responses 2026-07-27** via
+`backend/test/probe-weatherkit-summary.sh` (which added a `dryRun` mode to
+`/test-cron` so any coordinate can be probed without a device there and without
+sending a push):
+
+| Location | Observed |
+|---|---|
+| Chicago, actively raining | `summary: ["rain","clear"]` → `precip: rain` |
+| Dry locations | `summary: ["clear"]` → `precip: rain` |
+| Queenstown NZ, Bariloche AR | `summary: null` (no coverage) → `precip: rain`, no throw |
+| Bergen NO | `summary: []` → `precip: rain`, no throw |
+
+So the field is real, values are lowercase bare nouns, and periods run in
+chronological order — which is what makes `precipFromForecast`'s "skip leading
+`clear` periods" loop resolve "snow starting in 40 min" to wintry.
+
+Two things this did **not** settle:
+
+*A wintry value has not been observed in the wild* — it was July. Perisher AU is
+covered and in season, so it is the target for a southern-hemisphere follow-up.
+`precipFromForecast` lowercases and strips spaces, hyphens and underscores
+before matching, so `"Snow"`, `"wintry mix"` and `"wintry_mix"` all resolve even
+if Apple's casing differs from `"rain"`.
+
+*Apple's summary uses a higher confidence bar than our own detection.* Belfast
+showed `minutes` precipitation at chance 0.31 while `summary` still said
+`["clear"]`. Very light snow can therefore be detected minute-wise but
+summarised as clear, and would render as rain. That is a documented limitation,
+not a bug — `rain` is the deliberate fallback for a rain app.
 
 ## `.mixed` handling
 

@@ -14,6 +14,7 @@ cd backend && npm test          # typecheck + validator units + endpoint contrac
 |---|---|
 | `backend/test/validate.test.mjs` | Token/coordinate/lead-time validators, incl. every real production device token |
 | `backend/test/endpoints.test.sh` | `/test-*` stay authenticated; `/register` rejects bad input before writing KV |
+| `backend/test/probe-weatherkit-summary.sh` | WeatherKit still populates `forecastNextHour.summary[].condition` — the field snow-vs-rain depends on, whose absence fails silently |
 | `scripts/test-live-activity.sh` | Rain vs wintry rendering across all three design states + the legacy-payload regression, in both presentations |
 | `screenshots/take_screenshots.sh` | App Store screenshots |
 
@@ -179,7 +180,10 @@ curl -X DELETE https://will-it-rain.albertwxu.workers.dev/unregister \
 ## Known gaps (Release 2 follow-ups)
 - Server push says "in your area" (no city name) — backend stores only lat/lon.
   Add `locationName` to the `/register` payload to name the city.
-- Server can't tell rain vs snow (WeatherKit `forecastNextHour` has no type) —
-  only the on-device path is type-aware.
+- ~~Server can't tell rain vs snow~~ — fixed in 1.1.1. It reads
+  `forecastNextHour.summary[].condition`, confirmed live 2026-07-27. Caveat:
+  Apple's summary applies a higher confidence bar than our own minute-level
+  detection (Belfast showed precipitation at chance 0.31 while the summary still
+  said `clear`), so very light snow can render as rain. Deliberate fallback.
 - Cron reads only the next ~hour, so it can't warn earlier than ~75 min out.
 - Stale device tokens accumulate; add 410-Gone cleanup in the APNs path later.

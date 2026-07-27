@@ -361,8 +361,18 @@ async function handleTestRain(request: Request, env: Env): Promise<Response> {
   }
 }
 
+// Runs the cron's detection logic for one coordinate and reports what it saw.
+//
+// `dryRun: true` skips the push, which makes this usable as a plain forecast
+// probe against any coordinate — no device has to exist there and nobody's
+// phone buzzes. That is the only way to answer "does WeatherKit actually
+// populate forecastNextHour.summary[].condition, and with what values?", since
+// the cron's own summary log only fires for a grid that already has a
+// registered device AND active precipitation.
 async function handleTestCron(request: Request, env: Env): Promise<Response> {
-  const body = await readJson<{ token?: unknown; lat?: unknown; lon?: unknown }>(request);
+  const body = await readJson<{
+    token?: unknown; lat?: unknown; lon?: unknown; dryRun?: unknown;
+  }>(request);
   if (!body) return json({ error: 'Malformed JSON body' }, 400);
 
   if (!isValidDeviceToken(body.token)) {
@@ -371,15 +381,20 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
   if (!isValidLatitude(body.lat) || !isValidLongitude(body.lon)) {
     return json({ error: 'Invalid or missing lat/lon' }, 400);
   }
+  const dryRun = body.dryRun === true;
 
   try {
     const forecast = await fetchForecast(body.lat, body.lon, env);
     const minutes = forecast.forecastNextHour?.minutes;
 
+    // The raw conditions, not just the derived value: if Apple renames a case
+    // or ships one WINTRY_CONDITIONS does not know about, `precip` alone would
+    // read as a confident "rain" and hide it.
+    const summary = forecast.forecastNextHour?.summary?.map((s) => s.condition) ?? null;
+    const diagnostics = { precip: precipFromForecast(forecast), summary, dryRun };
+
     if (!minutes || minutes.length === 0) {
-      return new Response(JSON.stringify({ ok: true, result: 'no_forecast_data' }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return json({ ok: true, result: 'no_forecast_data', ...diagnostics });
     }
 
     const now = Date.now();
@@ -388,23 +403,22 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
     );
 
     if (!rainStart) {
-      return new Response(JSON.stringify({ ok: true, result: 'no_rain', minutesChecked: minutes.length }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return json({ ok: true, result: 'no_rain', minutesChecked: minutes.length, ...diagnostics });
     }
 
     const rainStartTime = new Date(rainStart.startTime).getTime();
     const minutesUntilRain = Math.round((rainStartTime - now) / 60000);
 
-    await sendRainAlert(body.token, minutesUntilRain, env);
-    return new Response(JSON.stringify({
+    if (!dryRun) {
+      await sendRainAlert(body.token, minutesUntilRain, env);
+    }
+    return json({
       ok: true,
       result: 'rain_detected',
       minutesUntilRain,
       precipitationChance: rainStart.precipitationChance,
       precipitationIntensity: rainStart.precipitationIntensity,
-    }), {
-      headers: { 'Content-Type': 'application/json' },
+      ...diagnostics,
     });
   } catch (err) {
     return new Response(JSON.stringify({ error: String(err) }), {
