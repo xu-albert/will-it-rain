@@ -1,4 +1,4 @@
-import { Env, DeviceRegistration, LiveActivityContentState } from './types';
+import { Env, DeviceRegistration, LiveActivityContentState, Precip, WeatherKitForecast } from './types';
 import { getDevicesByGrid, gridCenter, toGridKey } from './grid';
 import { fetchForecast } from './weatherkit';
 import {
@@ -25,6 +25,43 @@ const ACTIVITY_WINDOW_MINUTES = 90;
 // How many BadDeviceToken rejections a device may collect before we drop it.
 // See recordPushFailure for why this isn't 1.
 const BAD_TOKEN_STRIKES = 5;
+
+// WeatherKit condition strings that should render with the wintry treatment.
+// Anything with ice in it groups together; everything else is rain.
+const WINTRY_CONDITIONS = new Set(['snow', 'sleet', 'hail', 'mixed', 'flurries', 'wintrymix']);
+
+// Server-side copy, kept in step with `precip`. Without this the widget would
+// draw a snowflake next to the word "rain".
+function copyFor(precip: Precip) {
+  const wintry = precip === 'wintry';
+  return {
+    incoming: wintry ? 'Snow incoming' : 'Rain incoming',
+    expected: wintry ? 'Snow expected' : 'Rain expected',
+    fallingNow: wintry ? 'Snowing now' : 'Raining now',
+    fallingVerb: wintry ? 'Snowing · ' : 'Raining · ',
+    ended: wintry ? 'Snow ended' : 'Rain ended',
+    hasStopped: wintry ? 'Snow has stopped' : 'Rain has stopped',
+  };
+}
+
+// Reads the precipitation type out of forecastNextHour's summary rollup.
+//
+// The per-minute entries carry only chance and intensity, so the summary is the
+// sole source of type in this dataset. Every field is treated as possibly
+// absent: if Apple changes the schema, or the summary contains only "clear",
+// this returns 'rain' — both the old behaviour and the right default for a rain
+// app. It never throws.
+function precipFromForecast(forecast: WeatherKitForecast): Precip {
+  const summary = forecast.forecastNextHour?.summary;
+  if (!summary?.length) return 'rain';
+
+  for (const period of summary) {
+    const condition = period.condition?.toLowerCase().replace(/[\s_-]/g, '');
+    if (!condition || condition === 'clear') continue;
+    return WINTRY_CONDITIONS.has(condition) ? 'wintry' : 'rain';
+  }
+  return 'rain';
+}
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -110,6 +147,15 @@ export default {
 
         if (!rainStart && !rainEnd) return;
 
+        const precip = precipFromForecast(forecast);
+        const copy = copyFor(precip);
+        // Logged so the summary schema can be confirmed against real responses
+        // rather than trusted from Apple's docs — see the 1.1.1 spec.
+        console.log(
+          `[Cron] Grid ${grid.gridKey} precip=${precip} summary=` +
+            JSON.stringify(forecast.forecastNextHour?.summary?.map((s) => s.condition) ?? null)
+        );
+
         // At most one push per device per event type, deduped for 30 min via KV.
         const notifyOnce = async (
           device: DeviceRegistration,
@@ -144,10 +190,10 @@ export default {
                 try {
                   const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
                   const contentState: LiveActivityContentState = {
-                    statusText: 'Rain incoming',
+                    statusText: copy.incoming,
                     countdownTarget: encodeActivityDate(new Date(now + minutesUntilRain * 60000)),
                     heroText: null,
-                    subBold: 'Rain expected',
+                    subBold: copy.expected,
                     subRest: ' · next hour',
                     boldFirst: true,
                     rightText: '',
@@ -159,6 +205,7 @@ export default {
                     // clock time would render in UTC. The app's own refreshes set it.
                     flagText: null,
                     flagPosition: null,
+                    precip,
                   };
                   await sendLiveActivityUpdate(device.activityToken, contentState, env);
                   console.log(`[Activity] Sent rain-start update, grid ${grid.gridKey}`);
@@ -185,11 +232,11 @@ export default {
                 if (minutesUntilEnd > 0) {
                   const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
                   const contentState: LiveActivityContentState = {
-                    statusText: 'Raining now',
+                    statusText: copy.fallingNow,
                     countdownTarget: encodeActivityDate(new Date(now + minutesUntilEnd * 60000)),
                     heroText: null,
                     subBold: `stops in about ${minutesUntilEnd} min`,
-                    subRest: 'Raining · ',
+                    subRest: copy.fallingVerb,
                     boldFirst: false,
                     rightText: '',
                     segments,
@@ -198,14 +245,15 @@ export default {
                     endLabel: '+90 min',
                     flagText: null,
                     flagPosition: null,
+                    precip,
                   };
                   await sendLiveActivityUpdate(device.activityToken, contentState, env);
                 } else {
                   const contentState: LiveActivityContentState = {
-                    statusText: 'Rain ended',
+                    statusText: copy.ended,
                     countdownTarget: null,
                     heroText: 'Clear',
-                    subBold: 'Rain has stopped',
+                    subBold: copy.hasStopped,
                     subRest: '',
                     boldFirst: true,
                     rightText: '',
@@ -215,6 +263,7 @@ export default {
                     endLabel: '+90 min',
                     flagText: null,
                     flagPosition: null,
+                    precip,
                   };
                   await sendLiveActivityUpdate(device.activityToken, contentState, env, 'end');
                   await clearActivityToken(device.token, env);

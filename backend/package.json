@@ -4,7 +4,11 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && npm run test:unit && npm run test:endpoints",
+    "test:unit": "tsc src/validate.ts --outDir .test-build --module esnext --target es2022 --moduleResolution bundler && echo '{\"type\":\"module\"}' > .test-build/package.json && node test/validate.test.mjs",
+    "test:endpoints": "./test/endpoints.test.sh"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250224.0",

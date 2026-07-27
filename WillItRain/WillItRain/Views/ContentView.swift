@@ -142,7 +142,7 @@ struct ContentView: View {
     private func precipitationOverlay(for forecast: RainForecast) -> some View {
         let intensity: PrecipitationIntensity = forecast.dataPoints.first?.intensity ?? .moderate
         switch forecast.currentType {
-        case .rain, .sleet:
+        case .rain, .sleet, .mixed:
             RainAnimationView(intensity: intensity)
         case .snow:
             SnowAnimationView(intensity: intensity)

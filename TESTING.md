@@ -1,6 +1,42 @@
-# Gonna Rain? — Notification Testing Guide (temporary)
+# Gonna Rain? — Testing Guide
 
-_Written 2026-07-24 for Release 2. Delete when done._
+## Test scripts (start here)
+
+Re-runnable harnesses. Prefer these over ad-hoc commands so regressions get
+caught by a rerun rather than by a user.
+
+```bash
+cd backend && npm test          # typecheck + validator units + endpoint contracts
+./scripts/test-live-activity.sh # build Debug, drive every Live Activity state
+```
+
+| Script | Covers |
+|---|---|
+| `backend/test/validate.test.mjs` | Token/coordinate/lead-time validators, incl. every real production device token |
+| `backend/test/endpoints.test.sh` | `/test-*` stay authenticated; `/register` rejects bad input before writing KV |
+| `scripts/test-live-activity.sh` | Rain vs wintry rendering across all three design states + the legacy-payload regression |
+| `screenshots/take_screenshots.sh` | App Store screenshots |
+
+**Live Activity gotchas the script encodes** (each cost real time to find):
+
+- The scenario harness is behind `#if DEBUG`. A **Release** build strips it and
+  the app launches normally while silently starting no activity. Build Debug.
+- App `print()` does not reach most log wrappers — use
+  `xcrun simctl launch --console-pty`.
+- The compact island only renders while the app is **backgrounded**, so the
+  script launches another app to take the foreground. It avoids Settings on
+  purpose: Settings can land on an Apple Account sign-in sheet and put an email
+  and password field into every screenshot.
+- Scenario `BX` sends a payload with `precip` **absent**, standing in for a push
+  from a Worker that predates the field. It must render exactly like `B`. If it
+  renders as snow the default is inverted; if the card freezes, someone made the
+  field non-optional and ActivityKit can no longer decode.
+
+---
+
+## Notification testing (Release 2)
+
+_Written 2026-07-24._
 
 ## ⚠️ Read this first — the `--remote` gotcha
 

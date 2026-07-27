@@ -2,20 +2,56 @@ import ActivityKit
 import SwiftUI
 import WidgetKit
 
-// Palette from docs/design/live-activity/rain-mockup-v3.html
+// Palette from docs/design/live-activity/rain-mockup-v3.html (rain) and
+// snow-mockup-v2.html variant B2 (wintry).
 private enum LA {
-    static let cyan = Color(red: 0x54 / 255, green: 0xC3 / 255, blue: 0xF5 / 255)
-    static let cyanDeep = Color(red: 0x38 / 255, green: 0xAD / 255, blue: 0xE7 / 255)
     static let bgTop = Color(red: 0x28 / 255, green: 0x39 / 255, blue: 0x4F / 255)
     static let bgBottom = Color(red: 0x15 / 255, green: 0x23 / 255, blue: 0x3D / 255)
-    static let flagBlue = Color(red: 0x9D / 255, green: 0xDC / 255, blue: 0xFF / 255)
-    static let compactCyan = Color(red: 0xCF / 255, green: 0xEE / 255, blue: 0xFF / 255)
 
     static var background: LinearGradient {
         LinearGradient(colors: [bgTop, bgBottom], startPoint: .topLeading, endPoint: .bottomTrailing)
     }
-    static var segmentFill: LinearGradient {
-        LinearGradient(colors: [cyan, cyanDeep], startPoint: .leading, endPoint: .trailing)
+}
+
+/// Everything that differs between falling rain and falling snow. Resolved once
+/// from the content state and threaded down, so adding a treatment later means
+/// adding a case here rather than hunting for hard-coded cyan.
+private struct Style {
+    let accent: Color        // track head, status dot, keyline
+    let accentDeep: Color    // track tail, glow
+    let flag: Color          // the little time flag above the track
+    let compact: Color       // Dynamic Island compact/minimal foreground
+    let glyph: String        // SF Symbol
+    /// Glyph colour *inside the header badge*, which is filled with the accent
+    /// gradient. The wintry badge is near-white, so a white glyph would vanish.
+    let badgeGlyph: Color
+
+    var segmentFill: LinearGradient {
+        LinearGradient(colors: [accent, accentDeep], startPoint: .leading, endPoint: .trailing)
+    }
+
+    static let rain = Style(
+        accent: Color(red: 0x54 / 255, green: 0xC3 / 255, blue: 0xF5 / 255),
+        accentDeep: Color(red: 0x38 / 255, green: 0xAD / 255, blue: 0xE7 / 255),
+        flag: Color(red: 0x9D / 255, green: 0xDC / 255, blue: 0xFF / 255),
+        compact: Color(red: 0xCF / 255, green: 0xEE / 255, blue: 0xFF / 255),
+        glyph: "drop.fill",
+        badgeGlyph: .white
+    )
+
+    static let wintry = Style(
+        accent: Color(red: 0xF0 / 255, green: 0xF8 / 255, blue: 0xFF / 255),
+        accentDeep: Color(red: 0x9F / 255, green: 0xC4 / 255, blue: 0xDE / 255),
+        flag: Color(red: 0xDC / 255, green: 0xEE / 255, blue: 0xFB / 255),
+        compact: Color(red: 0xE8 / 255, green: 0xF4 / 255, blue: 0xFC / 255),
+        glyph: "snowflake",
+        badgeGlyph: Color(red: 0x12 / 255, green: 0x23 / 255, blue: 0x3B / 255)
+    )
+
+    /// A missing `precip` means the payload predates the field — treat it as
+    /// rain, which is exactly how those payloads rendered before.
+    static func of(_ state: RainActivityAttributes.ContentState) -> Style {
+        state.precip == .wintry ? .wintry : .rain
     }
 }
 
@@ -26,10 +62,11 @@ struct RainLiveActivity: Widget {
                 .activityBackgroundTint(LA.bgBottom)
                 .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
-            DynamicIsland {
+            let style = Style.of(context.state)
+            return DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
                     HStack(spacing: 8) {
-                        DropGlyph(size: 16)
+                        PrecipGlyph(style: style, size: 16)
                         Text(context.state.statusText)
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundStyle(.white)
@@ -46,13 +83,13 @@ struct RainLiveActivity: Widget {
                         .padding(.top, 10)
                 }
             } compactLeading: {
-                DropGlyph(size: 15)
+                PrecipGlyph(style: style, size: 15)
             } compactTrailing: {
                 CompactCountdownText(state: context.state)
             } minimal: {
-                DropGlyph(size: 15)
+                PrecipGlyph(style: style, size: 15)
             }
-            .keylineTint(LA.cyan)
+            .keylineTint(style.accent)
         }
     }
 }
@@ -61,6 +98,8 @@ struct RainLiveActivity: Widget {
 
 private struct LockScreenActivityView: View {
     let state: RainActivityAttributes.ContentState
+
+    private var style: Style { Style.of(state) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -78,12 +117,12 @@ private struct LockScreenActivityView: View {
     private var headerRow: some View {
         HStack(spacing: 7) {
             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(LA.segmentFill)
+                .fill(style.segmentFill)
                 .frame(width: 20, height: 20)
                 .overlay {
-                    Image(systemName: "drop.fill")
+                    Image(systemName: style.glyph)
                         .font(.system(size: 11))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(style.badgeGlyph)
                 }
             Text("Gonna Rain?")
                 .font(.system(size: 12, weight: .semibold))
@@ -91,9 +130,9 @@ private struct LockScreenActivityView: View {
             Spacer()
             HStack(spacing: 5) {
                 Circle()
-                    .fill(LA.cyan)
+                    .fill(style.accent)
                     .frame(width: 6, height: 6)
-                    .shadow(color: LA.cyan, radius: 3.5)
+                    .shadow(color: style.accentDeep, radius: 3.5)
                 Text(state.statusText)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.55))
@@ -165,29 +204,32 @@ private struct HeroCountdownText: View {
 private struct CompactCountdownText: View {
     let state: RainActivityAttributes.ContentState
 
+    private var style: Style { Style.of(state) }
+
     var body: some View {
         if let target = state.countdownTarget, target > .now {
             Text(timerInterval: Date.now...target, countsDown: true, showsHours: false)
                 .font(.system(size: 13, weight: .semibold))
                 .monospacedDigit()
-                .foregroundStyle(LA.compactCyan)
+                .foregroundStyle(style.compact)
                 .frame(maxWidth: 46)
                 .multilineTextAlignment(.trailing)
         } else {
-            Image(systemName: "cloud.rain.fill")
+            Image(systemName: state.precip == .wintry ? "cloud.snow.fill" : "cloud.rain.fill")
                 .font(.system(size: 12))
-                .foregroundStyle(LA.compactCyan)
+                .foregroundStyle(style.compact)
         }
     }
 }
 
-private struct DropGlyph: View {
+private struct PrecipGlyph: View {
+    let style: Style
     let size: CGFloat
 
     var body: some View {
-        Image(systemName: "drop.fill")
+        Image(systemName: style.glyph)
             .font(.system(size: size))
-            .foregroundStyle(LA.cyan)
+            .foregroundStyle(style.accent)
     }
 }
 
@@ -197,6 +239,8 @@ private struct DropGlyph: View {
 /// faint hour dots, a white "now" dot, labels below, optional time flag above.
 private struct SlimTrackView: View {
     let state: RainActivityAttributes.ContentState
+
+    private var style: Style { Style.of(state) }
 
     private var hourFractions: [Double] {
         guard state.windowMinutes >= 60 else { return [] }
@@ -217,7 +261,7 @@ private struct SlimTrackView: View {
                     if let flag = state.flagText, let pos = state.flagPosition {
                         Text(flag)
                             .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundStyle(LA.flagBlue)
+                            .foregroundStyle(style.flag)
                             .fixedSize()
                             .position(x: min(max(pos * w, 12), w - 12), y: 0)
                     }
@@ -229,17 +273,17 @@ private struct SlimTrackView: View {
                     // cyan segments
                     ForEach(Array(state.segments.enumerated()), id: \.offset) { _, seg in
                         Capsule()
-                            .fill(LA.segmentFill)
+                            .fill(style.segmentFill)
                             .frame(width: max((seg.end - seg.start) * w, 4), height: 4)
-                            .shadow(color: LA.cyan.opacity(0.55), radius: 4.5)
+                            .shadow(color: style.accentDeep.opacity(0.55), radius: 4.5)
                             .offset(x: seg.start * w, y: 6)
                     }
                     // hour dots
                     ForEach(hourFractions, id: \.self) { f in
                         Circle()
-                            .fill(isWet(f) ? LA.cyan : .white.opacity(0.4))
+                            .fill(isWet(f) ? style.accent : .white.opacity(0.4))
                             .frame(width: 3, height: 3)
-                            .shadow(color: isWet(f) ? LA.cyan : .clear, radius: 3.5)
+                            .shadow(color: isWet(f) ? style.accentDeep : .clear, radius: 3.5)
                             .position(x: f * w, y: 8)
                     }
                     // now dot (window always starts at now)
