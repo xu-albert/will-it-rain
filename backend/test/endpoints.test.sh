@@ -28,6 +28,8 @@ REMOTE=false
 PORT=8899
 TARGET="${TARGET:-http://127.0.0.1:$PORT}"
 TOKEN_OK=$(printf 'a%.0s' {1..64})
+# Well-formed but deliberately never registered, so 404-vs-409 can be told apart.
+TOKEN_MISSING=$(printf 'b%.0s' {1..64})
 ADMIN_TOKEN="${ADMIN_TOKEN:-local-test-secret}"
 
 pass=0; fail=0
@@ -83,6 +85,10 @@ check "/test-rain  unauthenticated" 401 -X POST "$TARGET/test-rain" -d "{\"token
 check "/test-rain  wrong secret"    401 -X POST "$TARGET/test-rain" -H "X-Admin-Token: wrong" -d "{\"token\":\"$TOKEN_OK\"}"
 check "/test-cron  unauthenticated" 401 -X POST "$TARGET/test-cron" -d "{\"token\":\"$TOKEN_OK\",\"lat\":37.3,\"lon\":-122.0}"
 check "/test-cron  wrong secret"    401 -X POST "$TARGET/test-cron" -H "X-Admin-Token: wrong" -d "{\"token\":\"$TOKEN_OK\",\"lat\":37.3,\"lon\":-122.0}"
+# /test-activity pushes at a real device's live activity. Left open it would let
+# anyone drive arbitrary text onto a stranger's lock screen.
+check "/test-activity unauth"      401 -X POST "$TARGET/test-activity" -d "{\"token\":\"$TOKEN_OK\"}"
+check "/test-activity wrong secret" 401 -X POST "$TARGET/test-activity" -H "X-Admin-Token: wrong" -d "{\"token\":\"$TOKEN_OK\"}"
 
 echo
 echo "== /register input validation =="
@@ -105,6 +111,11 @@ if [ "$REMOTE" = false ]; then
   check "lead time clamped"     200 -X POST "$TARGET/register" -d "{\"token\":\"$TOKEN_OK\",\"lat\":37.3,\"lon\":-122.0,\"leadTimeMinutes\":99999}"
   check "authorized /test-rain" 500 -X POST "$TARGET/test-rain" -H "X-Admin-Token: $ADMIN_TOKEN" -d "{\"token\":\"$TOKEN_OK\"}"
   echo "      (500 above is correct: auth passed, then APNs rejected the dummy local credentials)"
+  # The device registered just above has no activityToken, so this exercises the
+  # 409 branch — the one a human hits when they forget to start an activity
+  # first, and the one that would otherwise surface as a confusing APNs error.
+  check "/test-activity, no activity" 409 -X POST "$TARGET/test-activity" -H "X-Admin-Token: $ADMIN_TOKEN" -d "{\"token\":\"$TOKEN_OK\"}"
+  check "/test-activity, no device"   404 -X POST "$TARGET/test-activity" -H "X-Admin-Token: $ADMIN_TOKEN" -d "{\"token\":\"$TOKEN_MISSING\"}"
 fi
 
 echo

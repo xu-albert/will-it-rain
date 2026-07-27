@@ -115,6 +115,11 @@ export default {
       return handleTestRain(request, env);
     }
 
+    if (request.method === 'POST' && url.pathname === '/test-activity') {
+      if (!isAuthorizedAdmin(request, env)) return json({ error: 'Unauthorized' }, 401);
+      return handleTestActivity(request, env);
+    }
+
     if (request.method === 'POST' && url.pathname === '/test-cron') {
       if (!isAuthorizedAdmin(request, env)) return json({ error: 'Unauthorized' }, 401);
       return handleTestCron(request, env);
@@ -357,6 +362,78 @@ async function handleTestRain(request: Request, env: Env): Promise<Response> {
     await sendRainAlert(body.token, minutesUntilRain, env);
     return json({ ok: true, minutesUntilRain });
   } catch (err) {
+    return json({ error: String(err) }, 500);
+  }
+}
+
+// Pushes a content-state at a device's live activity, on demand.
+//
+// This is the only way to exercise the server -> Live Activity path without
+// waiting for real weather: the cron pushes activity updates, but only for a
+// device that has an activityToken AND sits in a grid that is currently
+// precipitating. Until this existed the path had never run against a real
+// activity token even once.
+//
+// It matters most for `precip`. `content-state` is a full replacement, so the
+// server's payload — not the app's — decides whether a card reads as snow or
+// rain from the next tick onward. `precip: null` reproduces a pre-1.1.1 Worker
+// and must leave the card ticking in rain colours rather than freezing it.
+async function handleTestActivity(request: Request, env: Env): Promise<Response> {
+  const body = await readJson<{
+    token?: unknown; precip?: unknown; event?: unknown; minutesUntil?: unknown;
+  }>(request);
+  if (!body) return json({ error: 'Malformed JSON body' }, 400);
+
+  if (!isValidDeviceToken(body.token)) {
+    return json({ error: 'Invalid or missing token' }, 400);
+  }
+
+  const registration = await env.DEVICES.get<DeviceRegistration>(`device:${body.token}`, 'json');
+  if (!registration) return json({ error: 'Device not registered' }, 404);
+  if (!registration.activityToken) {
+    return json({
+      error: 'Device has no activityToken — no Live Activity is running, or the '
+        + 'app never reported its push token',
+    }, 409);
+  }
+
+  // Explicit null is meaningful here (the legacy-payload case), so absence and
+  // null must be told apart: only an actual 'wintry' or 'rain' sets the field.
+  const precip: Precip | undefined =
+    body.precip === 'wintry' ? 'wintry' : body.precip === 'rain' ? 'rain' : undefined;
+  const event = body.event === 'end' ? 'end' : 'update';
+  const minutesUntil =
+    typeof body.minutesUntil === 'number' && Number.isFinite(body.minutesUntil)
+      ? Math.round(body.minutesUntil)
+      : 25;
+  const copy = copyFor(precip ?? 'rain');
+
+  // `precip` is required on LiveActivityContentState precisely so no production
+  // path can forget it — a payload without it silently reverts a snowing card
+  // to rain. This test needs to send exactly that payload on purpose, so it
+  // relaxes the field here and nowhere else.
+  const contentState: Omit<LiveActivityContentState, 'precip'> & { precip?: Precip } = {
+    statusText: copy.incoming,
+    countdownTarget: encodeActivityDate(new Date(Date.now() + minutesUntil * 60000)),
+    heroText: null,
+    subBold: copy.expected,
+    subRest: ' · test push',
+    boldFirst: true,
+    rightText: 'Test',
+    segments: [{ start: 0.2, end: 0.6 }],
+    windowMinutes: ACTIVITY_WINDOW_MINUTES,
+    midLabel: '+45 min',
+    endLabel: '+90 min',
+    flagText: null,
+    flagPosition: null,
+  };
+  if (precip) contentState.precip = precip;
+
+  try {
+    await sendLiveActivityUpdate(registration.activityToken, contentState, env, event);
+    return json({ ok: true, event, precip: precip ?? null, minutesUntil });
+  } catch (err) {
+    await discardDeadActivityToken(body.token, err, env);
     return json({ error: String(err) }, 500);
   }
 }

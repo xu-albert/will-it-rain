@@ -132,11 +132,18 @@ extension LiveActivityService {
 
         let content = ActivityContent(state: scenario.contentState, staleDate: nil)
         do {
+            // `.token`, not nil. An activity started with no push type cannot be
+            // reached from the server at all, which made the whole
+            // server -> Live Activity path impossible to exercise on demand:
+            // the only activities with tokens were ones real weather had
+            // started. With a token, `scripts/test-activity-push.sh` can drive
+            // a real content-state push at a real activity.
             let activity = try Activity.request(
                 attributes: RainActivityAttributes(locationName: "San Francisco"),
                 content: content,
-                pushType: nil
+                pushType: .token
             )
+            LiveActivityService.shared.observePushToken(for: activity)
             print("[LiveActivity][Debug] Started scenario \(scenario.rawValue): \(activity.id)")
         } catch {
             print("[LiveActivity][Debug] Failed to start scenario \(scenario.rawValue): \(error)")

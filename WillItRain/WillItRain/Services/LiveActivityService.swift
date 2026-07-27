@@ -59,7 +59,10 @@ final class LiveActivityService {
         }
     }
 
-    private func observePushToken(for activity: Activity<RainActivityAttributes>) {
+    // Not private: the DEBUG scenario harness starts its own activities and must
+    // register their push tokens too, or the server has no way to reach an
+    // activity that a test started.
+    func observePushToken(for activity: Activity<RainActivityAttributes>) {
         tokenObservers[activity.id]?.cancel()
         tokenObservers[activity.id] = Task {
             for await tokenData in activity.pushTokenUpdates {
