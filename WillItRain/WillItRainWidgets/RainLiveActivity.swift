@@ -29,7 +29,7 @@ struct RainLiveActivity: Widget {
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
                     HStack(spacing: 8) {
-                        DropGlyph(size: 16)
+                        DropGlyph(size: 19)
                         Text(context.state.statusText)
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundStyle(.white)
@@ -46,11 +46,11 @@ struct RainLiveActivity: Widget {
                         .padding(.top, 10)
                 }
             } compactLeading: {
-                DropGlyph(size: 15)
+                DropGlyph(size: 18)
             } compactTrailing: {
                 CompactCountdownText(state: context.state)
             } minimal: {
-                DropGlyph(size: 15)
+                DropGlyph(size: 18)
             }
             .keylineTint(LA.cyan)
         }
@@ -77,14 +77,9 @@ private struct LockScreenActivityView: View {
 
     private var headerRow: some View {
         HStack(spacing: 7) {
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(LA.segmentFill)
-                .frame(width: 20, height: 20)
-                .overlay {
-                    Image(systemName: "drop.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.white)
-                }
+            // The app icon itself, not a stand-in: this slot is the activity's
+            // identity badge, so it shows the same tile the home screen does.
+            AppIconTile(size: 20)
             Text("Gonna Rain?")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.72))
@@ -174,20 +169,20 @@ private struct CompactCountdownText: View {
                 .frame(maxWidth: 46)
                 .multilineTextAlignment(.trailing)
         } else {
-            Image(systemName: "cloud.rain.fill")
-                .font(.system(size: 12))
-                .foregroundStyle(LA.compactCyan)
+            AppIconGlyph(size: 17, tint: LA.compactCyan)
         }
     }
 }
 
+/// The app's own mark, used everywhere the activity previously showed a generic
+/// `drop.fill`, so the Live Activity and Dynamic Island read as this app rather
+/// than as any weather app. Drawn from the icon's vector source — see
+/// `AppIconMark`.
 private struct DropGlyph: View {
     let size: CGFloat
 
     var body: some View {
-        Image(systemName: "drop.fill")
-            .font(.system(size: size))
-            .foregroundStyle(LA.cyan)
+        AppIconGlyph(size: size, tint: LA.cyan)
     }
 }
 
