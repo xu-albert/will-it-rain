@@ -29,7 +29,7 @@ struct RainLiveActivity: Widget {
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
                     HStack(spacing: 8) {
-                        DropGlyph(size: 19)
+                        DropGlyph(size: 16)
                         Text(context.state.statusText)
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundStyle(.white)
@@ -46,11 +46,11 @@ struct RainLiveActivity: Widget {
                         .padding(.top, 10)
                 }
             } compactLeading: {
-                DropGlyph(size: 18)
+                DropGlyph(size: 15)
             } compactTrailing: {
                 CompactCountdownText(state: context.state)
             } minimal: {
-                DropGlyph(size: 18)
+                DropGlyph(size: 15)
             }
             .keylineTint(LA.cyan)
         }
@@ -169,20 +169,25 @@ private struct CompactCountdownText: View {
                 .frame(maxWidth: 46)
                 .multilineTextAlignment(.trailing)
         } else {
-            AppIconGlyph(size: 17, tint: LA.compactCyan)
+            Image(systemName: "cloud.rain.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(LA.compactCyan)
         }
     }
 }
 
-/// The app's own mark, used everywhere the activity previously showed a generic
-/// `drop.fill`, so the Live Activity and Dynamic Island read as this app rather
-/// than as any weather app. Drawn from the icon's vector source — see
-/// `AppIconMark`.
+/// The Dynamic Island's precipitation glyph. This slot is deliberately NOT the
+/// app icon: it says what the weather is doing, not whose app is saying it, so
+/// `release-1.1.1-wintry-live-activity` can keep swapping it for a snowflake on
+/// wintry activities. App identity lives on the lock-screen header badge only —
+/// see `LockScreenActivityView.headerRow`.
 private struct DropGlyph: View {
     let size: CGFloat
 
     var body: some View {
-        AppIconGlyph(size: size, tint: LA.cyan)
+        Image(systemName: "drop.fill")
+            .font(.system(size: size))
+            .foregroundStyle(LA.cyan)
     }
 }
 

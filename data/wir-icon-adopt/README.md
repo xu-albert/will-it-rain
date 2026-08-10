@@ -38,24 +38,35 @@ Nothing here has been adjusted to hide that. If the answer is "reshape it", the
 vector source is `WillItRain/Design/AppIcon/AppIcon.svg` and every catalogue PNG
 regenerates from it with `render_appicon.py`.
 
-## The line-art presentations
-
-The Live Activity and Dynamic Island draw the mark as **line art**, not as the
-filled tile, and at those sizes the shaped underside survives — the open
-outline keeps the bottom edge legible where the filled tile loses it.
+## The Live Activity presentations
 
 | # | Presentation | Mark | Size |
 |---|---|---|---|
 | `04-lockscreen-{A,B,C}` | Live Activity card, lock screen | `AppIconTile` — the icon on its `#0E0F12` ground | 20 pt identity badge |
-| `05-island-expanded-{A,B,C}` | Dynamic Island, expanded | `AppIconGlyph` | 19 pt |
-| `06-island-compact-{A,B,C}` | Dynamic Island, compact | `AppIconGlyph` leading + trailing fallback | 18 pt |
+| `05-island-expanded-{A,B,C}` | Dynamic Island, expanded | `AppIconGlyph` — **superseded, see below** | 19 pt |
+| `06-island-compact-{A,B,C}` | Dynamic Island, compact | `AppIconGlyph` — **superseded, see below** | 18 pt |
 
 `A` / `B` / `C` are the three debug scenarios: *rain incoming*, *raining now*,
 *on & off showers*.
 
 The 20 pt identity badge on the Live Activity card (`04-*`) is the smallest the
 **filled tile** appears anywhere, and there the underside is gone for the same
-reason as in Settings.
+reason as in Settings. That badge is what ships.
+
+### The Dynamic Island captures show a state that was reverted
+
+`05-*` and `06-*` were captured while the Dynamic Island's leading, compact and
+minimal slots were also drawing the app mark. **They no longer are.** That was
+reverted on the master's decision: those slots are weather-semantic, not app
+identity, so `release-1.1.1-wintry-live-activity` can keep swapping them for a
+snowflake on wintry activities. The Dynamic Island now carries no app branding
+and is byte-identical to `main`.
+
+The captures are kept because they are still the only real render of the mark
+as line art at 18–19 pt, and they show something worth knowing: **as line art
+the shaped underside survives at sizes where the filled tile loses it**, because
+the open outline holds the bottom edge. If the mark is ever wanted in a small
+line-art slot, this is the evidence that it would work there.
 
 ## Not captured
 
