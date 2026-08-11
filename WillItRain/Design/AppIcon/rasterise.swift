@@ -27,13 +27,18 @@ for spec in arguments.dropFirst(2) {
     }
     let destination = URL(fileURLWithPath: String(parts[1]))
 
+    // No alpha channel: an asset-catalogue App Store icon that carries one is
+    // rejected on upload (ITMS-90717) even when it is fully opaque. Three
+    // samples with 32 bits per pixel keeps the row padding Core Graphics needs
+    // — a 24-bit-per-pixel context cannot be created — while still writing PNG
+    // colour type 2.
     guard let bitmap = NSBitmapImageRep(
         bitmapDataPlanes: nil,
         pixelsWide: size, pixelsHigh: size,
-        bitsPerSample: 8, samplesPerPixel: 4,
-        hasAlpha: true, isPlanar: false,
+        bitsPerSample: 8, samplesPerPixel: 3,
+        hasAlpha: false, isPlanar: false,
         colorSpaceName: .deviceRGB,
-        bytesPerRow: 0, bitsPerPixel: 0
+        bytesPerRow: 0, bitsPerPixel: 32
     ) else {
         FileHandle.standardError.write(Data("could not allocate \(size)px bitmap\n".utf8))
         exit(4)

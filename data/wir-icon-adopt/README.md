@@ -10,8 +10,9 @@ Each capture comes as a pair:
 * `*-icon.png` — the crop at **1:1**, i.e. the size the pixels really are.
 * `*-icon-4x.png` — the same crop at 4x nearest-neighbour, for judging pixels.
 
-Full-frame screenshots (45 MB) were left out of the repo to keep it light; they
-are in `data/wir-icon-adopt/native/` in the firstmate home.
+Full-frame screenshots (45 MB) are left out of the repo to keep it light. The
+capture script writes them to `data/wir-icon-adopt/native/` here, which is
+git-ignored; every crop below is cut from the frame of the same name.
 
 ## The open question
 
