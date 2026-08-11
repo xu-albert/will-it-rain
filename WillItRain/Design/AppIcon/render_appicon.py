@@ -76,10 +76,10 @@ def assert_opaque(paths):
 def main():
     os.makedirs(OUT, exist_ok=True)
 
-    written = [os.path.join(OUT, f"AppIcon-{size}.png") for size in PIXEL_SIZES]
-    written += [os.path.join(OUT, name + ".png") for name in APPEARANCES]
-    specs = [f"{size}:{path}" for size, path in zip(PIXEL_SIZES, written)]
-    specs += [f"1024:{os.path.join(OUT, name + '.png')}" for name in APPEARANCES]
+    targets = [(size, os.path.join(OUT, f"AppIcon-{size}.png")) for size in PIXEL_SIZES]
+    targets += [(1024, os.path.join(OUT, name + ".png")) for name in APPEARANCES]
+    specs = [f"{size}:{path}" for size, path in targets]
+    written = [path for _, path in targets]
 
     result = subprocess.run(["swift", RASTERISER, SVG, *specs], capture_output=True, text=True)
     if result.returncode != 0:

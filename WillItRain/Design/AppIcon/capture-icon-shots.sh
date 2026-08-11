@@ -22,6 +22,12 @@
 # a re-run after a silhouette change is comparable frame for frame. Re-derive
 # them only if the framing itself has to change.
 #
+# One of them is not self-checking: the Settings > Apps crop is an absolute
+# rectangle, and which row lands there depends on what apps the simulator has
+# installed and how they sort. It frames this app's row only on a simulator
+# matching the one the committed evidence came from — on any other, it silently
+# frames a neighbouring app. The operator has to confirm that row by eye.
+#
 # REQUIRES AN UNLOCKED MAC AND EXCLUSIVE USE OF THE SIMULATOR — the GUI passes
 # drive Simulator's own window with cliclick.
 #
@@ -206,11 +212,14 @@ shot() {
   fi
   local native="$OUTDIR/native/${base}.png"
   rm -f "$native"
-  xcrun simctl io "$SIM" screenshot --type=png "$native" >/dev/null 2>&1
+  # Every failure below is reported by returning non-zero rather than by letting
+  # `set -e` fire: callers reached through `||` run with errexit suppressed, so
+  # a bare failing command there would fall through and be reported as success.
+  xcrun simctl io "$SIM" screenshot --type=png "$native" >/dev/null 2>&1 || true
   [ -s "$native" ] || { echo "    FAIL screenshot $base"; return 1; }
   echo "    wrote native/${base}.png"
   if [ $# -eq 4 ]; then
-    python3 - "$native" "$OUTDIR/${base}-icon.png" "$OUTDIR/${base}-icon-4x.png" "$@" <<'PY'
+    if ! python3 - "$native" "$OUTDIR/${base}-icon.png" "$OUTDIR/${base}-icon-4x.png" "$@" <<'PY'
 import sys
 from PIL import Image
 src, out1, out4, x, y, w, h = sys.argv[1], sys.argv[2], sys.argv[3], *map(int, sys.argv[4:8])
@@ -218,19 +227,31 @@ c = Image.open(src).crop((x, y, x + w, y + h))
 c.save(out1)
 c.resize((w * 4, h * 4), Image.NEAREST).save(out4)
 PY
+    then
+      echo "    FAIL crop $base"
+      return 1
+    fi
     echo "    wrote ${base}-icon.png + -icon-4x.png"
   fi
 }
 
-# Confirms the pane on screen really is the Settings > Apps row for this app
-# before anything is written, since `App-Prefs:root=APPS` is a private scheme
-# that is not guaranteed to land anywhere in particular. The row has a signature
-# no other screen this harness visits shares: a light list row carrying a much
-# darker app tile at its left. Measured on the committed capture that is 231
-# against 62; every other pane in this run reads below 60 on the light side.
+# Checks that SOME plausible Settings list row is at the crop rectangle: a light
+# list row carrying a distinctly darker tile at its left edge. Measured on the
+# committed capture that is 231 against 62, and every other pane this harness
+# visits reads below 60 on the light side, so it catches the Home Screen, the
+# lock screen, Spotlight and the Settings root.
+#
+# That is ALL it proves. It is NOT evidence the row belongs to this app: every
+# row in Settings > Apps has the same shape, and the crop rectangle is a fixed
+# absolute position while the Apps list is ordered by whatever apps are
+# installed. On a simulator whose app set differs from the one the committed
+# evidence was captured on, a neighbouring app's row sits at that position and
+# passes this check unchanged. Confirming the row is the right one is the
+# operator's job; what keeps a wrong crop out of the repo is `shot` refusing to
+# overwrite an existing capture without OVERWRITE=1.
 verify_settings_row() {  # verify_settings_row <x> <y> <w> <h>
   local probe; probe="$(mktemp -d)/settings-probe.png"
-  xcrun simctl io "$SIM" screenshot --type=png "$probe" >/dev/null 2>&1
+  xcrun simctl io "$SIM" screenshot --type=png "$probe" >/dev/null 2>&1 || true
   [ -s "$probe" ] || { echo "    ABORT: could not screenshot to check the pane"; return 1; }
   python3 - "$probe" "$@" <<'PY'
 import sys
@@ -240,7 +261,7 @@ row = Image.open(src).crop((x, y, x + w, y + h)).convert("L")
 tile = ImageStat.Stat(row.crop((64, 40, 151, 130))).mean[0]
 rest = ImageStat.Stat(row.crop((200, 40, 550, 130))).mean[0]
 if rest <= 170 or tile >= rest - 100:
-    sys.exit(f"    ABORT: not the Settings > Apps row for this app "
+    sys.exit(f"    ABORT: no Settings list row at the crop rectangle "
              f"(row {rest:.0f}, tile {tile:.0f}; want a light row with a darker tile)")
 PY
 }
@@ -295,15 +316,21 @@ shot "02-spotlight" 96 330 240 250
 # Where the "Apps" row sits in the ROOT Settings list moves with the iOS version
 # and is the one coordinate the committed frames do not pin down. Rather than
 # guess a tap — a miss here captures the wrong pane and looks like a real result
-# — this tries the deep link, has the operator confirm, and then checks the pane
-# itself before writing anything.
+# — this tries the deep link and has the operator confirm.
+#
+# The crop rectangle is absolute, so it only frames THIS app's row on a
+# simulator whose Settings > Apps ordering matches the machine the committed
+# evidence came from. Nothing here can check that, which is why the operator is
+# asked to confirm the row itself and not merely that Settings is open.
 SETTINGS_ROW=(55 1755 560 175)
 echo; echo "=== 3/6: Settings > Apps (29pt @3x — the 87px asset) ==="
 home; sleep 1
 xcrun simctl openurl "$SIM" "App-Prefs:root=APPS" >/dev/null 2>&1 \
   || xcrun simctl launch "$SIM" com.apple.Preferences >/dev/null 2>&1 || true
 sleep 3
-echo "    open Settings > Apps if it is not already showing, then press return"
+echo "    open Settings > Apps, then confirm the Gonna Rain? row is the one the"
+echo "    crop will take (device-pixel y=${SETTINGS_ROW[1]}; compare it against the"
+echo "    committed 03-settings-apps-icon.png) before pressing return"
 read -r _
 status_bar_override
 verify_settings_row "${SETTINGS_ROW[@]}"
