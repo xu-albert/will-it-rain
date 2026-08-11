@@ -68,6 +68,16 @@ ROTATED=1           # window draws the device upside-down
 DEV_W=1320
 DEV_H=2868
 
+# Refuse the two ways this run can do damage, before it touches anything: it
+# needs an operator watching (capture 3 cannot be confirmed otherwise), and it
+# writes into the directory holding the committed evidence.
+[ -t 0 ] || { echo "ABORT: this harness needs an operator on a terminal (stdin is not a tty)."; exit 2; }
+if [ "${OVERWRITE:-0}" != 1 ] && compgen -G "$OUTDIR/*-icon.png" >/dev/null; then
+  echo "ABORT: $OUTDIR already holds captures; a re-run would overwrite committed evidence."
+  echo "       Re-run with OVERWRITE=1 to re-capture, or set OUTDIR elsewhere."
+  exit 2
+fi
+
 mkdir -p "$OUTDIR/native"
 
 [ -d "$APP" ] || { echo "No Debug build at $APP — build first:"; \
@@ -183,8 +193,17 @@ status_bar_override() {
 }
 
 # shot <basename> [crop x y w h]
+#
+# The crops in $OUTDIR are committed evidence, so a capture never overwrites one
+# unless the operator asks for it with OVERWRITE=1. Producing nothing is always
+# better here than producing a plausible-looking wrong file.
 shot() {
   local base="$1"; shift
+  if [ $# -eq 4 ] && [ "${OVERWRITE:-0}" != 1 ] && [ -e "$OUTDIR/${base}-icon.png" ]; then
+    echo "    REFUSING to overwrite ${base}-icon.png (committed evidence)."
+    echo "    Re-run with OVERWRITE=1 to re-capture, or set OUTDIR elsewhere."
+    return 1
+  fi
   local native="$OUTDIR/native/${base}.png"
   rm -f "$native"
   xcrun simctl io "$SIM" screenshot --type=png "$native" >/dev/null 2>&1
@@ -201,6 +220,29 @@ c.resize((w * 4, h * 4), Image.NEAREST).save(out4)
 PY
     echo "    wrote ${base}-icon.png + -icon-4x.png"
   fi
+}
+
+# Confirms the pane on screen really is the Settings > Apps row for this app
+# before anything is written, since `App-Prefs:root=APPS` is a private scheme
+# that is not guaranteed to land anywhere in particular. The row has a signature
+# no other screen this harness visits shares: a light list row carrying a much
+# darker app tile at its left. Measured on the committed capture that is 231
+# against 62; every other pane in this run reads below 60 on the light side.
+verify_settings_row() {  # verify_settings_row <x> <y> <w> <h>
+  local probe; probe="$(mktemp -d)/settings-probe.png"
+  xcrun simctl io "$SIM" screenshot --type=png "$probe" >/dev/null 2>&1
+  [ -s "$probe" ] || { echo "    ABORT: could not screenshot to check the pane"; return 1; }
+  python3 - "$probe" "$@" <<'PY'
+import sys
+from PIL import Image, ImageStat
+src, x, y, w, h = sys.argv[1], *map(int, sys.argv[2:6])
+row = Image.open(src).crop((x, y, x + w, y + h)).convert("L")
+tile = ImageStat.Stat(row.crop((64, 40, 151, 130))).mean[0]
+rest = ImageStat.Stat(row.crop((200, 40, 550, 130))).mean[0]
+if rest <= 170 or tile >= rest - 100:
+    sys.exit(f"    ABORT: not the Settings > Apps row for this app "
+             f"(row {rest:.0f}, tile {tile:.0f}; want a light row with a darker tile)")
+PY
 }
 
 start_scenario() {  # start_scenario <A|B|C>
@@ -252,17 +294,20 @@ shot "02-spotlight" 96 330 240 250
 #
 # Where the "Apps" row sits in the ROOT Settings list moves with the iOS version
 # and is the one coordinate the committed frames do not pin down. Rather than
-# guess a tap — a miss here captures the wrong pane and looks like a real
-# result — this tries the deep link and then has the operator confirm.
+# guess a tap — a miss here captures the wrong pane and looks like a real result
+# — this tries the deep link, has the operator confirm, and then checks the pane
+# itself before writing anything.
+SETTINGS_ROW=(55 1755 560 175)
 echo; echo "=== 3/6: Settings > Apps (29pt @3x — the 87px asset) ==="
 home; sleep 1
 xcrun simctl openurl "$SIM" "App-Prefs:root=APPS" >/dev/null 2>&1 \
   || xcrun simctl launch "$SIM" com.apple.Preferences >/dev/null 2>&1 || true
 sleep 3
 echo "    open Settings > Apps if it is not already showing, then press return"
-read -r _ || echo "    WARNING: nothing on stdin — capturing whatever is on screen"
+read -r _
 status_bar_override
-shot "03-settings-apps" 55 1755 560 175
+verify_settings_row "${SETTINGS_ROW[@]}"
+shot "03-settings-apps" "${SETTINGS_ROW[@]}"
 
 # ============ 4: Live Activity, Lock Screen card ===========================
 echo; echo "=== 4/6: Live Activity lock-screen card ==="

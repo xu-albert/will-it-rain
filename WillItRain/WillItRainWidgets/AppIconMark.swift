@@ -23,6 +23,10 @@ struct AppIconMark: Shape {
     /// be fitted to an arbitrary frame without leaving the SVG's padding in.
     private static let ink = CGRect(x: 163.86, y: 194.48, width: 696.32, height: 635.04)
 
+    /// Height-to-width ratio of the ink box. Framing the mark at this aspect is
+    /// what makes `fit(into:)` fill the frame instead of letterboxing inside it.
+    static let inkAspect = ink.height / ink.width
+
     /// Line width to stroke this shape with when drawn at `size` points.
     static func lineWidth(forSize size: CGFloat) -> CGFloat {
         size * strokeUnits / max(ink.width, ink.height)
@@ -121,7 +125,7 @@ struct AppIconGlyph: View {
                     style: StrokeStyle(lineWidth: AppIconMark.lineWidth(forSize: size),
                                        lineCap: .round,
                                        lineJoin: .round))
-            .frame(width: size, height: size * 635.04 / 696.32)
+            .frame(width: size, height: size * AppIconMark.inkAspect)
     }
 }
 
