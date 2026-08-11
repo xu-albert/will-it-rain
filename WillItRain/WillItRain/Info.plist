@@ -2,6 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Orientation keys are deliberately absent: GENERATE_INFOPLIST_FILE=YES merges the
+	     INFOPLIST_KEY_UISupportedInterfaceOrientations_* build settings (portrait only,
+	     iPhone + iPad, Debug + Release) into the built Info.plist, so those settings are the
+	     single source of truth — declaring the keys here would fork it. Caveat: iPadOS 26 may
+	     ignore the lock for resizable scenes; it is authoritative on iPhone, the only shipping
+	     device family (TARGETED_DEVICE_FAMILY = 1). -->
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>NSSupportsLiveActivities</key>
