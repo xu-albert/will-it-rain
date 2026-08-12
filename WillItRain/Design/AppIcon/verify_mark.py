@@ -2,7 +2,7 @@
 """Check that the Live Activity's vector mark still matches the app icon.
 
 `WillItRainWidgets/AppIconMark.swift` transcribes `AppIcon.svg` into a SwiftUI
-`Shape` so the Live Activity and Dynamic Island draw the same silhouette the
+`Shape` so the Live Activity's identity badge draws the same silhouette the
 home screen does. Nothing enforces that by construction, so this renders both
 and compares them:
 

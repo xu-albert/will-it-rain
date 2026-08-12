@@ -7,9 +7,13 @@
 #   home screen        (60pt @3x -> the 180px asset)
 #   Spotlight          (small, on a light blurred ground)
 #   Settings > Apps    (29pt @3x -> the 87px asset — the size the question is about)
-#   Live Activity lock-screen card   (AppIconTile at 20pt)
-#   Dynamic Island expanded
-#   Dynamic Island compact
+#   Live Activity lock-screen card   (AppIconTile at 20pt — the only slot that
+#                                     carries the app mark)
+#   Dynamic Island expanded          (weather glyph, not the mark)
+#   Dynamic Island compact           (weather glyph, not the mark)
+#
+# A re-run's 05-/06- captures therefore will NOT show the icon; the committed
+# ones predate that revert.
 #
 # The Dynamic Island MINIMAL presentation is not captured: it only appears when
 # a second app's activity is running alongside this one, which this harness does

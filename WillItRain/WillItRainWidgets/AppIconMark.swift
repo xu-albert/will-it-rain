@@ -3,8 +3,8 @@ import SwiftUI
 /// The "Gonna Rain?" app icon mark, in vector form.
 ///
 /// Geometry is transcribed literally from `WillItRain/Design/AppIcon/AppIcon.svg`
-/// (the adopted `drift-scatter` design) so the Live Activity and Dynamic Island
-/// show the same silhouette the home screen does: the shaped-underside cloud
+/// (the adopted `drift-scatter` design) so the Live Activity's identity badge
+/// shows the same silhouette the home screen does: the shaped-underside cloud
 /// over five forward-slash raindrops of varied length. Numbers below are the
 /// SVG's own, in its 1024 x 1024 coordinate space — do not "clean them up";
 /// they are meant to diff against the SVG.

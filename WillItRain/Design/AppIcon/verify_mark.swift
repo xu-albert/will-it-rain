@@ -1,5 +1,5 @@
-// Renders the SwiftUI `AppIconMark` (the shape the Live Activity and Dynamic
-// Island draw) off-screen, so it can be diffed against the same geometry
+// Renders the SwiftUI `AppIconMark` (the shape the Live Activity's identity
+// badge draws) off-screen, so it can be diffed against the same geometry
 // rasterised from AppIcon.svg. Proves the transcription in
 // WillItRainWidgets/AppIconMark.swift still matches the icon's vector source
 // without needing a simulator.
