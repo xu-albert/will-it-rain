@@ -114,7 +114,10 @@ private extension Path {
     }
 }
 
-/// The mark drawn as line art, sized to a square of `size` points.
+/// The mark drawn as line art, `size` points wide and `size * inkAspect` points
+/// tall (about 0.912 * `size`) — the aspect of the ink box, not a square, so the
+/// art fills the frame instead of letterboxing inside it. Callers reserving a
+/// slot should reserve that height, not `size`.
 struct AppIconGlyph: View {
     let size: CGFloat
     var tint: Color = .white

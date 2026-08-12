@@ -54,8 +54,13 @@
 # Symptom of getting this wrong: long-pressing the Dynamic Island silently
 # lands on the wallpaper and drops the Home Screen into jiggle mode instead.
 #
-# To re-derive the calibration after a zoom/orientation change, see
-# recalibrate() below — it prints the numbers to paste back into this header.
+# To re-derive the calibration after a zoom/orientation change, by hand:
+# `screencapture` the Simulator window, find the device screen rectangle inside
+# that image, and halve every measurement (a screencapture on a 2x display is in
+# mac PIXELS; the constants below are screen POINTS). SCALE is then that
+# rectangle's width / DEV_W — its height / DEV_H must agree — and ORIGIN_X /
+# ORIGIN_Y are the screen point of its top-left corner AS DRAWN. Set ROTATED=1
+# when the status bar is drawn at the BOTTOM of the window.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -74,10 +79,19 @@ ROTATED=1           # window draws the device upside-down
 DEV_W=1320
 DEV_H=2868
 
-# Refuse the two ways this run can do damage, before it touches anything: it
-# needs an operator watching (capture 3 cannot be confirmed otherwise), and it
-# writes into the directory holding the committed evidence.
+# Refuse the three ways this run can do damage, before it touches anything: it
+# needs an operator watching (capture 3 cannot be confirmed otherwise), it needs
+# the tool that drives every GUI pass, and it writes into the directory holding
+# the committed evidence.
 [ -t 0 ] || { echo "ABORT: this harness needs an operator on a terminal (stdin is not a tty)."; exit 2; }
+CLICLICK="$(command -v cliclick 2>/dev/null || true)"
+[ -x "${CLICLICK:-}" ] || {
+  echo "ABORT: cliclick is not installed or not executable (brew install cliclick)."
+  echo "       Every GUI pass is driven by it: without it the long press, the Home"
+  echo "       Screen paging and Spotlight all silently do nothing, and the captures"
+  echo "       come out plausible-looking but wrong."
+  exit 2
+}
 if [ "${OVERWRITE:-0}" != 1 ] && compgen -G "$OUTDIR/*-icon.png" >/dev/null; then
   echo "ABORT: $OUTDIR already holds captures; a re-run would overwrite committed evidence."
   echo "       Re-run with OVERWRITE=1 to re-capture, or set OUTDIR elsewhere."
@@ -143,7 +157,8 @@ assert_window() {
   echo "window ${w}x${h} at ($x,$y)"
   if [ "$w" -ne 462 ] || [ "$h" -ne 988 ] || [ "$x" -ne 278 ] || [ "$y" -ne 53 ]; then
     echo "ABORT: expected the 462x988 window at (278,53) this script is calibrated for."
-    echo "       Got ${w}x${h} at ($x,$y). Re-run with RECALIBRATE=1 and update the header."
+    echo "       Got ${w}x${h} at ($x,$y). Re-derive ORIGIN_X/ORIGIN_Y/SCALE/ROTATED by"
+    echo "       hand as the header describes, and update the constants above."
     exit 2
   fi
 }
@@ -158,28 +173,33 @@ print(round($ORIGIN_X + $SCALE * dx), round($ORIGIN_Y + $SCALE * dy))
 "
 }
 
-tap()   { local p; p=$(map_pt "$1" "$2"); set -- $p
-          cliclick m:"$1","$2" >/dev/null 2>&1 || true; sleep 0.3
-          cliclick c:"$1","$2" >/dev/null 2>&1 || true; }
-
 # Long press that screenshots WHILE the finger is down. The Dynamic Island
 # collapses the moment it is released, so a shot taken after `du` catches the
 # compact presentation instead — which is exactly how the previous round's
 # "expanded" captures came out compact.
+#
+# A failed press must never fall through to the screenshot: that is the same
+# failure by another route, an unpressed island captured under an "expanded"
+# name. Every input step below therefore reports instead of being swallowed.
 press_shot() {  # press_shot <dx> <dy> <hold_s> <basename> [crop x y w h]
   local dx="$1" dy="$2" hold="$3"; shift 3
   local p; p=$(map_pt "$dx" "$dy"); set -- $p "$@"
   local sx="$1" sy="$2"; shift 2
   focus
-  cliclick m:"$sx","$sy" >/dev/null 2>&1 || true; sleep 0.4
-  cliclick dd:"$sx","$sy" >/dev/null 2>&1 || true
+  cliclick m:"$sx","$sy" >/dev/null 2>&1 \
+    || { echo "    FAIL: cliclick could not move to ($sx,$sy) for the long press"; return 1; }
+  sleep 0.4
+  cliclick dd:"$sx","$sy" >/dev/null 2>&1 \
+    || { echo "    FAIL: cliclick could not press at ($sx,$sy)"
+         cliclick du:"$sx","$sy" >/dev/null 2>&1 || true; return 1; }
   sleep "$hold"
   # The shot must never abort this function: under `set -e` a failed screenshot
   # would skip the release below and leave the mouse button physically held
   # down on the user's desktop. Take the status, release, then report it.
   local status=0
   shot "$@" || status=$?
-  cliclick du:"$sx","$sy" >/dev/null 2>&1 || true
+  cliclick du:"$sx","$sy" >/dev/null 2>&1 \
+    || { echo "    FAIL: cliclick could not release the press at ($sx,$sy)"; status=1; }
   return "$status"
 }
 
@@ -187,7 +207,9 @@ drag() {  # drag <dx1> <dy1> <dx2> <dy2>
   local a b; a=$(map_pt "$1" "$2"); b=$(map_pt "$3" "$4")
   set -- $a $b
   focus
-  cliclick dd:"$1","$2" m:"$3","$4" w:250 du:"$3","$4" >/dev/null 2>&1 || true
+  cliclick dd:"$1","$2" m:"$3","$4" w:250 du:"$3","$4" >/dev/null 2>&1 \
+    || { echo "    FAIL: cliclick could not drag ($1,$2) -> ($3,$4)"
+         cliclick du:"$3","$4" >/dev/null 2>&1 || true; return 1; }
 }
 
 typed() { focus; osascript >/dev/null 2>&1 -e "tell application \"System Events\" to keystroke \"$1\"" || true; }
