@@ -72,8 +72,10 @@ OUTDIR="${OUTDIR:-$REPO/data/wir-icon-adopt}"   # the committed evidence lives h
 APP="$REPO/.build/la-shots/Build/Products/Debug-iphonesimulator/WillItRain.app"
 
 # Calibration, in macOS screen POINTS. See the header.
-ORIGIN_X=304        # screen x of device pixel (0,0) as DRAWN
-ORIGIN_Y=132.5      # screen y of device pixel (0,0) as DRAWN
+ORIGIN_X=304        # screen x of the DRAWN device-screen rectangle's top-left corner
+ORIGIN_Y=132.5      # screen y of that same corner. Under ROTATED=1 the corner shows
+                    # device pixel (DEV_W, DEV_H), NOT (0,0): map_pt mirrors before it
+                    # scales, so (0,0) lands at the rectangle's bottom-right.
 SCALE=0.31          # screen points per device pixel
 ROTATED=1           # window draws the device upside-down
 DEV_W=1320
@@ -106,6 +108,11 @@ mkdir -p "$OUTDIR/native"
   echo "    -derivedDataPath .build/la-shots build"; exit 1; }
 [ -d "$APP/PlugIns/WillItRainWidgets.appex" ] || { echo "Widget extension missing"; exit 1; }
 
+# The one input helper that is deliberately best-effort: re-activating the window
+# is not itself state a capture depends on, and the steps below fail loudly on
+# their own if the window never came forward. Every OTHER osascript that drives
+# input propagates its status, because an input step that silently did nothing
+# means screenshotting whatever was already on screen and labelling it evidence.
 focus() {
   osascript >/dev/null 2>&1 <<'EOS' || true
 tell application "Simulator" to activate
@@ -122,24 +129,34 @@ EOS
 # Cmd+L does not lock via System Events, but Cmd+Shift+H does go Home.
 home() {
   focus
-  osascript >/dev/null 2>&1 <<'EOS' || true
+  if ! osascript >/dev/null 2>&1 <<'EOS'
 tell application "System Events" to tell process "Simulator"
   keystroke "h" using {command down, shift down}
 end tell
 EOS
+  then
+    echo "    FAIL: Cmd+Shift+H did not reach the Simulator — is this terminal allowed"
+    echo "          to control System Events (Privacy & Security > Automation)?"
+    return 1
+  fi
 }
 
 # A Device menu item must have its parent menu opened first, or the click is
 # silently swallowed.
 devmenu() {
   focus
-  osascript >/dev/null 2>&1 <<EOS || true
+  if ! osascript >/dev/null 2>&1 <<EOS
 tell application "System Events" to tell process "Simulator"
   click menu bar item "Device" of menu bar 1
   delay 0.8
   click menu item "$1" of menu 1 of menu bar item "Device" of menu bar 1
 end tell
 EOS
+  then
+    echo "    FAIL: Device > $1 did not click — no such menu item, or this terminal is"
+    echo "          not allowed to control System Events (Privacy & Security > Automation)?"
+    return 1
+  fi
 }
 
 win_geom() {  # -> "x y w h"
@@ -153,7 +170,13 @@ win_geom() {  # -> "x y w h"
 assert_window() {
   local x y w h
   read -r x y w h <<<"$(win_geom)"
-  [ -n "${h:-}" ] || { echo "ABORT: Simulator has no window (Mac screen locked?)"; exit 2; }
+  [ -n "${h:-}" ] || {
+    echo "ABORT: could not read the Simulator's window geometry. Either it has no window"
+    echo "       (Mac screen locked?), or this terminal is not allowed to control System"
+    echo "       Events (Privacy & Security > Automation) — which every input step here"
+    echo "       needs, so this check is also the up-front probe for that permission."
+    exit 2
+  }
   echo "window ${w}x${h} at ($x,$y)"
   if [ "$w" -ne 462 ] || [ "$h" -ne 988 ] || [ "$x" -ne 278 ] || [ "$y" -ne 53 ]; then
     echo "ABORT: expected the 462x988 window at (278,53) this script is calibrated for."
@@ -212,7 +235,12 @@ drag() {  # drag <dx1> <dy1> <dx2> <dy2>
          cliclick du:"$3","$4" >/dev/null 2>&1 || true; return 1; }
 }
 
-typed() { focus; osascript >/dev/null 2>&1 -e "tell application \"System Events\" to keystroke \"$1\"" || true; }
+typed() {
+  focus
+  osascript >/dev/null 2>&1 -e "tell application \"System Events\" to keystroke \"$1\"" \
+    || { echo "    FAIL: could not type \"$1\" — is this terminal allowed to control"
+         echo "          System Events (Privacy & Security > Automation)?"; return 1; }
+}
 
 status_bar_override() {
   xcrun simctl status_bar "$SIM" override --time "9:41" \
