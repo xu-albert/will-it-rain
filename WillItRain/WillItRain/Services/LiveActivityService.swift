@@ -59,7 +59,10 @@ final class LiveActivityService {
         }
     }
 
-    private func observePushToken(for activity: Activity<RainActivityAttributes>) {
+    // Not private: the DEBUG scenario harness starts its own activities and must
+    // register their push tokens too, or the server has no way to reach an
+    // activity that a test started.
+    func observePushToken(for activity: Activity<RainActivityAttributes>) {
         tokenObservers[activity.id]?.cancel()
         tokenObservers[activity.id] = Task {
             for await tokenData in activity.pushTokenUpdates {
@@ -93,10 +96,16 @@ final class LiveActivityService {
         // State C — intermittent: several distinct bursts ahead, not raining now.
         if current == nil, periods.count >= 2, let next = periods.first {
             let minutes = max(1, Int(next.start.timeIntervalSince(now) / 60))
+            let hero: String
+            switch next.type {
+            case .snow: hero = "Flurries"
+            case .sleet, .mixed, .hail: hero = "Wintry mix"
+            case .rain, .none: hero = "Showers"
+            }
             return .init(
                 statusText: "On & off",
                 countdownTarget: nil,
-                heroText: next.type == .snow ? "Flurries" : "Showers",
+                heroText: hero,
                 subBold: "next burst in \(minutes) min",
                 subRest: "On & off · ",
                 boldFirst: false,
@@ -106,7 +115,8 @@ final class LiveActivityService {
                 midLabel: mid,
                 endLabel: end,
                 flagText: nil,
-                flagPosition: nil
+                flagPosition: nil,
+                precip: next.type.isWintry ? .wintry : .rain
             )
         }
 
@@ -118,6 +128,7 @@ final class LiveActivityService {
             case .snow: statusWord = "Snowing now"; verb = "Snowing"
             case .hail: statusWord = "Hailing now"; verb = "Hailing"
             case .sleet: statusWord = "Sleet now"; verb = "Sleet"
+            case .mixed: statusWord = "Wintry mix now"; verb = "Wintry mix"
             case .rain, .none: statusWord = "Raining now"; verb = "Raining"
             }
             return .init(
@@ -133,7 +144,8 @@ final class LiveActivityService {
                 midLabel: mid,
                 endLabel: end,
                 flagText: shortTime(current.end),
-                flagPosition: segments.first?.end
+                flagPosition: segments.first?.end,
+                precip: current.type.isWintry ? .wintry : .rain
             )
         }
 
@@ -145,6 +157,7 @@ final class LiveActivityService {
         case .snow: typeWord = "snow"
         case .hail: typeWord = "hail"
         case .sleet: typeWord = "sleet"
+        case .mixed: typeWord = "wintry mix"
         case .rain, .none: typeWord = "rain"
         }
         let intensity = next.peakIntensity == .none ? "Light" : next.peakIntensity.rawValue
@@ -161,7 +174,8 @@ final class LiveActivityService {
             midLabel: mid,
             endLabel: end,
             flagText: shortTime(next.start),
-            flagPosition: segments.first?.start
+            flagPosition: segments.first?.start,
+            precip: next.type.isWintry ? .wintry : .rain
         )
     }
 

@@ -1,4 +1,4 @@
-import { Env, LiveActivityContentState } from './types';
+import { Env, LiveActivityContentState, Precip } from './types';
 
 // Generate JWT for APNs authentication (same key as WeatherKit but different use)
 // APNs provider tokens may be reused for up to 1 hour; regenerating one per push
@@ -155,9 +155,14 @@ export function encodeActivityDate(date: Date): number {
 
 export type LiveActivityEvent = 'update' | 'end';
 
+// `precip` is optional in this signature only so the test endpoint can send a
+// payload without it, standing in for a pre-1.1.1 Worker. The invariant that
+// production always sends it is enforced where the cron's content states are
+// declared — each is annotated `LiveActivityContentState`, where the field is
+// required. A transport function is the wrong place to hold that guarantee.
 export async function sendLiveActivityUpdate(
   activityToken: string,
-  contentState: LiveActivityContentState,
+  contentState: Omit<LiveActivityContentState, 'precip'> & { precip?: Precip },
   env: Env,
   event: LiveActivityEvent = 'update'
 ): Promise<void> {

@@ -1,6 +1,55 @@
-# Gonna Rain? — Notification Testing Guide (temporary)
+# Gonna Rain? — Testing Guide
 
-_Written 2026-07-24 for Release 2. Delete when done._
+## Test scripts (start here)
+
+Re-runnable harnesses. Prefer these over ad-hoc commands so regressions get
+caught by a rerun rather than by a user.
+
+```bash
+cd backend && npm test          # typecheck + validator units + endpoint contracts
+./scripts/test-live-activity.sh # build Debug, drive every Live Activity state
+```
+
+| Script | Covers |
+|---|---|
+| `backend/test/validate.test.mjs` | Token/coordinate/lead-time validators, incl. every real production device token |
+| `backend/test/endpoints.test.sh` | `/test-*` stay authenticated; `/register` rejects bad input before writing KV |
+| `backend/test/probe-weatherkit-summary.sh` | WeatherKit still populates `forecastNextHour.summary[].condition` — the field snow-vs-rain depends on, whose absence fails silently |
+| `scripts/test-live-activity.sh` | Rain vs wintry rendering across all three design states + the legacy-payload regression, in both presentations |
+| `screenshots/take_screenshots.sh` | App Store screenshots |
+
+**Live Activity gotchas the script encodes** (each cost real time to find):
+
+- The scenario harness is behind `#if DEBUG`. A **Release** build strips it and
+  the app launches normally while silently starting no activity. Build Debug.
+- App `print()` does not reach most log wrappers — use
+  `xcrun simctl launch --console-pty`.
+- The compact island only renders while the app is **backgrounded**, so the
+  script launches another app to take the foreground. It avoids Settings on
+  purpose: Settings can land on an Apple Account sign-in sheet and put an email
+  and password field into every screenshot.
+- Scenario `BX` sends a payload with `precip` **absent**, standing in for a push
+  from a Worker that predates the field. It must render exactly like `B`. If it
+  renders as snow the default is inverted; if the card freezes, someone made the
+  field non-optional and ActivityKit can no longer decode.
+- The script runs **two passes**, because the two presentations need opposite
+  things. The Dynamic Island needs the app backgrounded; the lock-screen card
+  needs it foregrounded, via the app's DEBUG `-liveActivityCards A,B,C` screen.
+  The real lock screen is unreachable from a script — `simctl` has no lock
+  command and Simulator's Device ▸ Lock over osascript fails silently too often
+  to trust. So the card renders in-app from the same views the widget uses
+  (`Shared/LiveActivityCardViews.swift`). This matters because everything the
+  wintry palette touches — the track, its glow, the ring around the "now" dot —
+  appears **only** on the card. The island shows a glyph and a countdown.
+- `simctl` cannot overwrite a screenshot that a *different* process created:
+  macOS attaches a per-file access ACL (`com.apple.macl`) and the write fails
+  with EPERM, which `ls` gives no hint of. The script unlinks each target first.
+
+---
+
+## Notification testing (Release 2)
+
+_Written 2026-07-24._
 
 ## ⚠️ Read this first — the `--remote` gotcha
 
@@ -131,7 +180,10 @@ curl -X DELETE https://will-it-rain.albertwxu.workers.dev/unregister \
 ## Known gaps (Release 2 follow-ups)
 - Server push says "in your area" (no city name) — backend stores only lat/lon.
   Add `locationName` to the `/register` payload to name the city.
-- Server can't tell rain vs snow (WeatherKit `forecastNextHour` has no type) —
-  only the on-device path is type-aware.
+- ~~Server can't tell rain vs snow~~ — fixed in 1.1.1. It reads
+  `forecastNextHour.summary[].condition`, confirmed live 2026-07-27. Caveat:
+  Apple's summary applies a higher confidence bar than our own minute-level
+  detection (Belfast showed precipitation at chance 0.31 while the summary still
+  said `clear`), so very light snow can render as rain. Deliberate fallback.
 - Cron reads only the next ~hour, so it can't warn earlier than ~75 min out.
 - Stale device tokens accumulate; add 410-Gone cleanup in the APNs path later.
