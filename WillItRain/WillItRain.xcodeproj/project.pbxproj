@@ -18,6 +18,13 @@
 			remoteGlobalIDString = 4CA000000000000000000005;
 			remoteInfo = WillItRainWidgets;
 		};
+		4CB000000000000000000002 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 35628FB92F45B954003AA967 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 35628FC02F45B954003AA967;
+			remoteInfo = WillItRain;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -37,6 +44,7 @@
 /* Begin PBXFileReference section */
 		35628FC12F45B954003AA967 /* WillItRain.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WillItRain.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		4CA000000000000000000001 /* WillItRainWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = WillItRainWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		4CB000000000000000000001 /* WillItRainTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WillItRainTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -80,6 +88,13 @@
 			path = Shared;
 			sourceTree = "<group>";
 		};
+		4CB000000000000000000003 /* WillItRainTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+			);
+			path = WillItRainTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -97,6 +112,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		4CB000000000000000000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -106,6 +128,7 @@
 				35628FC32F45B954003AA967 /* WillItRain */,
 				4CA000000000000000000002 /* WillItRainWidgets */,
 				4CA000000000000000000003 /* Shared */,
+				4CB000000000000000000003 /* WillItRainTests */,
 				35628FC22F45B954003AA967 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -115,6 +138,7 @@
 			children = (
 				35628FC12F45B954003AA967 /* WillItRain.app */,
 				4CA000000000000000000001 /* WillItRainWidgets.appex */,
+				4CB000000000000000000001 /* WillItRainTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -170,6 +194,29 @@
 			productReference = 4CA000000000000000000001 /* WillItRainWidgets.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		4CB000000000000000000007 /* WillItRainTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4CB00000000000000000000B /* Build configuration list for PBXNativeTarget "WillItRainTests" */;
+			buildPhases = (
+				4CB000000000000000000005 /* Sources */,
+				4CB000000000000000000004 /* Frameworks */,
+				4CB000000000000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				4CB000000000000000000008 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				4CB000000000000000000003 /* WillItRainTests */,
+			);
+			name = WillItRainTests;
+			packageProductDependencies = (
+			);
+			productName = WillItRainTests;
+			productReference = 4CB000000000000000000001 /* WillItRainTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXTargetDependency section */
@@ -177,6 +224,11 @@
 			isa = PBXTargetDependency;
 			target = 4CA000000000000000000005 /* WillItRainWidgets */;
 			targetProxy = 4CA00000000000000000000C /* PBXContainerItemProxy */;
+		};
+		4CB000000000000000000008 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 35628FC02F45B954003AA967 /* WillItRain */;
+			targetProxy = 4CB000000000000000000002 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -190,6 +242,9 @@
 				TargetAttributes = {
 					35628FC02F45B954003AA967 = {
 						CreatedOnToolsVersion = 26.2;
+					};
+					4CB000000000000000000007 = {
+						TestTargetID = 35628FC02F45B954003AA967;
 					};
 				};
 			};
@@ -209,6 +264,7 @@
 			targets = (
 				35628FC02F45B954003AA967 /* WillItRain */,
 				4CA000000000000000000005 /* WillItRainWidgets */,
+				4CB000000000000000000007 /* WillItRainTests */,
 			);
 		};
 /* End PBXProject section */
@@ -228,6 +284,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		4CB000000000000000000006 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -239,6 +302,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		4CA000000000000000000006 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4CB000000000000000000005 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -501,6 +571,48 @@
 			};
 			name = Release;
 		};
+		4CB000000000000000000009 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 6;
+				DEVELOPMENT_TEAM = T3RMY9V6G8;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.6;
+				MARKETING_VERSION = 1.1.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.willitrain.WillItRainTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/WillItRain.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/WillItRain";
+			};
+			name = Debug;
+		};
+		4CB00000000000000000000A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 6;
+				DEVELOPMENT_TEAM = T3RMY9V6G8;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.6;
+				MARKETING_VERSION = 1.1.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.willitrain.WillItRainTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/WillItRain.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/WillItRain";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -527,6 +639,15 @@
 			buildConfigurations = (
 				4CA00000000000000000000A /* Debug */,
 				4CA00000000000000000000B /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		4CB00000000000000000000B /* Build configuration list for PBXNativeTarget "WillItRainTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4CB000000000000000000009 /* Debug */,
+				4CB00000000000000000000A /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

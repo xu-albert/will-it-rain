@@ -2,7 +2,14 @@
 
 This file is the project's committed home for project-intrinsic agent knowledge: build, test, release, architecture, and sharp-edge notes that should travel with the code.
 
-- Add durable project-specific notes here as they are discovered through real work.
+## Build & test
+
+- The Xcode project is `WillItRain/WillItRain.xcodeproj`, shared scheme `WillItRain` (targets: app, `WillItRainWidgets` extension, `WillItRainTests` unit tests hosted in the app).
+- CI is `.github/workflows/ci.yml`: unsigned simulator build + headless `xcodebuild test` on macos-26 with Xcode pinned via `DEVELOPER_DIR`. Keep that pin in sync with the Xcode version the project needs; runner image contents are listed in actions/runner-images `macos-26-Readme.md`.
+- Local headless verification (don't open Simulator.app unless the session is explicitly doing GUI capture work like the screenshot section below):
+  `xcodebuild build-for-testing -project WillItRain/WillItRain.xcodeproj -scheme WillItRain -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO` then `xcodebuild test-without-building ... -destination 'platform=iOS Simulator,name=iPhone 17 Pro'`; shut the sim down afterwards with `xcrun simctl shutdown`.
+- The app's Info.plist is generated (`GENERATE_INFOPLIST_FILE=YES`): INFOPLIST_KEY_* build settings in the pbxproj are the source of truth (e.g. the portrait lock). `BuildProductTests` asserts on the merged plist of the built product — update those tests when changing those settings deliberately.
+- `SourceFiles/` at the repo root is a stale copy of app sources; the compiled code lives under `WillItRain/`.
 
 ## Driving the iOS Simulator for screenshots
 

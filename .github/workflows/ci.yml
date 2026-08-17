@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pin Xcode explicitly so image-default bumps can't change the toolchain under us.
+  # Xcode 26.6 (17F113) on the macos-26 image; update deliberately, not implicitly.
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+jobs:
+  build-and-test:
+    name: Build & Test (iOS Simulator)
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun simctl list devices available | grep -i iphone || true
+
+      - name: Build (iOS Simulator, unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project WillItRain/WillItRain.xcodeproj \
+            -scheme WillItRain \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Test (iPhone 17 Pro simulator, headless)
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project WillItRain/WillItRain.xcodeproj \
+            -scheme WillItRain \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+            -derivedDataPath DerivedData \
+            -resultBundlePath TestResults.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults.xcresult
