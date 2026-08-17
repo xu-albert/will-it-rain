@@ -77,14 +77,9 @@ private struct LockScreenActivityView: View {
 
     private var headerRow: some View {
         HStack(spacing: 7) {
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(LA.segmentFill)
-                .frame(width: 20, height: 20)
-                .overlay {
-                    Image(systemName: "drop.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.white)
-                }
+            // The app icon itself, not a stand-in: this slot is the activity's
+            // identity badge, so it shows the same tile the home screen does.
+            AppIconTile(size: 20)
             Text("Gonna Rain?")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.72))
@@ -181,6 +176,11 @@ private struct CompactCountdownText: View {
     }
 }
 
+/// The Dynamic Island's precipitation glyph. This slot is deliberately NOT the
+/// app icon: it says what the weather is doing, not whose app is saying it, so
+/// `release-1.1.1-wintry-live-activity` can keep swapping it for a snowflake on
+/// wintry activities. App identity lives on the lock-screen header badge only —
+/// see `LockScreenActivityView.headerRow`.
 private struct DropGlyph: View {
     let size: CGFloat
 
