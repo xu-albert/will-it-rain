@@ -338,7 +338,7 @@ struct ContentView: View {
             weatherPoller.schedule(after: interval) {
                 Task { await fetchWeather() }
             }
-        } catch is LocationError {
+        } catch LocationError.permissionDenied {
             appState = .error(.locationDenied)
             return
         } catch {

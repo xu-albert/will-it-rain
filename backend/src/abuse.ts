@@ -7,7 +7,7 @@
 // coordinate, and every one of those coordinates became a permanent line item
 // in the cron's WeatherKit fan-out.
 //
-// Three limits close that, and they are deliberately different in kind:
+// Four limits close that, and they are deliberately different in kind:
 //
 //   1. A per-client throttle bounds how fast anyone can register at all.
 //   2. Hard ceilings on distinct grid cells, and on devices inside one cell,
@@ -298,11 +298,11 @@ export const INTERNAL_SUBREQUESTS_PER_TICK_FIXED =
 export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 
 // ---------------------------------------------------------------------------
-// The daily allowances — four KV buckets and three Durable Object meters
+// The daily allowances — four KV buckets and four Durable Object meters
 // ---------------------------------------------------------------------------
 
 // Different budget, different period, and — the part that is easy to get wrong
-// — SEVEN independent allowances, not one. The Free plan gives the KV namespace
+// — EIGHT independent allowances, not one. The Free plan gives the KV namespace
 // 100,000 key reads, 1,000 key writes, 1,000 key DELETES and 1,000 LIST
 // requests per day, and meters Durable Objects again on top of that: 100,000
 // requests, 100,000 SQLite rows WRITTEN and 5,000,000 rows read per day, plus
@@ -483,9 +483,11 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //   single-digit devices. Anyone approaching the caps for real should lower it
 //   rather than assume the bucket cannot move.
 //
-//   BOTH DO METERS FIT, and neither gets a budget. Legitimate traffic spends
-//   about 6% of each, and no arithmetic above asks for a bound, so there is
-//   deliberately no per-tick DO budget, no new constant and no guard code here —
+//   ALL FOUR DO METERS FIT, and none of them gets a budget. Legitimate traffic
+//   spends about 6% of the two that bind first — requests and rows written —
+//   and far less of rows read and duration, and no arithmetic above asks for a
+//   bound, so there is deliberately no per-tick DO budget, no new constant and
+//   no guard code here —
 //   a mitigation nothing demands is just another thing to get wrong. What does
 //   need saying is the failure mode, because it is unlike KV's: both callers
 //   fail OPEN on purpose (checkRegistrationRate at the throttle, reserveGridCell

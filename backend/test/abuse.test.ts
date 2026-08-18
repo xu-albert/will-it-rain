@@ -1319,6 +1319,16 @@ describe('re-registration', () => {
 
   it('keeps the Live Activity token even when /register reads a stale device record', async () => {
     await reRegister(1, 0);
+
+    // The real sequence: /register-activity and /register both run inside one
+    // fetchWeather cycle, seconds apart, and KV serves gets from a colo cache
+    // with a 60-second floor. Freezing here — before the activity exists — is
+    // what makes /register's read genuinely predate it, which is the only
+    // arrangement that hurts: a read-modify-write on one shared record would
+    // merge that pre-activity snapshot forward and wipe the token. Freezing
+    // after the attach instead would snapshot a record that already carried it,
+    // and the shared-record design would survive too.
+    kv.freezeReads();
     await worker.fetch(
       new Request('https://worker.test/register-activity', {
         method: 'POST',
@@ -1327,12 +1337,6 @@ describe('re-registration', () => {
       }),
       env
     );
-
-    // The real sequence: /register-activity and /register both run inside one
-    // fetchWeather cycle, seconds apart, and KV serves gets from a colo cache
-    // with a 60-second floor — so /register's read can predate the activity
-    // entirely. A read-modify-write on one shared record loses the token here.
-    kv.freezeReads();
     await reRegister(1, 1);
     kv.thawReads();
 
