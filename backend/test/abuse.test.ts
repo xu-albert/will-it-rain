@@ -18,9 +18,10 @@ import {
   RATE_LIMIT_MAX_REQUESTS,
   RATE_LIMIT_WINDOW_SECONDS,
   createPushBudget,
+  reconcileCoverage,
   selectCellsWithinCap,
 } from '../src/abuse';
-import { Env, GridCell } from '../src/types';
+import { DeviceRegistration, Env, GridCell } from '../src/types';
 import { KVMock } from './kvMock';
 import { DurableObjectNamespaceMock } from './doMock';
 
@@ -76,6 +77,11 @@ function fakeToken(n: number): string {
 /** Distinct coordinates 0.05 deg apart, so each maps to its own grid cell. */
 function coordsForCell(n: number): { lat: number; lon: number } {
   return { lat: 30 + (n % 200) * 0.05, lon: -120 - Math.floor(n / 200) * 0.05 };
+}
+
+/** A device registration whose only interesting property is when it was first seen. */
+function device(n: number, registeredAt: string): DeviceRegistration {
+  return { token: fakeToken(n), lat: 0, lon: 0, leadTimeMinutes: 20, registeredAt };
 }
 
 function registerRequest(
@@ -200,6 +206,43 @@ describe('per-client rate limit', () => {
     // A different cell, so this asserts the throttle and not one of the caps.
     const other = await worker.fetch(registerRequest(500, { cell: 1, ip: '198.51.100.2' }), env);
     expect(other.status).toBe(200);
+  });
+
+  it('tears down an unregistered token without spending any KV writes on it', async () => {
+    // /unregister is deliberately unthrottled, so this is the cheapest request
+    // an attacker can make. It must stay cheap for us too: four KV deletes each
+    // would drain the Free plan's daily delete allowance in one 250-request
+    // burst and break teardown for real users for the rest of the day.
+    const before = kv.deletes;
+    for (let n = 0; n < 25; n++) {
+      const res = await worker.fetch(
+        new Request('https://worker.test/unregister', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': `203.0.113.${n}` },
+          body: JSON.stringify({ token: fakeToken(700 + n) }),
+        }),
+        env
+      );
+      expect(res.status).toBe(200);
+    }
+    expect(kv.deletes).toBe(before);
+  });
+
+  it('still tears down a registration that really exists', async () => {
+    await worker.fetch(registerRequest(1, { cell: 0 }), env);
+    expect(kv.raw(`device:${fakeToken(1)}`)).toBeTruthy();
+
+    const res = await worker.fetch(
+      new Request('https://worker.test/unregister', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.7' },
+        body: JSON.stringify({ token: fakeToken(1) }),
+      }),
+      env
+    );
+
+    expect(res.status).toBe(200);
+    expect(kv.raw(`device:${fakeToken(1)}`)).toBeUndefined();
   });
 
   it('does not throttle a user tearing their registration down', async () => {
@@ -340,6 +383,85 @@ describe('grid-cell cap', () => {
     expect(kv.deletes).toBe(before);
   });
 
+  it('never refuses an incumbent, even after a stale cron snapshot loses its cell', async () => {
+    // Workers KV `list` is eventually consistent, so the cron can read a
+    // snapshot taken before the newest registration landed. Reconciling that
+    // snapshot verbatim used to evict the newcomer from the tally; a later
+    // arrival then took the freed slot, and when the original device
+    // re-registered on foreground it was refused AND had its record deleted —
+    // a live user silently and permanently deregistered.
+    for (let n = 0; n < MAX_GRID_CELLS; n++) {
+      expect((await registerCell(n)).status).toBe(200);
+    }
+
+    // A cron tick whose device listing predates the last registration.
+    const stale = kv.keysWithPrefix('device:').filter((k) => k !== `device:${fakeToken(14)}`);
+    await reconcileCoverage(
+      stale.map((key) => {
+        const record = JSON.parse(kv.raw(key)!) as { token: string; lat: number; lon: number };
+        return {
+          gridKey: `${record.lat.toFixed(2)},${record.lon.toFixed(2)}`,
+          devices: [record as never],
+        };
+      }),
+      env
+    );
+
+    // Whatever the tally now believes, the fleet really is at capacity, so a
+    // genuinely new area is still refused.
+    const newcomer = await worker.fetch(
+      registerRequest(800, { cell: 800, ip: '192.0.2.231' }),
+      env
+    );
+    expect(newcomer.status).toBe(503);
+
+    // And the incumbent, whose record never went anywhere, is still admitted.
+    const again = await worker.fetch(registerRequest(14, { cell: 14, ip: '192.0.2.230' }), env);
+    expect(again.status).toBe(200);
+    expect(kv.raw(`device:${fakeToken(14)}`)).toBeTruthy();
+  });
+
+  it('never refuses an incumbent even once the tally has genuinely lost its cell', async () => {
+    // The grace window above covers a snapshot taken seconds before the tick.
+    // Past it, the tally really can drop a device that is still in KV, and the
+    // only thing left standing between a live user and having their
+    // registration deleted is that a stored record at this exact cell is proof
+    // enough on its own.
+    for (let n = 0; n < MAX_GRID_CELLS; n++) {
+      expect((await registerCell(n)).status).toBe(200);
+    }
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + 5 * 60_000);
+
+      const stale = kv.keysWithPrefix('device:').filter((k) => k !== `device:${fakeToken(14)}`);
+      await reconcileCoverage(
+        stale.map((key) => {
+          const record = JSON.parse(kv.raw(key)!) as { token: string; lat: number; lon: number };
+          return {
+            gridKey: `${record.lat.toFixed(2)},${record.lon.toFixed(2)}`,
+            devices: [record as never],
+          };
+        }),
+        env
+      );
+
+      // The tally now has a free slot it should not have, and a newcomer takes it.
+      expect(
+        (await worker.fetch(registerRequest(800, { cell: 800, ip: '192.0.2.231' }), env)).status
+      ).toBe(200);
+
+      // Device 14 is still registered in KV at its own unchanged cell, so it is
+      // an incumbent and must be admitted — not refused and deleted.
+      const again = await worker.fetch(registerRequest(14, { cell: 14, ip: '192.0.2.230' }), env);
+      expect(again.status).toBe(200);
+      expect(kv.raw(`device:${fakeToken(14)}`)).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('refuses a new device once a single cell is full, and says which limit it hit', async () => {
     for (let n = 0; n < MAX_DEVICES_PER_CELL; n++) {
       const res = await worker.fetch(registerRequest(n, { cell: 7, ip: `192.0.2.${n}` }), env);
@@ -401,14 +523,53 @@ describe('grid-cell cap', () => {
     expect(first).toEqual(second);
   });
 
-  it('leaves a fleet below the cap completely untouched', () => {
+  it('serves a fleet below the cap in full', () => {
     const cells: GridCell[] = Array.from({ length: MAX_GRID_CELLS }, (_, n) => ({
       gridKey: `${n}.00,0.00`,
       devices: [],
     }));
     const { cells: served, skipped } = selectCellsWithinCap(cells);
-    expect(served).toBe(cells);
+    expect(served.map((c) => c.gridKey).sort()).toEqual(cells.map((c) => c.gridKey).sort());
     expect(skipped).toBe(0);
+  });
+
+  it('orders cells oldest-first even when nothing has to be skipped', () => {
+    // Below the cap the list used to come back in KV order — `device:<token-hex>`
+    // — which is arbitrary with respect to who registered first and identical on
+    // every tick. The push budget is spent walking this list, so that handed the
+    // same devices the same shortfall forever.
+    const cells: GridCell[] = [
+      { gridKey: 'newest', devices: [device(1, '2026-03-01T00:00:00.000Z')] },
+      { gridKey: 'oldest', devices: [device(2, '2026-01-01T00:00:00.000Z')] },
+      { gridKey: 'middle', devices: [device(3, '2026-02-01T00:00:00.000Z')] },
+    ];
+
+    const { cells: served, skipped } = selectCellsWithinCap(cells);
+    expect(served.map((c) => c.gridKey)).toEqual(['oldest', 'middle', 'newest']);
+    expect(skipped).toBe(0);
+  });
+
+  it('orders devices inside a cell oldest-first, so the budget starves newcomers', () => {
+    // One cell can hold up to MAX_DEVICES_PER_CELL devices and the budget is
+    // spent per device, so ordering within a cell decides who goes unnotified
+    // just as much as ordering between cells does.
+    const cells: GridCell[] = [
+      {
+        gridKey: 'one-cell',
+        devices: [
+          device(1, '2026-03-01T00:00:00.000Z'),
+          device(2, '2026-01-01T00:00:00.000Z'),
+          device(3, '2026-02-01T00:00:00.000Z'),
+        ],
+      },
+    ];
+
+    const served = selectCellsWithinCap(cells).cells[0].devices;
+    expect(served.map((d) => d.registeredAt)).toEqual([
+      '2026-01-01T00:00:00.000Z',
+      '2026-02-01T00:00:00.000Z',
+      '2026-03-01T00:00:00.000Z',
+    ]);
   });
 });
 
@@ -602,13 +763,24 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
   });
 
   it('gives every tick its own budget rather than a shared one', async () => {
-    const first = await runCron({ cells: 2, devicesPerCell: 5, forecast: rainStartingSoon });
-    const second = await runCron({ cells: 2, devicesPerCell: 5, forecast: rainStartingSoon });
+    // Each tick has to want more than the budget on its own. Two small ticks
+    // would prove nothing: 10 pushes then 10 more still fit inside 34 whether
+    // the budget is per-invocation or hoisted to module scope. Sized like this,
+    // a shared budget spends it all on the first tick and sends nothing at all
+    // on the second.
+    const first = await runCron({
+      cells: MAX_GRID_CELLS,
+      devicesPerCell: 5,
+      forecast: rainStartingSoon,
+    });
+    const second = await runCron({
+      cells: MAX_GRID_CELLS,
+      devicesPerCell: 5,
+      forecast: rainStartingSoon,
+    });
 
-    // 10 devices, well under the budget: a budget carried across invocations
-    // would leave the second tick with less to spend than the first.
-    expect(first.pushes).toBe(10);
-    expect(second.pushes).toBe(first.pushes);
+    expect(first.pushes).toBe(PUSH_BUDGET_PER_INVOCATION);
+    expect(second.pushes).toBe(PUSH_BUDGET_PER_INVOCATION);
   });
 });
 

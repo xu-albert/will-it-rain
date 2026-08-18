@@ -20,7 +20,16 @@
 import { CoverageMap, CoverageReply, RateReply } from './types';
 
 const COVERAGE_KEY = 'cells';
+const RECENT_KEY = 'recent';
 const WINDOW_KEY = 'window';
+
+// How long an admission is protected from being reconciled away. Workers KV
+// `list` is eventually consistent, so a device admitted moments before a cron
+// tick can be missing from the snapshot that tick reads — see reconcile().
+const RECONCILE_GRACE_MS = 120_000;
+
+/** Tokens admitted recently, with the cell they were admitted into. */
+type RecentAdmissions = Record<string, { gridKey: string; at: number }>;
 
 function reply(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -104,6 +113,16 @@ export class CoverageRegistry {
     return (await this.ctx.storage.get<CoverageMap>(COVERAGE_KEY)) ?? {};
   }
 
+  /** Recent admissions, with anything past the grace window dropped. */
+  private async loadRecent(now: number): Promise<RecentAdmissions> {
+    const stored = (await this.ctx.storage.get<RecentAdmissions>(RECENT_KEY)) ?? {};
+    const live: RecentAdmissions = {};
+    for (const [token, entry] of Object.entries(stored)) {
+      if (now - entry.at < RECONCILE_GRACE_MS) live[token] = entry;
+    }
+    return live;
+  }
+
   /**
    * Admits `deviceToken` into `gridKey`, enforcing both caps.
    *
@@ -113,18 +132,29 @@ export class CoverageRegistry {
    * device that is genuinely new to a full cell, or that would open a cell
    * beyond the global cap, is refused.
    *
+   * `incumbent` says the caller has verified a stored `device:` record for this
+   * token at this exact gridKey, so the device already occupies real storage and
+   * the cron already fetches its cell. Admitting it past a cap therefore adds
+   * nothing that refusing would take away — it only repairs a tally that has
+   * fallen behind the truth — while refusing would delete a live user's
+   * registration. It cannot be used to grow past the caps, because incumbency
+   * requires a record that only a prior successful admission could have written.
+   *
    * A device moving between cells releases its old slot first, including when
    * the move is then refused: the caller drops that device's record on a
    * capacity refusal, so leaving it counted would leak a slot forever.
    */
   private async reserve(request: Request): Promise<Response> {
-    const { gridKey, deviceToken, maxCells, maxDevicesPerCell } = (await request.json()) as {
-      gridKey: string;
-      deviceToken: string;
-      maxCells: number;
-      maxDevicesPerCell: number;
-    };
+    const { gridKey, deviceToken, incumbent, maxCells, maxDevicesPerCell } =
+      (await request.json()) as {
+        gridKey: string;
+        deviceToken: string;
+        incumbent?: boolean;
+        maxCells: number;
+        maxDevicesPerCell: number;
+      };
 
+    const now = Date.now();
     const cells = await this.load();
     let changed = false;
 
@@ -140,7 +170,7 @@ export class CoverageRegistry {
     const occupants = cells[gridKey];
     if (occupants) {
       if (!occupants.includes(deviceToken)) {
-        if (occupants.length >= maxDevicesPerCell) {
+        if (occupants.length >= maxDevicesPerCell && !incumbent) {
           if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
           return reply(this.refusal('cell_at_capacity', cells, gridKey));
         }
@@ -148,7 +178,7 @@ export class CoverageRegistry {
         changed = true;
       }
     } else {
-      if (Object.keys(cells).length >= maxCells) {
+      if (Object.keys(cells).length >= maxCells && !incumbent) {
         if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
         return reply(this.refusal('coverage_at_capacity', cells, gridKey));
       }
@@ -157,6 +187,10 @@ export class CoverageRegistry {
     }
 
     if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
+
+    const recent = await this.loadRecent(now);
+    recent[deviceToken] = { gridKey, at: now };
+    await this.ctx.storage.put(RECENT_KEY, recent);
 
     const admitted: CoverageReply = {
       ok: true,
@@ -198,18 +232,44 @@ export class CoverageRegistry {
   }
 
   /**
-   * Replaces the tally with what KV actually holds, once per cron tick.
+   * Rebuilds the tally from what KV actually holds, once per cron tick.
    *
    * Device records expire on their own TTL, and nothing tells this object when
    * that happens, so without a periodic truth-up the tally would only ever grow.
-   * A registration that lands between the cron's KV read and this write is
-   * dropped from the tally and re-added the next time that device registers,
-   * which under-counts for at most one tick. The caller skips the call entirely
-   * if its KV read was truncated, so a partial read can never wipe live state.
+   *
+   * The snapshot is not taken as gospel, though. Workers KV `list` is eventually
+   * consistent, so a device that registered shortly before the tick can simply
+   * be missing from it — and dropping such a device is not the harmless
+   * one-tick under-count it looks like. At capacity it is permanent: its cell
+   * goes back on the market, a newcomer takes the last slot, and when the device
+   * re-registers (which the client now does on every foreground) the caller
+   * would refuse it and delete its record. So an admission inside
+   * RECONCILE_GRACE_MS survives a snapshot that does not mention it, and only
+   * entries older than that window can be reconciled away.
+   *
+   * The caller also skips this entirely when its KV read was truncated, so a
+   * partial read can never wipe live state.
    */
   private async reconcile(request: Request): Promise<Response> {
     const { coverage } = (await request.json()) as { coverage: CoverageMap };
-    await this.ctx.storage.put(COVERAGE_KEY, coverage);
-    return reply({ ok: true, cells: Object.keys(coverage).length, devices: 0 } satisfies CoverageReply);
+    const now = Date.now();
+
+    const next: CoverageMap = {};
+    for (const [gridKey, tokens] of Object.entries(coverage)) next[gridKey] = [...tokens];
+
+    const recent = await this.loadRecent(now);
+    for (const [token, entry] of Object.entries(recent)) {
+      const occupants = next[entry.gridKey];
+      if (!occupants) {
+        next[entry.gridKey] = [token];
+      } else if (!occupants.includes(token)) {
+        occupants.push(token);
+      }
+    }
+
+    await this.ctx.storage.put(COVERAGE_KEY, next);
+    await this.ctx.storage.put(RECENT_KEY, recent);
+
+    return reply({ ok: true, cells: Object.keys(next).length, devices: 0 } satisfies CoverageReply);
   }
 }

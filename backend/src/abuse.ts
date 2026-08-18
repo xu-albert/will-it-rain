@@ -25,7 +25,7 @@
 // App Attest (see the security review's item 9); this is the bound that holds
 // until then.
 
-import { CoverageMap, CoverageReply, Env, GridCell, RateReply } from './types';
+import { CoverageMap, CoverageReply, DeviceRegistration, Env, GridCell, RateReply } from './types';
 
 // ---------------------------------------------------------------------------
 // The fan-out budget
@@ -184,7 +184,8 @@ export type CellDecision = CoverageReply;
 export async function reserveGridCell(
   gridKey: string,
   deviceToken: string,
-  env: Env
+  env: Env,
+  options: { incumbent?: boolean } = {}
 ): Promise<CellDecision> {
   try {
     const response = await coverageStub(env).fetch('https://coverage/reserve', {
@@ -192,6 +193,7 @@ export async function reserveGridCell(
       body: JSON.stringify({
         gridKey,
         deviceToken,
+        incumbent: options.incumbent === true,
         maxCells: MAX_GRID_CELLS,
         maxDevicesPerCell: MAX_DEVICES_PER_CELL,
       }),
@@ -282,31 +284,48 @@ export function createPushBudget(limit = PUSH_BUDGET_PER_INVOCATION): PushBudget
 // Cron-side cap
 // ---------------------------------------------------------------------------
 
+/** Ascending by `registeredAt`, ties broken on token so the order is total. */
+function byFirstSeen(a: DeviceRegistration, b: DeviceRegistration): number {
+  if (a.registeredAt !== b.registeredAt) return a.registeredAt < b.registeredAt ? -1 : 1;
+  if (a.token === b.token) return 0;
+  return a.token < b.token ? -1 : 1;
+}
+
 /**
- * The caps' last line of defence: whatever ends up in KV, the cron never fans
- * out to more than MAX_GRID_CELLS cells in one invocation. This is what keeps
- * the Free plan's external-subrequest ceiling out of reach even if the
+ * Puts the cron's whole work list into first-seen order, oldest first, and
+ * truncates it to MAX_GRID_CELLS.
+ *
+ * The truncation is the caps' last line of defence: whatever ends up in KV, the
+ * cron never fans out to more than MAX_GRID_CELLS cells in one invocation, which
+ * keeps the Free plan's external-subrequest ceiling out of reach even if the
  * registration side is raced, mis-counted, or bypassed entirely.
  *
- * Cells are kept oldest-registration-first, so a flood of new coordinates
- * cannot displace the users who were already here. That ordering is only
- * truthful because handleRegister preserves a device's original `registeredAt`
- * across re-registrations — restamping it would invert this ranking, handing
- * every slot to whoever registered least recently.
+ * The ordering matters just as much, and it is applied unconditionally — not
+ * only when the list is long enough to truncate. PUSH_BUDGET_PER_INVOCATION can
+ * bind well below the cell cap (ten cells of four devices already want more
+ * pushes than a tick can afford), and whoever the loop reaches last is who goes
+ * unnotified. Left in KV list order that would be `device:<token-hex>` order:
+ * arbitrary with respect to who was here first, and *stable*, so the same
+ * devices would lose their pushes on every tick forever. Sorting devices inside
+ * each cell as well as the cells themselves makes budget exhaustion fall on the
+ * newest arrivals instead, which is the same incumbent-protection promise the
+ * cell truncation makes.
+ *
+ * Both orderings are only truthful because handleRegister preserves a device's
+ * original `registeredAt` across re-registrations — restamping it would invert
+ * the ranking, handing every slot to whoever registered least recently.
  */
 export function selectCellsWithinCap(grids: GridCell[]): { cells: GridCell[]; skipped: number } {
-  if (grids.length <= MAX_GRID_CELLS) return { cells: grids, skipped: 0 };
-
-  const oldest = (cell: GridCell): string =>
-    cell.devices.reduce(
-      (earliest, device) => (device.registeredAt < earliest ? device.registeredAt : earliest),
-      '9999'
-    );
-
-  // Decorate-sort-undecorate: `oldest` is a full pass over a cell's devices, and
-  // a comparator runs O(n log n) times.
+  // Decorate-sort-undecorate: sorting each cell's devices first makes its oldest
+  // registration simply the head of that list, so no cell is scanned twice.
   const ranked = grids
-    .map((cell) => ({ cell, oldest: oldest(cell) }))
+    .map((cell) => {
+      const devices = [...cell.devices].sort(byFirstSeen);
+      return {
+        cell: { gridKey: cell.gridKey, devices },
+        oldest: devices[0]?.registeredAt ?? '9999',
+      };
+    })
     .sort((a, b) => {
       if (a.oldest !== b.oldest) return a.oldest < b.oldest ? -1 : 1;
       if (a.cell.gridKey === b.cell.gridKey) return 0;
@@ -314,5 +333,8 @@ export function selectCellsWithinCap(grids: GridCell[]): { cells: GridCell[]; sk
     })
     .map((entry) => entry.cell);
 
-  return { cells: ranked.slice(0, MAX_GRID_CELLS), skipped: grids.length - MAX_GRID_CELLS };
+  return {
+    cells: ranked.slice(0, MAX_GRID_CELLS),
+    skipped: Math.max(0, grids.length - MAX_GRID_CELLS),
+  };
 }

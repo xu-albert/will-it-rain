@@ -202,9 +202,10 @@ export default {
 
     // Every push below is an external subrequest out of the same 50 the
     // WeatherKit fetches come from. The budget makes exhaustion deterministic —
-    // cells are already ordered oldest-first, and this loop is sequential, so
-    // the users who were here longest are the ones served — instead of letting
-    // the runtime throw "Too many subrequests" into a catch that swallows it.
+    // selectCellsWithinCap has ordered both the cells and the devices inside
+    // them oldest-first, and this loop is sequential, so the users who were here
+    // longest are the ones served — instead of letting the runtime throw "Too
+    // many subrequests" into a catch that swallows it.
     const budget = createPushBudget();
 
     const processGrid = async (grid: GridCell) => {
@@ -603,7 +604,16 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   // calls a month, forever. Registering into a cell the service already covers
   // costs nothing extra and is always allowed, so an existing user is never
   // turned away by the cap.
-  const cell = await reserveGridCell(gridKey, body.token, env);
+  //
+  // A device with a stored record at this very gridKey is an incumbent: it is
+  // already in KV and the cron already fetches its cell, so admitting it adds
+  // nothing. Saying so explicitly means the "never refuse a device
+  // re-registering at its own unchanged cell" invariant rests on KV — the same
+  // storage that decides whether the device exists at all — rather than on the
+  // registry's tally, which an eventually consistent cron snapshot can lag.
+  const incumbent =
+    existing !== null && toGridKey(existing.lat, existing.lon) === gridKey;
+  const cell = await reserveGridCell(gridKey, body.token, env, { incumbent });
   if (!cell.ok) {
     console.error(
       `[Register] Refused (${cell.code}): ${cell.cells}/${MAX_GRID_CELLS} cells, ` +
@@ -694,7 +704,20 @@ async function handleUnregister(request: Request, env: Env): Promise<Response> {
 //
 // The cell slot goes back too. Without that, a cell whose devices had all left
 // would stay "already covered" and hold a slot that nothing occupies.
+//
+// Tearing down a device that was never registered costs nothing, and that is
+// load-bearing rather than tidy. `/unregister` is deliberately unthrottled — a
+// user leaving must never be told to come back later — so without this check
+// anyone could spend four KV deletes and a round trip to the one global
+// CoverageRegistry per request, on fabricated tokens, and drain the Free plan's
+// daily delete allowance in a single burst. Deletes and the registry call have
+// to be earned by something actually being there. The `notified-*` and
+// `apnsfail:` keys carry their own short TTLs, so a device: record that is
+// already gone leaves nothing behind worth chasing.
 async function removeDevice(deviceToken: string, env: Env): Promise<void> {
+  const existing = await env.DEVICES.get(`device:${deviceToken}`);
+  if (existing === null) return;
+
   await Promise.all([
     env.DEVICES.delete(`device:${deviceToken}`),
     env.DEVICES.delete(`notified-start:${deviceToken}`),
