@@ -226,27 +226,34 @@ export const DEVICE_RECORD_REFRESH_SECONDS = 7 * 24 * 60 * 60; // 7 days
 
 // The shortest interval at which one device's record may be re-persisted.
 //
-// The skip-when-unchanged check above bounds repeats; it does nothing about
-// CHANGES, and a change is cheap to manufacture. Alternating one token between
-// two grid cells is a genuine change every time — the cell count never moves,
-// because reserve relocates the token rather than adding one, so neither
-// MAX_GRID_CELLS nor MAX_DEVICES_PER_CELL binds — and at the throttle's 20 per
-// 10 minutes that is 2,880 `device:` puts a day from a single address, nearly
-// three times the whole daily write allowance.
+// It applies to SAME-CELL settings changes only. A registration whose grid key
+// differs from the stored one is persisted immediately, never deferred: a
+// device that moved keeps being alerted for the cell it left until its new
+// coordinates land, and a mover silently warned about the wrong area is the
+// exact product break this whole change exists to prevent. That outranks the
+// write-budget bound, and the header above concedes the bound rather than
+// pretending this closes it.
 //
-// 5 minutes caps one device at 1,440/5 = 288 writes a day. That is a mitigation,
-// not a fix: an attacker who rotates ten tokens inside one cell is back at the
-// throttle's own 2,880, so the honest bound on this term is the per-client
-// throttle, not the caps. Lowering the throttle is a captain decision and it
-// stays at 20 per 10 minutes.
+// So be plain about what is left. The adversarial drain the cooldown was
+// reaching for — alternating one token between two grid cells, a genuine change
+// every time, at the throttle's 20 per 10 minutes, i.e. 2,880 `device:` puts a
+// day from one address against a 1,000-a-day allowance — is NOT bounded by this
+// constant, because those are cell changes and cell changes always write. What
+// this does bound is same-cell settings churn: at most 1,440/5 = 288 writes a
+// day per device from repeated leadTimeMinutes / rainStartEnabled / rainEndEnabled
+// flips, which is otherwise the same unbounded shape.
 //
-// 5 rather than 10 because of what the cooldown actually costs a real user. A
-// genuine mover's new coordinates do not persist until the cooldown elapses, so
-// the cron keeps alerting them for the cell they left: the cooldown IS the
-// wrong-area alert window. Against a 20-minute lead time, 5 minutes leaves 15
-// minutes of correct warning where 10 would leave 10. The write-budget
-// difference does not decide it — neither value makes the theoretical
-// 300-record maximum fit — so the user-facing cost does.
+// The hardening deliberately not taken, kept here so it stays discoverable: an
+// explicit deferral protocol — 202 with `deferred: true` and a
+// `retryAfterSeconds`, plus a client that records a location only after the
+// server confirms it stored it — would make deferring a cell change safe,
+// because the move would be retried rather than silently dropped. Worth
+// building if the drain ever appears in real traffic; not worth the client
+// change on a fleet of single-digit devices today.
+//
+// 5 rather than 10 minutes because a deferred settings change is invisible to
+// the user until it lands, and the client re-registers after every successful
+// poll, so a shorter window costs nothing and heals sooner.
 //
 // This must never suppress a refresh-due write. Refresh-due (renewedAt older
 // than DEVICE_RECORD_REFRESH_SECONDS) and cooling-down (renewedAt newer than
@@ -334,15 +341,19 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //   `notified-*` dedup puts       <= PUSH_BUDGET_PER_INVOCATION x 144 = 4,896/day
 //                                 at the absolute worst, one per push sent.
 //   `apnsfail:` puts              <= one per rejected push, same ceiling.
-//   `device:` puts, adversarial   <= 288/day per device after
-//                                 DEVICE_REWRITE_COOLDOWN_SECONDS, and bounded
-//                                 in aggregate only by the per-client throttle
-//                                 at 20 x 144 = 2,880/day per address. Moving a
+//   `device:` puts, adversarial   <= 20 x 144 = 2,880/day per address, bounded
+//                                 only by the per-client throttle. Moving a
 //                                 token between two cells is a real change, so
-//                                 the skip-when-unchanged check cannot see it,
-//                                 and it adds no cell and no record, so neither
-//                                 cap sees it either. This term is why the
-//                                 header above no longer calls registration
+//                                 the skip-when-unchanged check cannot see it;
+//                                 it adds no cell and no record, so neither cap
+//                                 sees it either; and a cell change is never
+//                                 deferred, so DEVICE_REWRITE_COOLDOWN_SECONDS
+//                                 does not see it either — that exemption is
+//                                 deliberate, because deferring a real move
+//                                 silently alerts the user for the wrong area.
+//                                 The cooldown bounds only same-cell settings
+//                                 churn, at 288/day per device. This term is why
+//                                 the header above no longer calls registration
 //                                 bounded.
 //   `activity:` puts              1 per Live Activity started.
 //   => Does NOT fit at the caps. Two separate terms exceed the allowance on

@@ -154,6 +154,7 @@ KV cannot count a sub-second burst.
 | `429 rate_limited` + `Retry-After` | more than 20 registrations from your IP in 10 minutes | wait out `retryAfterSeconds` |
 | `503 coverage_at_capacity` | the request would open a **new** grid cell and the service already covers `MAX_GRID_CELLS` (15) | delete junk `device:` keys from KV (section F — not `/unregister`), or re-run the subrequest arithmetic in `abuse.ts` before raising the cap |
 | `503 cell_at_capacity` | that one grid cell already holds `MAX_DEVICES_PER_CELL` (20) devices | unregister a device in that cell, or raise the cap after re-running the arithmetic |
+| `200` but `wrangler kv key get` shows the OLD lead time / toggles | a same-cell settings change inside the 5-minute rewrite cooldown | wait 5 minutes and re-send, or change the coordinates too — a cell change is never deferred |
 | `503 storage_unavailable` + `Retry-After: 60` | KV threw while reading the caller's existing record, so the write was refused rather than risk overwriting it | transient — check `wrangler tail` for the KV error; the caller's stored registration is untouched and still live |
 
 **The two capacity 503s clear the caller's existing registration.** That is
@@ -176,6 +177,14 @@ this only reaps records nothing is renewing. A repeat registration that changes
 nothing is **not** rewritten (it would spend the Free plan's 1,000 KV writes a day
 on nothing); a record older than 7 days is rewritten regardless, which resets the
 TTL with weeks to spare.
+
+A registration that changes only *settings* (`leadTimeMinutes`, `rainStartEnabled`,
+`rainEndEnabled`) within the same grid cell is also held back for up to 5 minutes
+after the last write, for the same budget reason. It returns `200` with the grid
+key the record still has, and self-heals on the next registration — which the app
+issues after every successful weather poll. **A move to a different grid cell is
+never held back**: it is written immediately, because a device alerted for the
+cell it left is exactly the silent break the gate exists to prevent.
 
 **Records written before this shipped had no expiry at all**, and KV cannot add
 one after the fact; the cron rewrites up to 5 such records per tick until they all

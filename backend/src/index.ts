@@ -511,11 +511,6 @@ async function discardDeadActivityToken(deviceToken: string, err: unknown, env: 
   console.log(`[Activity] Cleared dead activity token (${err.reason})`);
 }
 
-// Every write of a `device:` record goes through here so none can silently
-// re-create the immortal, TTL-less record this replaced. Re-writing resets the
-// clock, which is correct: every path that writes one is driven by a live
-// device — a registration, a Live Activity the device started, or a push it
-// accepted.
 /** The fields a `/register` body can actually change. */
 interface RegistrationSettings {
   lat: number;
@@ -525,31 +520,47 @@ interface RegistrationSettings {
   rainEndEnabled: boolean;
 }
 
-// True when the stored record differs from what the request carries, or when it
-// is stale enough that the write is worth spending purely to reset its TTL.
-//
-// A record with no `renewedAt` always counts as due: it predates the field, so
-// there is no evidence of when it was last written and guessing young would risk
-// the very expiry this exists to prevent.
+type WriteDecision = 'write' | 'unchanged' | 'cooling-down';
+
 /**
  * Whether this registration is persisted now, and if not, why not.
  *
- * `unchanged` is the common case: the client re-registers on cold launch, on
- * every foreground and after every poll, and almost all of that is a repeat.
- * `cooling-down` is a real change arriving sooner than
- * DEVICE_REWRITE_COOLDOWN_SECONDS after the last write.
+ * The order below is the whole contract, and each step earns its place:
  *
- * Refresh-due is checked first and overrides both, though note the two can
- * never actually collide: refresh-due is `sinceWrite >= 7 days` and cooling-down
- * is `sinceWrite < 5 minutes`, so they bracket the same quantity from opposite
- * ends and no write is ever both. The ordering is defensive against a future
- * edit that narrows the gap, not load-bearing today. What does hold the TTL
- * guarantee up is that the cooldown only ever gates a CHANGE: an unchanged
- * record falls through to `unchanged`, and the refresh-due branch above is what
- * eventually rewrites it.
+ *   1. no stored record       -> the caller writes; a first registration is
+ *                                never deferred (handled by the caller).
+ *   2. TTL refresh due        -> write, always. Captain ruling R1's dormant-user
+ *                                guarantee rests on this, so nothing may
+ *                                override it.
+ *   3. grid key changed       -> write immediately, no cooldown. A device that
+ *                                moved cells must not keep being alerted for
+ *                                the cell it left: that is the silent wrong-area
+ *                                break this whole change exists to prevent, and
+ *                                it outranks the adversarial write-drain bound
+ *                                the cooldown was reaching for. The narrowed
+ *                                claim in abuse.ts concedes that bound honestly
+ *                                rather than pretending the cooldown closes it.
+ *   4. same cell, unchanged   -> skip. The common case: the client re-registers
+ *                                on cold launch, on every foreground and after
+ *                                every poll, and almost all of it is a repeat.
+ *   5. same cell, changed,
+ *      inside the cooldown    -> defer. Only settings can reach here
+ *                                (leadTimeMinutes, rainStartEnabled,
+ *                                rainEndEnabled), and it self-heals on the next
+ *                                registration, which the client issues after
+ *                                every successful poll.
+ *
+ * A record with no `renewedAt` counts as refresh-due: it predates the field, so
+ * there is no evidence of when it was last written and guessing young would risk
+ * the very expiry step 2 exists to prevent.
+ *
+ * If the adversarial rewrite drain ever shows up in real traffic, the fix that
+ * was deliberately NOT taken here is an explicit deferral protocol — 202 with
+ * `deferred: true` and a `retryAfterSeconds`, plus a client that records a
+ * location only once the server confirms it stored it. That keeps a deferred
+ * move retryable instead of silently dropped, which is what made deferring a
+ * cell change unacceptable in the first place.
  */
-type WriteDecision = 'write' | 'unchanged' | 'cooling-down';
-
 function writeDecision(
   existing: DeviceRegistration,
   settings: RegistrationSettings
@@ -572,8 +583,11 @@ function writeDecision(
 
   if (sinceWrite >= DEVICE_RECORD_REFRESH_SECONDS * 1000) return 'write';
 
+  if (toGridKey(existing.lat, existing.lon) !== toGridKey(settings.lat, settings.lon)) {
+    return 'write';
+  }
+
   const changed =
-    toGridKey(existing.lat, existing.lon) !== toGridKey(settings.lat, settings.lon) ||
     existing.leadTimeMinutes !== settings.leadTimeMinutes ||
     (existing.rainStartEnabled ?? true) !== settings.rainStartEnabled ||
     (existing.rainEndEnabled ?? true) !== settings.rainEndEnabled;
@@ -582,6 +596,11 @@ function writeDecision(
   return sinceWrite >= DEVICE_REWRITE_COOLDOWN_SECONDS * 1000 ? 'write' : 'cooling-down';
 }
 
+// Every write of a `device:` record goes through here so none can silently
+// re-create the immortal, TTL-less record this replaced. Re-writing resets the
+// clock, which is correct: every path that writes one is driven by a live
+// device — a registration, a Live Activity the device started, or a push it
+// accepted.
 async function putDeviceRecord(
   deviceToken: string,
   registration: DeviceRegistration,
@@ -779,27 +798,6 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     rainEndEnabled: asBoolean(body.rainEndEnabled, true),
   };
 
-  // Decided BEFORE the cell is reserved, not after, and that ordering is
-  // load-bearing rather than tidy. reserveGridCell relocates the token into the
-  // requested cell; returning early afterwards would leave the registry saying
-  // the device is somewhere KV does not, inflating the tally against
-  // MAX_GRID_CELLS and refusing a genuine newcomer for a slot nothing occupies.
-  // A registration we are not going to persist must not move anything.
-  //
-  // A first registration has no stored record, so it is never deferred.
-  if (existing) {
-    const decision = writeDecision(existing, settings);
-    if (decision !== 'write') {
-      const storedKey = toGridKey(existing.lat, existing.lon);
-      console.log(
-        decision === 'unchanged'
-          ? `[Register] Unchanged and still fresh, skipped the write for grid ${storedKey}`
-          : `[Register] Rewrite cooling down, kept grid ${storedKey} for now`
-      );
-      return json({ ok: true, gridKey: storedKey });
-    }
-  }
-
   // Opening a *new* grid cell is the expensive act: it adds ~4,383 WeatherKit
   // calls a month, forever. Registering into a cell the service already covers
   // costs nothing extra and is always allowed, so an existing user is never
@@ -857,6 +855,32 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
       503,
       { 'Retry-After': '3600' }
     );
+  }
+
+  // Decided AFTER the cell is reserved, and that ordering is load-bearing.
+  // `reserve` is the only path that clears a device's pending-reap flag, which
+  // is what puts a device APNs once rejected — a wrong APNS_ENV window, say —
+  // back into the push rotation. Returning before it would leave a live device
+  // that re-registers unchanged flagged and silently muted until the reap queue
+  // drained to it and deleted its record outright. The "this device is alive"
+  // signal has to be independent of whether we persist any bytes.
+  //
+  // Reserving first is safe precisely because a cell change is never deferred:
+  // every decision that reaches here other than 'write' is same-cell, so the
+  // reserve above was a no-op relocation and there is no cell to leak.
+  //
+  // A first registration has no stored record, so it is never deferred, and the
+  // gridKey reported back is always the one now stored.
+  if (existing) {
+    const decision = writeDecision(existing, settings);
+    if (decision !== 'write') {
+      console.log(
+        decision === 'unchanged'
+          ? `[Register] Unchanged and still fresh, skipped the write for grid ${gridKey}`
+          : `[Register] Same-cell settings change cooling down, kept grid ${gridKey} for now`
+      );
+      return json({ ok: true, gridKey });
+    }
   }
 
   const registration: DeviceRegistration = {
