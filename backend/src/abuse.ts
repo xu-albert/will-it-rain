@@ -61,33 +61,40 @@ import { CoverageMap, CoverageReply, DeviceRegistration, Env, GridCell, RateRepl
 //        — charged before budget.spend(), so every device
 //          pays it whether or not it is notified
 //
-//   FIXED, independent of the device count:
+//   PER PUSH ATTEMPTED (5 each, so 170 at PUSH_BUDGET_PER_INVOCATION):
+//     1  KV put on `notified-*`, the dedup key             notifyOnce
+//     2  recordPushFailure taking a BadDeviceToken strike:
+//        1 get + 1 put on `apnsfail:`
+//     2  clearActivityToken on a terminal Live Activity:
+//        1 get + 1 delete. It reads before deleting so an
+//        unthrottled teardown cannot spend the daily KV
+//        delete allowance on tokens never registered
+//
+//   PER DEVICE REAPED (4 each, so 8 at MAX_DEVICE_REAPS_PER_TICK):
+//     1  KV get + 2 KV deletes + 1 DO call                 removeDevice
+//        Reaps are budgeted separately rather than folded
+//        into the per-push term: without their own ceiling
+//        every one of the 34 pushes could reap, and the
+//        deletes come out of a daily allowance the tick has
+//        no other way to bound.
+//
+//   FIXED, independent of both counts:
 //     1  KV list of `device:`                              readCoverage
 //     1  KV list of `activity:`                            readActivityTokens
 //     5  KV puts, MAX_TTL_MIGRATIONS_PER_TICK              migrateLegacyRecords
 //     1  DO call                                           reconcileCoverage
-//    34  KV puts on `notified-*`, one per push sent        notifyOnce
-//   204  worst-case push-failure handling: recordPushFailure
-//        is 1 get + 1 put per strike, or 1 get + 4 deletes
-//        + 1 DO call when it reaps — 6 at most, and bounded
-//        by pushes attempted, i.e. by PUSH_BUDGET_PER_INVOCATION
-//    68  clearActivityToken, 1 get + 1 delete per terminal
-//        Live Activity, likewise bounded by pushes attempted.
-//        It reads before deleting so an unthrottled teardown
-//        cannot spend the daily KV delete allowance on tokens
-//        that were never registered
 //   ---
-//   314  fixed, i.e. 9 per push plus 8 that do not scale at all
+//   186  = 8 + 34 x 5 + 2 x 4
 //
-//   314 + 600 per-device = 914 of 1,000 at the caps.
+//   186 + 600 per-device = 786 of 1,000 at the caps.
 //
 // The activity token deliberately costs one `list` for the whole tick rather
 // than one `get` per device: it rides in the key's metadata (see
 // readActivityTokens). Reading it per-device would make this 3 per device,
-// 900 + 280 = 1,180, and would not fit.
+// 900 + 186 = 1,086, and would not fit.
 //
-// So the margin is roughly 9%, not the 3x that counting readCoverage alone
-// suggests, and the real ceiling is under (1,000 - 314) / 2 = 343 device
+// So the margin is roughly 21%, not the 3x that counting readCoverage alone
+// suggests, and the real ceiling is under (1,000 - 186) / 2 = 407 device
 // records — under, not at, because a tick that spends the 1,000th subrequest
 // has no room for anything this model has not thought of, and the 1,001st
 // throws "Too many subrequests" into the same per-grid catch the push budget
@@ -113,9 +120,13 @@ import { CoverageMap, CoverageReply, DeviceRegistration, Env, GridCell, RateRepl
 // app's own on-device forecasts.
 //
 // The cap is set by the Free-plan subrequest budget, NOT by the WeatherKit
-// quota. Raising it means moving to the Workers Paid plan — which raises the
-// external subrequest limit to 1,000 per invocation — and re-running every line
-// of arithmetic above.
+// quota. Note the two Free numbers are different ceilings on different things:
+// 50 EXTERNAL subrequests per invocation, and a separate 1,000 for internal
+// Cloudflare services (KV, Durable Objects). Raising the cap means moving to
+// the Workers Paid plan — which raises the EXTERNAL limit to 10,000 per
+// invocation by default, configurable up to 10 million via `limits.subrequests`
+// — and re-running every line of arithmetic above. Free is what applies to this
+// account.
 export const MAX_GRID_CELLS = 15;
 export const PUSH_BUDGET_PER_INVOCATION = 34;
 export const MAX_DEVICES_PER_CELL = 20;
@@ -165,6 +176,20 @@ export const DEVICE_RECORD_TTL_SECONDS = 45 * 24 * 60 * 60; // 45 days
 // putDeviceRecord, so a migrated record is never seen again.
 export const MAX_TTL_MIGRATIONS_PER_TICK = 5;
 
+// How many dead devices one cron tick may reap. Bounded for the same reason
+// MAX_TTL_MIGRATIONS_PER_TICK is: a reap is 2 KV deletes, and the Free plan
+// allows 1,000 deletes a day across the namespace — a separate allowance from
+// the 1,000 writes. Unbounded, a tick could reap once per push attempted, so
+// 34 x 2 x 144 = 9,792 deletes a day, ten times the allowance.
+//
+// 2 x 2 x 144 = 576/day is the ceiling this sets, and it is only reached if
+// every tick for a whole day finds two dead tokens — 288 devices churning
+// daily against a 300-device cap. Deferring the rest is safe: reaping is
+// idempotent and the next tick retries, so a backlog drains at 288/day rather
+// than being lost. The cost of deferral is that a dead token may absorb one
+// more push before it goes.
+export const MAX_DEVICE_REAPS_PER_TICK = 2;
+
 // How stale a record may get before a re-registration rewrites it even though
 // nothing in it changed. The client re-registers constantly (cold launch, every
 // foreground, every successful poll), and writing on each of those spends the
@@ -187,66 +212,118 @@ export const INTERNAL_SUBREQUESTS_PER_DEVICE = 2;
 
 /**
  * The worst case per push actually attempted: the `notified-*` dedup put, plus
- * recordPushFailure reaping a dead token (1 get + 4 deletes + 1 DO call), plus
- * a terminal Live Activity's get-then-delete. All bounded by
+ * recordPushFailure taking a BadDeviceToken strike (1 get + 1 put), plus a
+ * terminal Live Activity's get-then-delete. Bounded by
  * PUSH_BUDGET_PER_INVOCATION, so this is fixed traffic, not per-device — which
  * is exactly why it belongs in the term below rather than being left out of the
  * model as happy-path-only.
  */
-const INTERNAL_SUBREQUESTS_PER_PUSH_WORST_CASE = 9;
+const INTERNAL_SUBREQUESTS_PER_PUSH_WORST_CASE = 5;
+
+/** removeDevice: 1 get, 2 deletes (`device:` and `activity:`), 1 DO release. */
+const INTERNAL_SUBREQUESTS_PER_REAP = 4;
 
 /** The tick's device-count-independent internal traffic. */
 export const INTERNAL_SUBREQUESTS_PER_TICK_FIXED =
   2 + // one KV list for `device:`, one for `activity:`
   MAX_TTL_MIGRATIONS_PER_TICK +
   1 + // the reconcile DO call
-  PUSH_BUDGET_PER_INVOCATION * INTERNAL_SUBREQUESTS_PER_PUSH_WORST_CASE;
+  PUSH_BUDGET_PER_INVOCATION * INTERNAL_SUBREQUESTS_PER_PUSH_WORST_CASE +
+  MAX_DEVICE_REAPS_PER_TICK * INTERNAL_SUBREQUESTS_PER_REAP;
 
 /** Free-plan internal subrequests per invocation. */
 export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 
 // ---------------------------------------------------------------------------
-// The daily KV write allowance
+// The daily KV allowances — four separate buckets
 // ---------------------------------------------------------------------------
 
-// Separate budget, separate period: the Free plan allows **1,000 KV writes per
-// day** across the whole namespace. Everything above is per-invocation, so it
-// says nothing about this one, and this is the budget the client's
-// unconditional foreground re-registration spends fastest.
+// Different budget, different period, and — the part that is easy to get wrong
+// — FOUR independent allowances, not one. The Free plan gives the namespace
+// 100,000 key reads, 1,000 key writes, 1,000 key DELETES and 1,000 LIST
+// requests per day. Writes and deletes do not share a pool, so a delete-driven
+// amplifier cannot be reasoned about against the write budget. Everything in
+// the section above is per-invocation and says nothing about any of these.
 //
-// Who writes, per day, at the caps (15 x 20 = 300 devices, 144 ticks):
+// Counted at the caps (15 x 20 = 300 devices, 144 ticks/day):
 //
-//   `device:` puts, /register       ~43/day steady state. Without the
-//                                   skip-when-unchanged check below this would
-//                                   be one write per foreground per device —
-//                                   thousands. With it, an unchanged device
-//                                   writes once per DEVICE_RECORD_REFRESH_SECONDS,
-//                                   so 300/7 ~= 43, plus one per genuine change
-//                                   of coordinates or settings.
-//   `device:` puts, TTL migration   <= 5 x 144 = 720/day, but only until the
-//                                   pre-TTL records are drained; then zero.
-//   `notified-*` dedup puts         <= PUSH_BUDGET_PER_INVOCATION x 144 = 4,896/day
-//                                   at the absolute worst, one per push sent.
-//   `apnsfail:` puts                <= one per rejected push, same ceiling.
-//   rate limit / cell tally         zero. Both live in Durable Object storage,
-//                                   which is not KV.
+// READS — 100,000/day
+//   cron, per device record       2 x 300 x 144 = 86,400. The readCoverage get
+//                                 plus the `notified-*` dedup get.
+//   cron, per push attempted      <= 2 x 34 x 144 = 9,792. The `apnsfail:` get
+//                                 and clearActivityToken's guard get.
+//   cron, per reap               <= 2 x 144 = 288, removeDevice's guard get.
+//   /register                     1 per request. The client registers on cold
+//                                 launch, every foreground, every successful
+//                                 poll and every >10 km move, so this is the
+//                                 term that scales with user activity rather
+//                                 than fleet size.
+//   /unregister, /unregister-*    1 per request, the guard get.
+//   => ~96,500 before a single registration. Does NOT fit at the caps.
 //
-// So the honest total does NOT fit at the caps, and the binding term is not
-// registration — it is the dedup put, one per alert actually delivered. Roughly
-// 1,000/144 ~= 7 alerts per tick sustained around the clock is the whole day's
-// allowance, or about 20 devices being alerted continuously at the 30-minute
-// dedup interval.
+// WRITES — 1,000/day
+//   `device:` puts, /register     ~43/day steady state. Without the
+//                                 skip-when-unchanged check below this would be
+//                                 one write per foreground per device —
+//                                 thousands. With it, an unchanged device
+//                                 writes once per DEVICE_RECORD_REFRESH_SECONDS,
+//                                 so 300/7 ~= 43, plus one per genuine change of
+//                                 coordinates or settings.
+//   `device:` puts, TTL migration <= 5 x 144 = 720/day, but only until the
+//                                 pre-TTL records are drained; then zero.
+//   `notified-*` dedup puts       <= PUSH_BUDGET_PER_INVOCATION x 144 = 4,896/day
+//                                 at the absolute worst, one per push sent.
+//   `apnsfail:` puts              <= one per rejected push, same ceiling.
+//   `activity:` puts              1 per Live Activity started.
+//   => Does NOT fit at the caps, and the binding term is not registration — it
+//      is the dedup put, one per alert actually delivered. Roughly 1,000/144
+//      ~= 7 alerts per tick sustained around the clock is the whole day's
+//      allowance, or about 20 devices alerted continuously at the 30-minute
+//      dedup interval.
 //
-// That is a fleet-size ceiling, not a cap that can be tuned away here: lowering
-// MAX_DEVICES_PER_CELL does not touch it, and lowering
-// PUSH_BUDGET_PER_INVOCATION would buy the write budget by dropping alerts the
-// per-invocation budget can afford to send. The honest statement is that these
-// caps are sized for the current fleet (TESTING.md documents ~15 devices, which
-// is an order of magnitude below the crossover) and that running near
-// MAX_GRID_CELLS x MAX_DEVICES_PER_CELL in rainy weather needs the Paid plan.
-// Exceeding the allowance makes KV refuse further writes, so putDeviceRecord
-// throws and /register 500s for the rest of the day — and the 45-day TTL is only
-// safe while live installs can renew.
+// DELETES — 1,000/day, a SEPARATE allowance from writes
+//   cron reaps                    <= MAX_DEVICE_REAPS_PER_TICK x 2 x 144 = 576/day.
+//                                 This is the one term the tick can bound by
+//                                 itself, and MAX_DEVICE_REAPS_PER_TICK exists
+//                                 to bound it; unbounded it would be 9,792.
+//   cron clearActivityToken       1 per Live Activity that ends. Spikes at 34 in
+//                                 one tick, but a device holds one activity at a
+//                                 time and the key is gone once cleared, so the
+//                                 sustained rate is bounded by activities ended,
+//                                 not by the push budget.
+//   /unregister                   2 per real teardown, 0 for a token that was
+//                                 never registered.
+//   /unregister-activity          1 per real teardown, 0 otherwise.
+//   capacity refusal              2, and only when the caller really had a record.
+//   => Fits only because every consumer is either budgeted or earned by a
+//      stored record. Both of those are load-bearing, not tidiness: an
+//      unconditional teardown on the deliberately unthrottled `/unregister`
+//      would let one IP inside the 20-per-10-minutes registration throttle
+//      spend the whole day's deletes in under two hours, after which every
+//      `env.DEVICES.delete` fails until 00:00 UTC.
+//
+// LISTS — 1,000/day
+//   cron                          2 x 144 = 288/day, the `device:` and
+//                                 `activity:` prefix lists. That is per PAGE:
+//                                 KV returns up to 1,000 keys per call, so at
+//                                 the caps (300 + 300 keys) one call each
+//                                 suffices, but a namespace holding more than
+//                                 1,000 keys of either prefix multiplies this by
+//                                 the page count.
+//   => Fits with room, and is the only bucket that does.
+//
+// So two of the four buckets do not fit at MAX_GRID_CELLS x MAX_DEVICES_PER_CELL,
+// and that is a fleet-size ceiling rather than a cap that can be tuned away
+// here: lowering MAX_DEVICES_PER_CELL does not touch the dedup put, and
+// lowering PUSH_BUDGET_PER_INVOCATION would buy the write budget by dropping
+// alerts the per-invocation budget can afford to send. The honest statement is
+// that these caps are sized for the current fleet (TESTING.md documents ~15
+// devices, an order of magnitude below every crossover above) and that running
+// near the caps needs the Paid plan. Exceeding an allowance makes KV refuse
+// that operation for the rest of the UTC day — writes gone means putDeviceRecord
+// throws and /register 500s, and the 45-day TTL is only safe while live installs
+// can renew; deletes gone means /unregister 500s and dead tokens cannot be
+// reaped.
 
 // ---------------------------------------------------------------------------
 // Client identity
@@ -385,19 +462,19 @@ function coverageStub(env: Env): DurableObjectStub {
 }
 
 // ---------------------------------------------------------------------------
-// Push budget
+// Per-tick budgets
 // ---------------------------------------------------------------------------
 
-export interface PushBudget {
-  /** Claims one external push. False means the budget is gone and nothing was sent. */
+export interface TickBudget {
+  /** Claims one unit. False means the budget is gone and nothing was done. */
   spend(): boolean;
-  /** Pushes claimed so far. */
+  /** Units claimed so far. */
   readonly spent: number;
-  /** Pushes refused because the budget was exhausted. */
+  /** Units refused because the budget was exhausted. */
   readonly denied: number;
 }
 
-export function createPushBudget(limit = PUSH_BUDGET_PER_INVOCATION): PushBudget {
+export function createPushBudget(limit = PUSH_BUDGET_PER_INVOCATION): TickBudget {
   let spent = 0;
   let denied = 0;
   return {
@@ -475,4 +552,9 @@ export function selectCellsWithinCap(grids: GridCell[]): { cells: GridCell[]; sk
     cells: ranked.slice(0, MAX_GRID_CELLS),
     skipped: Math.max(0, grids.length - MAX_GRID_CELLS),
   };
+}
+
+/** Bounds the KV deletes one tick spends reaping dead device tokens. */
+export function createReapBudget(limit = MAX_DEVICE_REAPS_PER_TICK): TickBudget {
+  return createPushBudget(limit);
 }

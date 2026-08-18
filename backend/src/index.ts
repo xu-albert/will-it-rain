@@ -35,6 +35,9 @@ import {
   PUSH_BUDGET_PER_INVOCATION,
   checkRegistrationRate,
   createPushBudget,
+  createReapBudget,
+  TickBudget,
+  MAX_DEVICE_REAPS_PER_TICK,
   reconcileCoverage,
   releaseGridCell,
   reserveGridCell,
@@ -215,6 +218,7 @@ export default {
     // longest are the ones served — instead of letting the runtime throw "Too
     // many subrequests" into a catch that swallows it.
     const budget = createPushBudget();
+    const reaps = createReapBudget();
 
     // Live Activity updates are the optional half of a tick and must never be
     // able to take the mandatory half down with them — the same invariant the
@@ -268,7 +272,7 @@ export default {
             await env.DEVICES.put(metaKey, now.toString(), { expirationTtl: 3600 });
           } catch (err) {
             console.error(`[Cron] Failed to notify device (${kind}): ${err}`);
-            await recordPushFailure(device.token, err, env);
+            await recordPushFailure(device.token, err, env, reaps);
           }
         };
 
@@ -379,6 +383,15 @@ export default {
 
     for (const grid of grids) {
       await processGrid(grid);
+    }
+
+    if (reaps.denied > 0) {
+      console.error(
+        `[Cron] Reap budget exhausted: dropped ${reaps.spent} dead device tokens this tick and ` +
+          `deferred ${reaps.denied}. They will be retried next tick; the cap is ` +
+          `MAX_DEVICE_REAPS_PER_TICK=${MAX_DEVICE_REAPS_PER_TICK}, sized from the Free plan's ` +
+          `daily KV delete allowance in abuse.ts.`
+      );
     }
 
     if (budget.denied > 0) {
@@ -563,11 +576,11 @@ async function putActivityToken(
 // `/unregister-activity` is deliberately unthrottled, because a user tearing
 // down must never be told to come back later, so an unconditional delete would
 // let anyone spend one KV delete per request on a fabricated token. The
-// economics are lopsided on purpose: KV deletes come out of the Free plan's
-// 1,000-writes-a-day allowance, the same one every real registration and every
-// dedup key draws on, while a `get` comes out of the far larger read allowance.
-// Read-then-conditional-delete is therefore strictly the cheaper shape against
-// the budget that actually binds here. Drain the delete allowance and
+// economics are lopsided on purpose: KV deletes come out of their own
+// 1,000-a-day allowance — separate from the 1,000 writes, so a delete-driven
+// amplifier cannot be reasoned about against the write budget — while a `get`
+// comes out of the 100,000-a-day read allowance. Read-then-conditional-delete
+// is therefore strictly the cheaper shape against the budget that binds here. Drain the delete allowance and
 // removeDevice throws for the rest of the day, so `/unregister` 500s and the
 // cron cannot reap dead tokens.
 async function clearActivityToken(deviceToken: string, env: Env): Promise<void> {
@@ -722,11 +735,12 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     // used to be, which is worse than no alerts at all.
     //
     // Only then, though. This is the abuse gate, so refusing has to cost us less
-    // than it costs the caller, and `removeDevice` is four KV deletes plus a
+    // than it costs the caller, and `removeDevice` is two KV deletes plus a
     // round trip to the one global CoverageRegistry. Spending that on a
     // fabricated token that was never registered — the overwhelmingly common
     // case in a flood — would turn every refusal into an amplifier against the
-    // Free plan's daily KV write allowance. The reserve call above has already
+    // Free plan's daily KV DELETE allowance, which is 1,000 a day and separate
+    // from the write allowance. The reserve call above has already
     // released whatever cell slot this token held, so skipping here leaks
     // nothing.
     if (existing) {
@@ -812,9 +826,23 @@ async function handleUnregister(request: Request, env: Env): Promise<Response> {
   return json({ ok: true });
 }
 
-// Drops a device and every key keyed off its token. The dedup keys the cron
-// writes are `notified-start:` / `notified-end:`; an earlier version deleted a
-// `notified:` key that nothing has ever written.
+// Drops a device: the two keys that would otherwise outlive it, and its cell
+// slot. Deliberately NOT every key keyed off its token — `notified-start:`,
+// `notified-end:` and `apnsfail:` are left to their own 3600s/86400s TTLs.
+//
+// Deleting those three bought an hour or a day of tidiness for three fifths of
+// this function's delete cost, against a Free-plan allowance of 1,000 deletes a
+// day that is separate from the write allowance and that unthrottled teardown
+// draws on directly. Two consequences follow, and both are accepted rather than
+// overlooked:
+//
+//   * A device reaped and re-registering within 30 minutes may still be
+//     suppressed by its surviving `notified-*` key. That key exists only
+//     because the device was already notified for that rain event, so the
+//     suppression drops a duplicate rather than a distinct alert.
+//   * A device re-registering within 24h carries its surviving `apnsfail:`
+//     strike count, so it can be reaped after fewer fresh failures. Bounded by
+//     BAD_TOKEN_STRIKES, and every strike reflects a real APNs rejection.
 //
 // The cell slot goes back too. Without that, a cell whose devices had all left
 // would stay "already covered" and hold a slot that nothing occupies.
@@ -822,21 +850,16 @@ async function handleUnregister(request: Request, env: Env): Promise<Response> {
 // Tearing down a device that was never registered costs nothing, and that is
 // load-bearing rather than tidy. `/unregister` is deliberately unthrottled — a
 // user leaving must never be told to come back later — so without this check
-// anyone could spend four KV deletes and a round trip to the one global
-// CoverageRegistry per request, on fabricated tokens, and drain the Free plan's
-// daily delete allowance in a single burst. Deletes and the registry call have
-// to be earned by something actually being there. The `notified-*` and
-// `apnsfail:` keys carry their own short TTLs, so a device: record that is
-// already gone leaves nothing behind worth chasing.
+// anyone could spend two KV deletes and a round trip to the one global
+// CoverageRegistry per request, on fabricated tokens, and drain the day's
+// delete allowance in a single burst. Deletes and the registry call have to be
+// earned by something actually being there.
 async function removeDevice(deviceToken: string, env: Env): Promise<void> {
   const existing = await env.DEVICES.get(`device:${deviceToken}`);
   if (existing === null) return;
 
   await Promise.all([
     env.DEVICES.delete(`device:${deviceToken}`),
-    env.DEVICES.delete(`notified-start:${deviceToken}`),
-    env.DEVICES.delete(`notified-end:${deviceToken}`),
-    env.DEVICES.delete(`apnsfail:${deviceToken}`),
     env.DEVICES.delete(activityKey(deviceToken)),
     releaseGridCell(deviceToken, env),
   ]);
@@ -851,12 +874,34 @@ async function removeDevice(deviceToken: string, env: Env): Promise<void> {
 // several strikes inside the counter's 24h TTL keeps that from happening, and
 // still clears genuinely dead tokens within an hour. The app re-registers on
 // every foreground, so an over-eager delete heals itself.
-async function recordPushFailure(deviceToken: string, err: unknown, env: Env): Promise<void> {
+//
+// `reaps` bounds how many devices one tick may drop, because each is 2 KV
+// deletes out of a daily allowance the cron cannot otherwise limit. Refusing
+// defers rather than loses: the strike count is not written back when the
+// threshold was already reached, and a 410 recurs, so the next tick reaps the
+// same token. The cost of deferral is one more wasted push to a dead token.
+async function recordPushFailure(
+  deviceToken: string,
+  err: unknown,
+  env: Env,
+  reaps: TickBudget
+): Promise<void> {
   if (!(err instanceof APNsError)) return;
 
-  if (err.isUnregistered) {
+  const reap = async (why: string): Promise<void> => {
+    if (!reaps.spend()) {
+      console.error(
+        `[APNs] Reap budget exhausted (MAX_DEVICE_REAPS_PER_TICK=${MAX_DEVICE_REAPS_PER_TICK}); ` +
+          `deferring ${why} to the next tick.`
+      );
+      return;
+    }
     await removeDevice(deviceToken, env);
-    console.log(`[APNs] Dropped unregistered device token`);
+    console.log(`[APNs] ${why}`);
+  };
+
+  if (err.isUnregistered) {
+    await reap('Dropped unregistered device token');
     return;
   }
 
@@ -865,8 +910,7 @@ async function recordPushFailure(deviceToken: string, err: unknown, env: Env): P
   const key = `apnsfail:${deviceToken}`;
   const strikes = parseInt((await env.DEVICES.get(key)) ?? '0', 10) + 1;
   if (strikes >= BAD_TOKEN_STRIKES) {
-    await removeDevice(deviceToken, env);
-    console.log(`[APNs] Dropped device after ${strikes} BadDeviceToken rejections`);
+    await reap(`Dropped device after ${strikes} BadDeviceToken rejections`);
   } else {
     await env.DEVICES.put(key, String(strikes), { expirationTtl: 86400 });
     console.log(`[APNs] BadDeviceToken strike ${strikes}/${BAD_TOKEN_STRIKES}`);

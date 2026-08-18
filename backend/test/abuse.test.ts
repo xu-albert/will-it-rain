@@ -19,6 +19,7 @@ import {
   INTERNAL_SUBREQUESTS_PER_DEVICE,
   INTERNAL_SUBREQUESTS_PER_TICK_FIXED,
   INTERNAL_SUBREQUEST_CEILING,
+  MAX_DEVICE_REAPS_PER_TICK,
   PUSH_BUDGET_PER_INVOCATION,
   RATE_LIMIT_MAX_REQUESTS,
   RATE_LIMIT_WINDOW_SECONDS,
@@ -711,8 +712,10 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
     forecast: (now: number) => unknown;
     withActivityToken?: boolean;
     failActivityList?: boolean;
+    apnsRejects?: boolean;
+    harness?: Harness;
   }): Promise<Tick> {
-    const harness = makeHarness({ signingKey });
+    const harness = options.harness ?? makeHarness({ signingKey });
     const now = Date.now();
 
     let token = 0;
@@ -759,6 +762,9 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
       }
       if (url.includes('push.apple.com')) {
         tick.pushes += 1;
+        if (options.apnsRejects) {
+          return new Response(JSON.stringify({ reason: 'Unregistered' }), { status: 410 });
+        }
         return new Response('', { status: 200 });
       }
       throw new Error(`Unexpected outbound request to ${url}`);
@@ -855,6 +861,43 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
     expect(tick.weatherFetches).toBe(2);
     expect(tick.pushes).toBe(6);
     expect(errors.some((line) => line.includes('Could not read Live Activity tokens'))).toBe(true);
+  });
+
+  it('reaps only as many dead devices as the daily delete allowance affords', async () => {
+    const errors: string[] = [];
+    vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(' '));
+    });
+
+    // Every push comes back 410 Unregistered, so every device in the tick is a
+    // reap candidate. Each reap is 2 KV deletes out of 1,000 a day, so the tick
+    // must take MAX_DEVICE_REAPS_PER_TICK of them and defer the rest rather
+    // than spending the allowance in one invocation.
+    const harness = makeHarness({ signingKey });
+    const devices = MAX_DEVICE_REAPS_PER_TICK + 3;
+    await runCron({
+      cells: 1,
+      devicesPerCell: devices,
+      forecast: rainStartingSoon,
+      apnsRejects: true,
+      harness,
+    });
+
+    expect(harness.kv.keysWithPrefix('device:')).toHaveLength(devices - MAX_DEVICE_REAPS_PER_TICK);
+    expect(harness.kv.deletes).toBe(MAX_DEVICE_REAPS_PER_TICK * 2);
+    expect(errors.some((line) => line.includes('Reap budget exhausted'))).toBe(true);
+
+    // Deferred, not lost: the next tick takes the next batch.
+    await runCron({
+      cells: 1,
+      devicesPerCell: 0,
+      forecast: rainStartingSoon,
+      apnsRejects: true,
+      harness,
+    });
+    expect(harness.kv.keysWithPrefix('device:')).toHaveLength(
+      devices - 2 * MAX_DEVICE_REAPS_PER_TICK
+    );
   });
 
   it('gives every tick its own budget rather than a shared one', async () => {
@@ -1031,6 +1074,41 @@ describe('registration records expire', () => {
     expect((await detach(1)).status).toBe(200);
     expect(kv.raw(`activity:${fakeToken(1)}`)).toBeUndefined();
     expect(kv.deletes).toBe(before + 1);
+  });
+
+  it('leaves the self-expiring keys to their own TTLs when a device is torn down', async () => {
+    // Teardown deliberately deletes only the two keys that would outlive the
+    // device. `notified-*` (1h) and `apnsfail:` (24h) expire on their own, and
+    // deleting them would triple what an unthrottled `/unregister` costs
+    // against the Free plan's 1,000-deletes-a-day allowance.
+    await worker.fetch(registerRequest(1), env);
+    await worker.fetch(
+      new Request('https://worker.test/register-activity', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.7' },
+        body: JSON.stringify({ token: fakeToken(1), activityToken: fakeToken(2) }),
+      }),
+      env
+    );
+    await kv.put(`notified-start:${fakeToken(1)}`, '1', { expirationTtl: 3600 });
+    await kv.put(`apnsfail:${fakeToken(1)}`, '2', { expirationTtl: 86400 });
+
+    const before = kv.deletes;
+    const gone = await worker.fetch(
+      new Request('https://worker.test/unregister', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.7' },
+        body: JSON.stringify({ token: fakeToken(1) }),
+      }),
+      env
+    );
+
+    expect(gone.status).toBe(200);
+    expect(kv.deletes - before).toBe(2);
+    expect(kv.raw(`device:${fakeToken(1)}`)).toBeUndefined();
+    expect(kv.raw(`activity:${fakeToken(1)}`)).toBeUndefined();
+    expect(kv.ttlSeconds(`notified-start:${fakeToken(1)}`)).toBeGreaterThan(0);
+    expect(kv.ttlSeconds(`apnsfail:${fakeToken(1)}`)).toBeGreaterThan(0);
   });
 
   it('gives pre-TTL records an expiry the next time the cron sees them', async () => {
