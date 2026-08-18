@@ -45,15 +45,17 @@ final class PushRegistrationService {
                 print("[Push] Registered with backend")
             } else {
                 // The backend refuses registrations it cannot afford: 429 when
-                // this network has registered too often, 503 when the service
-                // is at its grid-cell coverage limit (`coverage_at_capacity`)
-                // or this area already holds as many devices as it can notify
-                // (`cell_at_capacity`). All are recoverable and all come with an
-                // explanation in the body — including, on the 503s, that the
-                // server has cleared any earlier registration for this device
-                // rather than leave it alerting for a previous location. Print
-                // the body verbatim, rather than letting a rejected
-                // registration look like a success.
+                // this network has registered too often, and three distinct
+                // 503s — `coverage_at_capacity` (at its grid-cell limit),
+                // `cell_at_capacity` (this area already holds as many devices
+                // as it can notify), and `storage_unavailable` (KV threw while
+                // reading the existing record). All are recoverable and all
+                // come with an explanation in the body. The two capacity
+                // refusals also clear any earlier registration for this device,
+                // rather than leave it alerting for a previous location;
+                // `storage_unavailable` changes nothing at all. Print the body
+                // verbatim, rather than letting a rejected registration look
+                // like a success.
                 let detail = String(data: data, encoding: .utf8) ?? "<no body>"
                 print("[Push] Registration rejected (HTTP \(http?.statusCode ?? -1)): \(detail)")
             }

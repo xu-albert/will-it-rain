@@ -1,5 +1,30 @@
-import { DeviceRegistration, GridCell, Env } from './types';
+import { ActivityKeyMetadata, DeviceRegistration, GridCell, Env } from './types';
 import { MAX_DEVICE_RECORDS } from './abuse';
+
+/**
+ * Every device that currently has a Live Activity, by device token.
+ *
+ * One `list` for the whole tick, not one `get` per device: the token rides in
+ * the key's metadata, so the cron learns every activity token in a single
+ * internal subrequest. Reading them per-device would make the cron cost three
+ * internal subrequests per device instead of two, which the 1,000-per-invocation
+ * budget in abuse.ts cannot afford at MAX_DEVICE_RECORDS.
+ */
+export async function readActivityTokens(env: Env): Promise<Map<string, string>> {
+  const tokens = new Map<string, string>();
+
+  let cursor: string | undefined;
+  do {
+    const list = await env.DEVICES.list<ActivityKeyMetadata>({ prefix: 'activity:', cursor });
+    for (const key of list.keys) {
+      const activityToken = key.metadata?.activityToken;
+      if (activityToken) tokens.set(key.name.slice('activity:'.length), activityToken);
+    }
+    cursor = list.list_complete ? undefined : list.cursor;
+  } while (cursor);
+
+  return tokens;
+}
 
 // Round to ~1km grid cells to deduplicate weather API calls
 const GRID_PRECISION = 2; // 0.01 degrees ~ 1.1km

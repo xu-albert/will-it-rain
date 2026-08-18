@@ -91,9 +91,11 @@ function device(n: number, registeredAt: string): DeviceRegistration {
 
 function registerRequest(
   n: number,
-  options: { ip?: string; contentType?: string; cell?: number } = {}
+  options: { ip?: string; contentType?: string; cell?: number; jitter?: number } = {}
 ): Request {
-  const { lat, lon } = coordsForCell(options.cell ?? n);
+  const base = coordsForCell(options.cell ?? n);
+  const lat = base.lat + (options.jitter ?? 0);
+  const lon = base.lon + (options.jitter ?? 0);
   return new Request('https://worker.test/register', {
     method: 'POST',
     headers: {
@@ -629,15 +631,20 @@ describe('the cron fan-out budget', () => {
   });
 
   it('bounds the devices one tick reads, so the internal subrequest budget holds', () => {
-    // Counting only readCoverage's one get per record would permit roughly twice
-    // the devices the budget really allows: every device also pays a `notified-*`
-    // dedup get, and that read happens before the push budget is consulted, so
-    // it is charged whether or not the device is notified. At 15 x 32 the
-    // readCoverage-only figure is still 480 of 1,000 while the real tick spends
-    // 1,001 — and subrequest 1,001 throws into a per-grid catch that only logs.
+    // Counting only readCoverage's one get per record would permit roughly three
+    // times the devices the budget really allows. Every device also pays a
+    // `notified-*` dedup get, charged before the push budget is consulted so it
+    // lands whether or not the device is notified; and the fixed term has to
+    // carry the failure paths — recordPushFailure reaping a token is 6 internal
+    // subrequests, clearActivityToken another — which are bounded by pushes
+    // attempted, not by devices. Leaving those out let a raised
+    // MAX_DEVICES_PER_CELL stay green while a tick of rejected pushes spent past
+    // 1,000, and subrequest 1,001 throws into a per-grid catch that only logs.
     const perTick =
       INTERNAL_SUBREQUESTS_PER_DEVICE * MAX_DEVICE_RECORDS + INTERNAL_SUBREQUESTS_PER_TICK_FIXED;
-    expect(perTick).toBeLessThanOrEqual(INTERNAL_SUBREQUEST_CEILING);
+    // Strictly less: a tick that spends the very last subrequest has no room
+    // for anything this model has not accounted for.
+    expect(perTick).toBeLessThan(INTERNAL_SUBREQUEST_CEILING);
   });
 
   it('is small enough that a full service cannot exhaust the WeatherKit quota', () => {
@@ -720,10 +727,16 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
             lon,
             leadTimeMinutes: 30,
             registeredAt: new Date(now - token * 1000).toISOString(),
-            ...(options.withActivityToken ? { activityToken: deviceToken } : {}),
           }),
           { expirationTtl: DEVICE_RECORD_TTL_SECONDS }
         );
+        if (options.withActivityToken) {
+          await harness.kv.put(
+            `activity:${deviceToken}`,
+            JSON.stringify({ activityToken: deviceToken, activityUpdatedAt: new Date(now).toISOString() }),
+            { expirationTtl: DEVICE_RECORD_TTL_SECONDS, metadata: { activityToken: deviceToken } }
+          );
+        }
       }
     }
 
@@ -856,6 +869,28 @@ describe('registration records expire', () => {
     expect(kv.puts).toBe(afterFirst);
   });
 
+  it('skips the write when the device has only jittered inside its own cell', async () => {
+    await worker.fetch(registerRequest(1, { cell: 0 }), env);
+    const afterFirst = kv.puts;
+
+    // What the client actually sends: a fresh CoreLocation fix every time, so
+    // the raw doubles differ on every request even when the user has not moved.
+    // Comparing them verbatim would rewrite the record on every foreground and
+    // the skip could never fire for a real device.
+    await worker.fetch(registerRequest(1, { cell: 0, jitter: 0.0003 }), env);
+    await worker.fetch(registerRequest(1, { cell: 0, jitter: -0.0007 }), env);
+    expect(kv.puts).toBe(afterFirst);
+  });
+
+  it('still writes when the jitter crosses into a different cell', async () => {
+    await worker.fetch(registerRequest(1, { cell: 0 }), env);
+    const afterFirst = kv.puts;
+
+    // 0.05 deg is a whole cell away, which is a real move and must be stored.
+    await worker.fetch(registerRequest(1, { cell: 0, jitter: 0.05 }), env);
+    expect(kv.puts).toBeGreaterThan(afterFirst);
+  });
+
   it('still writes when the request actually changes something', async () => {
     await worker.fetch(registerRequest(1, { cell: 0 }), env);
     const afterFirst = kv.puts;
@@ -914,6 +949,7 @@ describe('registration records expire', () => {
     );
     expect(attach.status).toBe(200);
     expect(kv.ttlSeconds(`device:${fakeToken(1)}`)).toBeGreaterThan(0);
+    expect(kv.ttlSeconds(`activity:${fakeToken(1)}`)).toBeGreaterThan(0);
 
     const detach = await worker.fetch(
       new Request('https://worker.test/unregister-activity', {
@@ -925,6 +961,7 @@ describe('registration records expire', () => {
     );
     expect(detach.status).toBe(200);
     expect(kv.ttlSeconds(`device:${fakeToken(1)}`)).toBeGreaterThan(0);
+    expect(kv.raw(`activity:${fakeToken(1)}`)).toBeUndefined();
   });
 
   it('gives pre-TTL records an expiry the next time the cron sees them', async () => {
@@ -969,16 +1006,67 @@ describe('re-registration', () => {
       env
     );
 
-    // The app re-registers after every successful weather poll. Before this,
-    // that silently erased the activity token minutes after it arrived.
-    await reRegister(1, 0);
+    // The app re-registers after every successful weather poll, and moving to a
+    // new cell makes that a real write. The token survives because it lives in
+    // its own key that /register never touches — not because /register happened
+    // to read a fresh copy of the device record.
+    await reRegister(1, 1);
 
-    const stored = JSON.parse(kv.raw(`device:${fakeToken(1)}`)!) as {
+    const stored = JSON.parse(kv.raw(`activity:${fakeToken(1)}`)!) as {
       activityToken?: string;
       activityUpdatedAt?: string;
     };
     expect(stored.activityToken).toBe(fakeToken(2));
     expect(stored.activityUpdatedAt).toBeTruthy();
+    expect(kv.raw(`device:${fakeToken(1)}`)).not.toContain('activityToken');
+  });
+
+  it('keeps the Live Activity token even when /register reads a stale device record', async () => {
+    await reRegister(1, 0);
+    await worker.fetch(
+      new Request('https://worker.test/register-activity', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.7' },
+        body: JSON.stringify({ token: fakeToken(1), activityToken: fakeToken(2) }),
+      }),
+      env
+    );
+
+    // The real sequence: /register-activity and /register both run inside one
+    // fetchWeather cycle, seconds apart, and KV serves gets from a colo cache
+    // with a 60-second floor — so /register's read can predate the activity
+    // entirely. A read-modify-write on one shared record loses the token here.
+    kv.freezeReads();
+    await reRegister(1, 1);
+    kv.thawReads();
+
+    const stored = JSON.parse(kv.raw(`activity:${fakeToken(1)}`)!) as { activityToken?: string };
+    expect(stored.activityToken).toBe(fakeToken(2));
+  });
+
+  it('drops the activity key when the device unregisters', async () => {
+    await reRegister(1, 0);
+    await worker.fetch(
+      new Request('https://worker.test/register-activity', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.7' },
+        body: JSON.stringify({ token: fakeToken(1), activityToken: fakeToken(2) }),
+      }),
+      env
+    );
+    expect(kv.raw(`activity:${fakeToken(1)}`)).toBeTruthy();
+
+    // Otherwise it becomes exactly the immortal orphan the record TTL exists to
+    // stop — nothing else would ever reach this key.
+    await worker.fetch(
+      new Request('https://worker.test/unregister', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.7' },
+        body: JSON.stringify({ token: fakeToken(1) }),
+      }),
+      env
+    );
+    expect(kv.raw(`activity:${fakeToken(1)}`)).toBeUndefined();
   });
 
   it('keeps the original registeredAt, so cell ranking is genuine first-seen order', async () => {

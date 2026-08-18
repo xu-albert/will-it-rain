@@ -14,6 +14,7 @@
 interface Entry {
   value: string;
   expiresAt: number | null;
+  metadata?: unknown;
 }
 
 export interface KVMockOptions {
@@ -29,6 +30,7 @@ export class KVMock {
   readonly options: KVMockOptions;
   puts = 0;
   deletes = 0;
+  lists = 0;
 
   constructor(options: KVMockOptions = {}) {
     this.options = options;
@@ -62,12 +64,17 @@ export class KVMock {
     return type === 'json' ? JSON.parse(entry.value) : entry.value;
   }
 
-  async put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
+  async put(
+    key: string,
+    value: string,
+    options?: { expirationTtl?: number; metadata?: unknown }
+  ): Promise<void> {
     if (this.options.failing) throw new Error('KV unavailable');
     this.puts += 1;
     this.store.set(key, {
       value,
       expiresAt: options?.expirationTtl ? Date.now() + options.expirationTtl * 1000 : null,
+      metadata: options?.metadata,
     });
   }
 
@@ -82,8 +89,8 @@ export class KVMock {
   // `expiration` is present on a listed key only when that key was written with
   // an expirationTtl, exactly as the real KV list does — that absence is the
   // only way to tell a pre-TTL record from a current one.
-  async list(options?: { prefix?: string; cursor?: string }): Promise<{
-    keys: Array<{ name: string; expiration?: number }>;
+  async list<Metadata = unknown>(options?: { prefix?: string; cursor?: string }): Promise<{
+    keys: Array<{ name: string; expiration?: number; metadata?: Metadata }>;
     list_complete: boolean;
     cursor?: string;
   }> {
@@ -91,11 +98,12 @@ export class KVMock {
     const prefix = options?.prefix ?? '';
     const keys = [...this.store.entries()]
       .filter(([name]) => name.startsWith(prefix) && this.live(this.store, name))
-      .map(([name, entry]) =>
-        entry.expiresAt === null
-          ? { name }
-          : { name, expiration: Math.round(entry.expiresAt / 1000) }
-      );
+      .map(([name, entry]) => ({
+        name,
+        ...(entry.expiresAt === null ? {} : { expiration: Math.round(entry.expiresAt / 1000) }),
+        ...(entry.metadata === undefined ? {} : { metadata: entry.metadata as Metadata }),
+      }));
+    this.lists += 1;
     return { keys, list_complete: true };
   }
 

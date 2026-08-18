@@ -24,8 +24,27 @@ export interface DeviceRegistration {
   renewedAt?: string;
   rainStartEnabled?: boolean;
   rainEndEnabled?: boolean;
-  activityToken?: string;
-  activityUpdatedAt?: string;
+}
+
+/**
+ * A device's Live Activity push token, stored under its own `activity:` key.
+ *
+ * Deliberately not a field on DeviceRegistration. `/register` and
+ * `/register-activity` both write within seconds of each other in one
+ * ContentView.fetchWeather cycle, and KV serves reads from a colo-local cache
+ * with a 60-second floor — so `/register`'s read-modify-write could see a
+ * pre-activity copy of the record and write the token back out of existence.
+ * Separate keys mean the two writers never touch the same value, which closes
+ * that race by construction rather than by racing it.
+ */
+export interface ActivityRegistration {
+  activityToken: string;
+  activityUpdatedAt: string;
+}
+
+/** Metadata stored alongside an `activity:` key, so one list call yields every token. */
+export interface ActivityKeyMetadata {
+  activityToken: string;
 }
 
 export interface GridCell {

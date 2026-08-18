@@ -55,30 +55,45 @@ import { CoverageMap, CoverageReply, DeviceRegistration, Env, GridCell, RateRepl
 // read that dominates it. At the caps, with rain in every cell and every device
 // eligible, one invocation spends:
 //
-//     1  KV list                                          readCoverage
-//   300  KV gets, one per device record                   readCoverage
-//     5  KV puts, MAX_TTL_MIGRATIONS_PER_TICK             migrateLegacyRecords
-//     1  DO call                                          reconcileCoverage
-//   300  KV gets on `notified-*`, one per device          notifyOnce
-//    34  KV puts on `notified-*`, one per push sent       notifyOnce
+//   PER DEVICE RECORD (2 each, so 600 at the caps):
+//     1  KV get of the record itself                      readCoverage
+//     1  KV get on `notified-*`, the dedup key             notifyOnce
+//        — charged before budget.spend(), so every device
+//          pays it whether or not it is notified
+//
+//   FIXED, independent of the device count:
+//     1  KV list of `device:`                              readCoverage
+//     1  KV list of `activity:`                            readActivityTokens
+//     5  KV puts, MAX_TTL_MIGRATIONS_PER_TICK              migrateLegacyRecords
+//     1  DO call                                           reconcileCoverage
+//    34  KV puts on `notified-*`, one per push sent        notifyOnce
+//   204  worst-case push-failure handling: recordPushFailure
+//        is 1 get + 1 put per strike, or 1 get + 4 deletes
+//        + 1 DO call when it reaps — 6 at most, and bounded
+//        by pushes attempted, i.e. by PUSH_BUDGET_PER_INVOCATION
+//    34  clearActivityToken, 1 delete per terminal Live
+//        Activity, likewise bounded by pushes attempted
 //   ---
-//   641  before anything goes wrong
+//   280  fixed, i.e. 8 per push plus 8 that do not scale at all
 //
-// and, in the worst case where every push is rejected and every Live Activity
-// ends on the same tick, up to ~270 more: recordPushFailure is 1 get + 1 put per
-// strike or, when it reaps, 1 get + 4 deletes + 1 DO call, and clearActivityToken
-// is 1 get + 1 put. Call it ~910 of 1,000.
+//   280 + 600 per-device = 880 of 1,000 at the caps.
 //
-// That fits, but the margin is roughly 9%, not the 3x that counting readCoverage
-// alone suggests. Raising MAX_DEVICES_PER_CELL costs 2 internal subrequests per
-// device (the record read plus the dedup read, which is paid before the push
-// budget is consulted so every device pays it whether or not it is notified) and
-// would go over. Overrunning this bucket throws "Too many subrequests" into the
-// same per-grid catch the push budget exists to keep out of.
+// The activity token deliberately costs one `list` for the whole tick rather
+// than one `get` per device: it rides in the key's metadata (see
+// readActivityTokens). Reading it per-device would make this 3 per device,
+// 900 + 280 = 1,180, and would not fit.
 //
-// The per-device and fixed halves of that count are exported below so the
-// guardrail test asserts this model rather than the readCoverage-only figure,
-// which permits roughly twice the device records the budget really allows.
+// So the margin is roughly 12%, not the 3x that counting readCoverage alone
+// suggests, and the real ceiling is under (1,000 - 280) / 2 = 360 device
+// records — under, not at, because a tick that spends the 1,000th subrequest
+// has no room for anything this model has not thought of, and the 1,001st
+// throws "Too many subrequests" into the same per-grid catch the push budget
+// exists to keep out of. The guardrail test asserts a strict inequality for
+// that reason.
+//
+// The per-device and fixed halves are exported below so the guardrail test
+// asserts this model rather than a figure that permits more devices than the
+// budget really allows.
 //
 // Enforcing the push budget is not optional bookkeeping. Overrunning the 50
 // makes the next fetch throw "Too many subrequests"; notifyOnce catches that
@@ -167,9 +182,21 @@ export const DEVICE_RECORD_REFRESH_SECONDS = 7 * 24 * 60 * 60; // 7 days
 /** Every device record costs a readCoverage get plus a `notified-*` dedup get. */
 export const INTERNAL_SUBREQUESTS_PER_DEVICE = 2;
 
+/**
+ * The worst case per push actually attempted: the `notified-*` dedup put, plus
+ * recordPushFailure reaping a dead token (1 get + 4 deletes + 1 DO call), plus
+ * a terminal Live Activity's delete. All bounded by PUSH_BUDGET_PER_INVOCATION,
+ * so this is fixed traffic, not per-device — which is exactly why it belongs in
+ * the term below rather than being left out of the model as happy-path-only.
+ */
+const INTERNAL_SUBREQUESTS_PER_PUSH_WORST_CASE = 8;
+
 /** The tick's device-count-independent internal traffic. */
 export const INTERNAL_SUBREQUESTS_PER_TICK_FIXED =
-  1 + MAX_TTL_MIGRATIONS_PER_TICK + 1 + PUSH_BUDGET_PER_INVOCATION;
+  2 + // one KV list for `device:`, one for `activity:`
+  MAX_TTL_MIGRATIONS_PER_TICK +
+  1 + // the reconcile DO call
+  PUSH_BUDGET_PER_INVOCATION * INTERNAL_SUBREQUESTS_PER_PUSH_WORST_CASE;
 
 /** Free-plan internal subrequests per invocation. */
 export const INTERNAL_SUBREQUEST_CEILING = 1_000;

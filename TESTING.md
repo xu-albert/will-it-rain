@@ -154,10 +154,14 @@ KV cannot count a sub-second burst.
 | `429 rate_limited` + `Retry-After` | more than 20 registrations from your IP in 10 minutes | wait out `retryAfterSeconds` |
 | `503 coverage_at_capacity` | the request would open a **new** grid cell and the service already covers `MAX_GRID_CELLS` (15) | delete junk `device:` keys from KV (section F — not `/unregister`), or re-run the subrequest arithmetic in `abuse.ts` before raising the cap |
 | `503 cell_at_capacity` | that one grid cell already holds `MAX_DEVICES_PER_CELL` (20) devices | unregister a device in that cell, or raise the cap after re-running the arithmetic |
+| `503 storage_unavailable` + `Retry-After: 60` | KV threw while reading the caller's existing record, so the write was refused rather than risk overwriting it | transient — check `wrangler tail` for the KV error; the caller's stored registration is untouched and still live |
 
-**Both 503s clear the caller's existing registration.** That is deliberate: a
-user who moves into an area the service cannot cover should get *no* alerts, not
-alerts for where they used to live. Re-register once capacity frees up.
+**The two capacity 503s clear the caller's existing registration.** That is
+deliberate: a user who moves into an area the service cannot cover should get
+*no* alerts, not alerts for where they used to live. Re-register once capacity
+frees up. `storage_unavailable` is the exception — it clears nothing, precisely
+because the whole point of that refusal is to avoid touching stored state it
+could not read.
 
 The caps are set by the Workers **Free** plan's 50-external-subrequests-per-invocation
 budget, which the cron shares between one WeatherKit fetch per cell and up to two

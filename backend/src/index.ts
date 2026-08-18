@@ -1,5 +1,12 @@
-import { Env, DeviceRegistration, GridCell, LiveActivityContentState } from './types';
-import { LegacyRecord, readCoverage, gridCenter, toGridKey } from './grid';
+import {
+  ActivityKeyMetadata,
+  ActivityRegistration,
+  Env,
+  DeviceRegistration,
+  GridCell,
+  LiveActivityContentState,
+} from './types';
+import { LegacyRecord, readActivityTokens, readCoverage, gridCenter, toGridKey } from './grid';
 import { fetchForecast } from './weatherkit';
 import {
   APNsError,
@@ -208,6 +215,7 @@ export default {
     // longest are the ones served — instead of letting the runtime throw "Too
     // many subrequests" into a catch that swallows it.
     const budget = createPushBudget();
+    const activityTokens = await readActivityTokens(env);
 
     const processGrid = async (grid: GridCell) => {
       const { lat, lon } = gridCenter(grid.gridKey);
@@ -250,6 +258,7 @@ export default {
         };
 
         for (const device of grid.devices) {
+          const activityToken = activityTokens.get(device.token);
           if (rainStart && device.rainStartEnabled !== false) {
             const minutesUntilRain = Math.round((new Date(rainStart.startTime).getTime() - now) / 60000);
             if (minutesUntilRain <= device.leadTimeMinutes && minutesUntilRain >= -5) {
@@ -261,7 +270,7 @@ export default {
               // Live Activity: rain incoming (State A). Only relevant within the same
               // lead-time window as the alert above; a push failure here must never
               // break the alert-push loop.
-              if (device.activityToken && budget.spend()) {
+              if (activityToken && budget.spend()) {
                 try {
                   const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
                   const contentState: LiveActivityContentState = {
@@ -281,7 +290,7 @@ export default {
                     flagText: null,
                     flagPosition: null,
                   };
-                  await sendLiveActivityUpdate(device.activityToken, contentState, env);
+                  await sendLiveActivityUpdate(activityToken, contentState, env);
                   console.log(`[Activity] Sent rain-start update, grid ${grid.gridKey}`);
                 } catch (err) {
                   console.error(`[Activity] push failed: ${err}`);
@@ -301,7 +310,7 @@ export default {
             // raining (State B), independent of the alert's 30-min/dedup gate above.
             // Once the dry minute actually arrives, send the terminal state and drop
             // the activity token — a push failure here must never break the alert loop.
-            if (device.activityToken && budget.spend()) {
+            if (activityToken && budget.spend()) {
               try {
                 if (minutesUntilEnd > 0) {
                   const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
@@ -320,7 +329,7 @@ export default {
                     flagText: null,
                     flagPosition: null,
                   };
-                  await sendLiveActivityUpdate(device.activityToken, contentState, env);
+                  await sendLiveActivityUpdate(activityToken, contentState, env);
                 } else {
                   const contentState: LiveActivityContentState = {
                     statusText: 'Rain ended',
@@ -337,7 +346,7 @@ export default {
                     flagText: null,
                     flagPosition: null,
                   };
-                  await sendLiveActivityUpdate(device.activityToken, contentState, env, 'end');
+                  await sendLiveActivityUpdate(activityToken, contentState, env, 'end');
                   await clearActivityToken(device.token, env);
                   console.log(`[Activity] Sent rain-end (final) update, grid ${grid.gridKey}`);
                 }
@@ -462,9 +471,19 @@ interface RegistrationSettings {
 // there is no evidence of when it was last written and guessing young would risk
 // the very expiry this exists to prevent.
 function needsRewrite(existing: DeviceRegistration, settings: RegistrationSettings): boolean {
+  // Coordinates are compared at grid precision, not as raw doubles. Every
+  // registration the app sends carries a fresh CoreLocation fix, and two fixes
+  // are never byte-identical, so comparing the doubles would report "changed"
+  // on every foreground and the skip below could never fire. The grid key is
+  // the only precision the server ever consumes — the cron fetches weather for
+  // `gridCenter(gridKey)`, never for the device's own lat/lon — so jitter
+  // inside a ~1.1 km cell genuinely changes nothing. A user who moves to a
+  // different cell changes the key, and that still writes.
+  //
+  // The consequence is that the stored lat/lon can lag the device's latest fix
+  // by up to one cell. That is deliberate and harmless for the same reason.
   const changed =
-    existing.lat !== settings.lat ||
-    existing.lon !== settings.lon ||
+    toGridKey(existing.lat, existing.lon) !== toGridKey(settings.lat, settings.lon) ||
     existing.leadTimeMinutes !== settings.leadTimeMinutes ||
     (existing.rainStartEnabled ?? true) !== settings.rainStartEnabled ||
     (existing.rainEndEnabled ?? true) !== settings.rainEndEnabled;
@@ -497,16 +516,33 @@ async function putDeviceRecordAtKey(
   });
 }
 
+function activityKey(deviceToken: string): string {
+  return `activity:${deviceToken}`;
+}
+
+// The activity token is duplicated into the key's metadata so the cron can read
+// every device's token with one `list` instead of one `get` per device. The TTL
+// matches the device record's, so an activity key can never outlive the device
+// that owns it and become the immortal junk DEVICE_RECORD_TTL_SECONDS exists to
+// prevent.
+async function putActivityToken(
+  deviceToken: string,
+  activityToken: string,
+  env: Env
+): Promise<void> {
+  const record: ActivityRegistration = {
+    activityToken,
+    activityUpdatedAt: new Date().toISOString(),
+  };
+  await env.DEVICES.put(activityKey(deviceToken), JSON.stringify(record), {
+    expirationTtl: DEVICE_RECORD_TTL_SECONDS,
+    metadata: { activityToken } satisfies ActivityKeyMetadata,
+  });
+}
+
 // Drop the stored activity token once its Live Activity has been ended.
 async function clearActivityToken(deviceToken: string, env: Env): Promise<void> {
-  const key = `device:${deviceToken}`;
-  const existing = await env.DEVICES.get(key, 'json');
-  if (!existing) return;
-
-  const registration = existing as DeviceRegistration;
-  delete registration.activityToken;
-  delete registration.activityUpdatedAt;
-  await putDeviceRecord(deviceToken, registration, env);
+  await env.DEVICES.delete(activityKey(deviceToken));
 }
 
 async function handleTestRain(request: Request, env: Env): Promise<Response> {
@@ -770,6 +806,7 @@ async function removeDevice(deviceToken: string, env: Env): Promise<void> {
     env.DEVICES.delete(`notified-start:${deviceToken}`),
     env.DEVICES.delete(`notified-end:${deviceToken}`),
     env.DEVICES.delete(`apnsfail:${deviceToken}`),
+    env.DEVICES.delete(activityKey(deviceToken)),
     releaseGridCell(deviceToken, env),
   ]);
 }
@@ -813,18 +850,13 @@ async function handleRegisterActivity(request: Request, env: Env): Promise<Respo
     return json({ error: 'Invalid or missing token or activityToken' }, 400);
   }
 
-  const key = `device:${body.token}`;
-  const existing = await env.DEVICES.get(key, 'json');
-  if (!existing) {
+  const existing = await env.DEVICES.get(`device:${body.token}`);
+  if (existing === null) {
     console.log(`[Activity] Register failed: no device for token`);
     return json({ error: 'Device not registered' }, 404);
   }
 
-  const registration = existing as DeviceRegistration;
-  registration.activityToken = body.activityToken;
-  registration.activityUpdatedAt = new Date().toISOString();
-
-  await putDeviceRecord(body.token, registration, env);
+  await putActivityToken(body.token, body.activityToken, env);
   console.log(`[Activity] Registered activity token for device`);
 
   return json({ ok: true });
@@ -837,15 +869,8 @@ async function handleUnregisterActivity(request: Request, env: Env): Promise<Res
     return json({ error: 'Invalid or missing token' }, 400);
   }
 
-  const key = `device:${body.token}`;
-  const existing = await env.DEVICES.get(key, 'json');
-  if (existing) {
-    const registration = existing as DeviceRegistration;
-    delete registration.activityToken;
-    delete registration.activityUpdatedAt;
-    await putDeviceRecord(body.token, registration, env);
-    console.log(`[Activity] Unregistered activity token for device`);
-  }
+  await clearActivityToken(body.token, env);
+  console.log(`[Activity] Unregistered activity token for device`);
 
   return json({ ok: true });
 }
