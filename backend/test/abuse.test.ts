@@ -1134,12 +1134,16 @@ describe('registration records expire', () => {
       // the staleness refresh still fires, so this fails outright — the record
       // is simply gone from KV — if the refresh threshold is ever raised past
       // the TTL, or if the refresh path is dropped.
+      //
+      // Liveness is checked BEFORE each registration, not after: a registration
+      // that finds nothing stored writes a fresh record, which would leave the
+      // key healthy again and hide the very expiry this is looking for.
       for (let day = 1; day <= 365; day++) {
         vi.advanceTimersByTime(24 * 60 * 60 * 1000);
+        expect(await kv.get(key), `record expired on day ${day}`).toBeTruthy();
+        expect(kv.ttlSeconds(key)).toBeGreaterThan(0);
         const res = await worker.fetch(registerRequest(1, { cell: 0 }), env);
         expect(res.status).toBe(200);
-        expect(kv.raw(key), `record expired on day ${day}`).toBeTruthy();
-        expect(kv.ttlSeconds(key)).toBeGreaterThan(0);
       }
 
       // And the ranking key survived every one of those rewrites: restamping it

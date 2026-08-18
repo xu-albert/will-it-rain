@@ -298,15 +298,20 @@ export const INTERNAL_SUBREQUESTS_PER_TICK_FIXED =
 export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 
 // ---------------------------------------------------------------------------
-// The daily KV allowances — four separate buckets
+// The daily allowances — four KV buckets and three Durable Object meters
 // ---------------------------------------------------------------------------
 
 // Different budget, different period, and — the part that is easy to get wrong
-// — FOUR independent allowances, not one. The Free plan gives the namespace
+// — SEVEN independent allowances, not one. The Free plan gives the KV namespace
 // 100,000 key reads, 1,000 key writes, 1,000 key DELETES and 1,000 LIST
-// requests per day. Writes and deletes do not share a pool, so a delete-driven
-// amplifier cannot be reasoned about against the write budget. Everything in
-// the section above is per-invocation and says nothing about any of these.
+// requests per day, and meters Durable Objects again on top of that: 100,000
+// requests, 100,000 SQLite rows WRITTEN and 5,000,000 rows read per day, plus
+// 13,000 GB-s of duration. Writes and deletes do not share a pool, so a
+// delete-driven amplifier cannot be reasoned about against the write budget;
+// KV and the Durable Objects share nothing at all, so moving the gate's
+// counters out of KV did not make them free — it moved them onto meters of
+// their own, which is why they are counted here. Everything in the section
+// above is per-invocation and says nothing about any of these.
 //
 // Counted at the caps (15 x 20 = 300 devices, 144 ticks/day):
 //
@@ -399,10 +404,69 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //                                 suffices, but a namespace holding more than
 //                                 1,000 keys of either prefix multiplies this by
 //                                 the page count.
-//   => Fits with room, and is the only bucket that does.
+//   => Fits with room, and is the only KV bucket that does.
 //
-// So two of the four buckets do not fit at MAX_GRID_CELLS x MAX_DEVICES_PER_CELL,
-// and the two are not alike — do not read one argument as covering both.
+// DO REQUESTS — 100,000/day, counting every call into an object and every alarm
+//   /register                     1 for the throttle check, which every request
+//                                 pays, plus 1 for the reserve — 2 for an
+//                                 admitted registration, 1 for a 429, which
+//                                 stops at the limiter.
+//   /register-activity            1, the same throttle check. It writes only the
+//                                 `activity:` key and never calls coverage.
+//   /unregister                   1, the release, and only when the caller
+//                                 really had a record. Deliberately unthrottled,
+//                                 so there is no limiter call.
+//   /unregister-activity          0. It reaches neither object.
+//   cron                          <= 38/tick = 5,472/day: 1 pending-reaps read,
+//                                 1 reconcile, MAX_DEVICE_REAPS_PER_TICK
+//                                 releases, and worst case one flag-reap per
+//                                 push attempted.
+//   limiter alarms                1 per address per idle window, the self-clean.
+//   => The cron spends ~5.5% of the allowance. Registration is the term that
+//      moves: one address at the 20-per-10-minutes ceiling is 2,880
+//      registrations = ~5,760 requests/day, so ~17 sustained addresses drain it.
+//      And the throttle does not floor that: the throttle IS a DO call, so a
+//      pure 429 flood still spends one DO request per HTTP request, one for one,
+//      with nothing in this file bounding it.
+//
+// DO ROWS WRITTEN — 100,000/day; a put, a delete and a setAlarm are one row each
+//   limiter, admitted request     1 WINDOW_KEY put, plus 1 setAlarm on the
+//                                 request that opens a window and 1 for the
+//                                 deleteAll when that alarm fires. A 429 writes
+//                                 nothing at all.
+//   reserve, per registration     1 RECENT_KEY put always, 1 COVERAGE_KEY put
+//                                 when the tally actually moves, and 1
+//                                 PENDING_KEY put only for a device that was
+//                                 flagged — 1 to 3, usually 2.
+//   reserve, per refusal          <= 2: the coverage put for the old cell it
+//                                 released on the way in, and the
+//                                 recent-admission forget.
+//   release                       <= 3, on a teardown and on a reap.
+//   flag-reap                     1 per newly rejected token, <= 34/tick.
+//   reconcile                     3/tick unconditionally: coverage, recent,
+//                                 pending.
+//   => The cron is <= 43/tick = 6,192/day, ~6%. One address at the throttle
+//      ceiling writes ~5,800 rows/day re-registering unchanged, and ~8,640 when
+//      it alternates cells so the tally moves on every request, so 12 to 17
+//      sustained addresses drain it — the same shape as the KV write bucket, and
+//      for the same reason.
+//
+// DO ROWS READ — 5,000,000/day
+//   ~4 per admitted registration (the limiter's window get, plus coverage,
+//   recent and pending inside reserve) and ~45 per cron tick, so ~11,500/day
+//   for an address at the throttle ceiling and ~6,500/day for the cron. Fits
+//   with three orders of magnitude to spare. It is listed so the next reader can
+//   see it was counted, not because it needs watching.
+//
+// DO DURATION — 13,000 GB-s/day
+//   The one term here bounded by argument rather than arithmetic: neither object
+//   holds a WebSocket or an outbound connection, so both are eligible to
+//   hibernate between requests, and each request is a handful of storage
+//   operations measured in milliseconds.
+//
+// So two of the four KV buckets do not fit at MAX_GRID_CELLS x
+// MAX_DEVICES_PER_CELL, and the two are not alike — do not read one argument as
+// covering both.
 //
 //   The WRITE bucket is NOT tunable here. Lowering MAX_DEVICES_PER_CELL does
 //   not touch the dedup put, which is one per alert delivered, and lowering
@@ -419,13 +483,27 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //   single-digit devices. Anyone approaching the caps for real should lower it
 //   rather than assume the bucket cannot move.
 //
+//   BOTH DO METERS FIT, and neither gets a budget. Legitimate traffic spends
+//   about 6% of each, and no arithmetic above asks for a bound, so there is
+//   deliberately no per-tick DO budget, no new constant and no guard code here —
+//   a mitigation nothing demands is just another thing to get wrong. What does
+//   need saying is the failure mode, because it is unlike KV's: both callers
+//   fail OPEN on purpose (checkRegistrationRate at the throttle, reserveGridCell
+//   at the caps — see intent decision 4), so exhausting a DO meter does not
+//   refuse registrations, it switches the throttle and both caps off until 00:00
+//   UTC behind a single console.warn. What still bounds the damage in that
+//   window is selectCellsWithinCap, which truncates the cron's fan-out whatever
+//   the registry says, and the 1,000 daily KV writes, which cap how many records
+//   can be planted at all.
+//
 // The honest statement is that these caps are sized for the current fleet
 // (TESTING.md documents ~15 devices, an order of magnitude below every
-// crossover above) and that running near the caps needs the Paid plan. Exceeding an allowance makes KV refuse
-// that operation for the rest of the UTC day — writes gone means putDeviceRecord
-// throws and /register 500s, and the 45-day TTL is only safe while live installs
-// can renew; deletes gone means /unregister 500s and dead tokens cannot be
-// reaped.
+// crossover above) and that running near the caps needs the Paid plan.
+// Exceeding an allowance makes that operation fail for the rest of the UTC day:
+// KV writes gone means putDeviceRecord throws and /register 500s, and the 45-day
+// TTL is only safe while live installs can renew; KV deletes gone means
+// /unregister 500s and dead tokens cannot be reaped; a DO meter gone means the
+// gate stops counting and lets everything through.
 
 // ---------------------------------------------------------------------------
 // Client identity

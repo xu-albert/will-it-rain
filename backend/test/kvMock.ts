@@ -112,9 +112,13 @@ export class KVMock {
     this.store.set(key, { value, expiresAt: null });
   }
 
-  /** Test-only: the TTL a key was written with, in seconds, or null if none. */
+  /**
+   * Test-only: how long a key has left, in seconds, or null when it carries no
+   * expiry — and null too once it has expired, since a key past its TTL is gone
+   * as far as every reader is concerned.
+   */
   ttlSeconds(key: string): number | null {
-    const entry = this.store.get(key);
+    const entry = this.live(this.store, key);
     if (!entry || entry.expiresAt === null) return null;
     return Math.round((entry.expiresAt - Date.now()) / 1000);
   }
@@ -123,7 +127,12 @@ export class KVMock {
     return [...this.store.keys()].filter((k) => k.startsWith(prefix));
   }
 
+  /**
+   * Test-only: the stored value, honouring expiry. Reading straight out of the
+   * backing Map would report an expired record as present, which is exactly the
+   * failure a TTL test is looking for.
+   */
   raw(key: string): string | undefined {
-    return this.store.get(key)?.value;
+    return this.live(this.store, key)?.value;
   }
 }
