@@ -318,17 +318,38 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 // READS — 100,000/day
 //   cron, per device record       2 x 300 x 144 = 86,400. The readCoverage get
 //                                 plus the `notified-*` dedup get.
-//   cron, per push attempted      <= 2 x 34 x 144 = 9,792. The `apnsfail:` get
-//                                 and clearActivityToken's guard get.
-//   cron, per reap               <= 2 x 144 = 288, removeDevice's guard get.
+//   cron, per push attempted      <= 2 x 34 x 144 = 9,792: the `apnsfail:` get on
+//                                 a rejected push, and clearActivityToken's
+//                                 guard get when an activity ends.
+//   cron, per reap                <= 2 x 2 x 144 = 576. A reap is TWO reads, not
+//                                 one: removeDevice's `device:` guard get plus
+//                                 the `activity:` guard get inside the
+//                                 clearActivityToken it calls. Reaps also arrive
+//                                 from the pending-reap drain, which is not a
+//                                 push, so they cannot be folded into the line
+//                                 above.
 //   /register                     1 per request. The client registers on cold
 //                                 launch, every foreground, every successful
 //                                 poll and every >10 km move, so this is the
 //                                 term that scales with user activity rather
 //                                 than fleet size.
-//   /unregister, /unregister-*    1 per request, the guard get.
-//   => ~96,500 of 100,000 before a single registration, so /register reads are
-//      what push it over. Note this is a deliberately pessimistic ceiling: it
+//   /register-activity            2 per request: the `device:` existence check,
+//                                 and putActivityToken's skip-when-identical
+//                                 guard get. That second read is bought
+//                                 deliberately — it is what keeps a replayed
+//                                 token off the far scarcer write allowance.
+//   /unregister                   2 per real teardown (the `device:` guard get
+//                                 and clearActivityToken's), and 1 for a token
+//                                 that was never registered, which stops at the
+//                                 first read.
+//   /unregister-activity          1 per request, clearActivityToken's guard get.
+//   capacity refusal              2 on top of the /register read above, because
+//                                 clearing the stale registration runs the same
+//                                 removeDevice as a reap. Zero for a token that
+//                                 was never registered — the reserve refusal
+//                                 short-circuits before removeDevice.
+//   => ~96,768 of 100,000 before a single registration, so registration reads
+//      are what push it over. Note this is a deliberately pessimistic ceiling: it
 //      assumes rain in every one of the 15 cells for all 144 ticks and a full
 //      300-device fleet. Real load is single-digit devices, three orders of
 //      magnitude below it.
@@ -360,13 +381,28 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //                                 churn, at 288/day per device. This term is why
 //                                 the header above no longer calls registration
 //                                 bounded.
-//   `activity:` puts              1 per Live Activity started.
-//   => Does NOT fit at the caps. Two separate terms exceed the allowance on
+//   `activity:` puts              1 per Live Activity started, plus 1 whenever the
+//                                 token changes. Re-submitting a token that is
+//                                 already stored writes nothing.
+//   `activity:` puts, adversarial <= 20 x 144 = 2,880/day per address, and the
+//                                 skip-when-identical guard does NOT close this
+//                                 one: an attacker rotating a fresh activityToken
+//                                 on every request submits a genuine change each
+//                                 time, and a genuine change is never deferred,
+//                                 because every server-side update to the
+//                                 activity the user just started depends on it.
+//                                 The guard closes the cheaper shape — replaying
+//                                 one token — for the price of a read. It costs
+//                                 one admitted registration first, since
+//                                 /register-activity 404s without a `device:`
+//                                 record, and it draws on the same per-IP bucket
+//                                 as /register rather than a second one.
+//   => Does NOT fit at the caps. Three separate terms exceed the allowance on
 //      their own: at a full 300-device fleet the dedup put does — roughly
 //      1,000/144 ~= 7 alerts per tick sustained around the clock is the whole
 //      day's allowance, about 20 devices alerted continuously at the 30-minute
 //      dedup interval — and with no fleet at all a single throttled address
-//      does, via the adversarial rewrite term above. Exhausting it means
+//      does, via either adversarial rewrite term above. Exhausting it means
 //      putDeviceRecord throws, so /register 500s for every real user, and
 //      notifyOnce's dedup put throws after a successful send, so a raining cell
 //      re-alerts every 10 minutes until 00:00 UTC.
@@ -385,8 +421,9 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //                                 time and the key is gone once cleared, so the
 //                                 sustained rate is bounded by activities ended,
 //                                 not by the push budget.
-//   /unregister                   2 per real teardown, 0 for a token that was
-//                                 never registered.
+//   /unregister                   2 per real teardown, 1 for the common device
+//                                 that never started a Live Activity, and 0 for
+//                                 a token that was never registered.
 //   /unregister-activity          1 per real teardown, 0 otherwise.
 //   capacity refusal              2, and only when the caller really had a record.
 //   => Fits only because every consumer is either budgeted or earned by a

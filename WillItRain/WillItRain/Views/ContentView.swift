@@ -288,6 +288,7 @@ struct ContentView: View {
     /// and the server's per-client throttle (20 per 10 minutes) is far above any
     /// plausible foregrounding rate.
     private func renewPushRegistration() async {
+        guard PushRegistrationService.shared.hasStoredToken else { return }
         guard let location = try? await locationService.currentLocation() else { return }
         await PushRegistrationService.shared.registerLocation(
             lat: location.coordinate.latitude,

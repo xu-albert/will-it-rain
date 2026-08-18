@@ -13,6 +13,14 @@ final class PushRegistrationService {
         print("[Push] Stored device token: \(hex)")
     }
 
+    /// Whether APNs has handed us a device token yet.
+    ///
+    /// Every call below bails without one, so a caller that would have to do work
+    /// of its own first — a CoreLocation fix, say — can check this and skip it.
+    var hasStoredToken: Bool {
+        UserDefaults.standard.string(forKey: "pushDeviceToken") != nil
+    }
+
     /// Register or update location with the backend
     func registerLocation(
         lat: Double,

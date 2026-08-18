@@ -1291,6 +1291,44 @@ describe('re-registration', () => {
   const reRegister = (n: number, cell: number) =>
     worker.fetch(registerRequest(n, { cell, ip: '198.51.100.7' }), env);
 
+  const attachActivity = (device: number, activity: number) =>
+    worker.fetch(
+      new Request('https://worker.test/register-activity', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.7' },
+        body: JSON.stringify({ token: fakeToken(device), activityToken: fakeToken(activity) }),
+      }),
+      env
+    );
+
+  it('does not rewrite an activity token the client re-submits unchanged', async () => {
+    await reRegister(1, 0);
+    expect((await attachActivity(1, 2)).status).toBe(200);
+
+    // /register-activity shares /register's per-IP bucket and has no cooldown of
+    // its own, so a replayed token that still wrote would let one address spend
+    // 20 x 144 = 2,880 puts a day against an allowance of 1,000.
+    const settled = kv.puts;
+    for (let n = 0; n < 5; n++) expect((await attachActivity(1, 2)).status).toBe(200);
+    expect(kv.puts).toBe(settled);
+    expect(kv.raw(`activity:${fakeToken(1)}`)).toContain(fakeToken(2));
+  });
+
+  it('persists a changed activity token at once rather than deferring it', async () => {
+    await reRegister(1, 0);
+    await attachActivity(1, 2);
+
+    // The activity the user just started sends every server-side update through
+    // this token, so a new one is never held back — the same reason a genuine
+    // cell change is never deferred.
+    const settled = kv.puts;
+    expect((await attachActivity(1, 3)).status).toBe(200);
+    expect(kv.puts).toBe(settled + 1);
+
+    const stored = JSON.parse(kv.raw(`activity:${fakeToken(1)}`)!) as { activityToken: string };
+    expect(stored.activityToken).toBe(fakeToken(3));
+  });
+
   it('keeps the Live Activity token the client only ever sends once', async () => {
     await reRegister(1, 0);
     await worker.fetch(

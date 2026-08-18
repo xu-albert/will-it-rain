@@ -632,19 +632,45 @@ function activityKey(deviceToken: string): string {
 // matches the device record's, so an activity key can never outlive the device
 // that owns it and become the immortal junk DEVICE_RECORD_TTL_SECONDS exists to
 // prevent.
+//
+// Re-submitting a token that is already stored writes nothing. `/register-activity`
+// shares `/register`'s per-IP throttle bucket, so without this one address could
+// spend 20 x 144 = 2,880 puts a day against an allowance of 1,000 — the same
+// adversarial drain DEVICE_REWRITE_COOLDOWN_SECONDS bounds on the `device:` side,
+// paid for the same way: a `get` comes from the 100,000-a-day read allowance,
+// which is two orders of magnitude larger than the write one.
+//
+// A NEW or CHANGED token is always persisted immediately — never deferred, never
+// cooled down. Every server-side Live Activity update depends on it, so holding
+// one back would silently break the activity the user just started, which is the
+// same reasoning that exempts a genuine cell change from the rewrite cooldown.
 async function putActivityToken(
   deviceToken: string,
   activityToken: string,
   env: Env
 ): Promise<void> {
+  const key = activityKey(deviceToken);
+  const stored = await env.DEVICES.get(key);
+  if (stored !== null && storedActivityToken(stored) === activityToken) return;
+
   const record: ActivityRegistration = {
     activityToken,
     activityUpdatedAt: new Date().toISOString(),
   };
-  await env.DEVICES.put(activityKey(deviceToken), JSON.stringify(record), {
+  await env.DEVICES.put(key, JSON.stringify(record), {
     expirationTtl: DEVICE_RECORD_TTL_SECONDS,
     metadata: { activityToken } satisfies ActivityKeyMetadata,
   });
+}
+
+// A record this Worker cannot parse is treated as absent, so the caller rewrites
+// it rather than skipping on a value nothing can read.
+function storedActivityToken(raw: string): string | null {
+  try {
+    return (JSON.parse(raw) as ActivityRegistration).activityToken ?? null;
+  } catch {
+    return null;
+  }
 }
 
 // Drop the stored activity token once its Live Activity has been ended.
