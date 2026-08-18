@@ -27,6 +27,7 @@ import {
 } from './validate';
 import {
   DEVICE_RECORD_REFRESH_SECONDS,
+  DEVICE_REWRITE_COOLDOWN_SECONDS,
   DEVICE_RECORD_TTL_SECONDS,
   MAX_DEVICES_PER_CELL,
   MAX_DEVICE_RECORDS,
@@ -530,7 +531,29 @@ interface RegistrationSettings {
 // A record with no `renewedAt` always counts as due: it predates the field, so
 // there is no evidence of when it was last written and guessing young would risk
 // the very expiry this exists to prevent.
-function needsRewrite(existing: DeviceRegistration, settings: RegistrationSettings): boolean {
+/**
+ * Whether this registration is persisted now, and if not, why not.
+ *
+ * `unchanged` is the common case: the client re-registers on cold launch, on
+ * every foreground and after every poll, and almost all of that is a repeat.
+ * `cooling-down` is a real change arriving sooner than
+ * DEVICE_REWRITE_COOLDOWN_SECONDS after the last write.
+ *
+ * Refresh-due is checked first and overrides both, though note the two can
+ * never actually collide: refresh-due is `sinceWrite >= 7 days` and cooling-down
+ * is `sinceWrite < 5 minutes`, so they bracket the same quantity from opposite
+ * ends and no write is ever both. The ordering is defensive against a future
+ * edit that narrows the gap, not load-bearing today. What does hold the TTL
+ * guarantee up is that the cooldown only ever gates a CHANGE: an unchanged
+ * record falls through to `unchanged`, and the refresh-due branch above is what
+ * eventually rewrites it.
+ */
+type WriteDecision = 'write' | 'unchanged' | 'cooling-down';
+
+function writeDecision(
+  existing: DeviceRegistration,
+  settings: RegistrationSettings
+): WriteDecision {
   // Coordinates are compared at grid precision, not as raw doubles. Every
   // registration the app sends carries a fresh CoreLocation fix, and two fixes
   // are never byte-identical, so comparing the doubles would report "changed"
@@ -542,16 +565,21 @@ function needsRewrite(existing: DeviceRegistration, settings: RegistrationSettin
   //
   // The consequence is that the stored lat/lon can lag the device's latest fix
   // by up to one cell. That is deliberate and harmless for the same reason.
+  const renewedAt = existing.renewedAt ? Date.parse(existing.renewedAt) : Number.NaN;
+  const sinceWrite = Number.isNaN(renewedAt)
+    ? Number.POSITIVE_INFINITY
+    : Date.now() - renewedAt;
+
+  if (sinceWrite >= DEVICE_RECORD_REFRESH_SECONDS * 1000) return 'write';
+
   const changed =
     toGridKey(existing.lat, existing.lon) !== toGridKey(settings.lat, settings.lon) ||
     existing.leadTimeMinutes !== settings.leadTimeMinutes ||
     (existing.rainStartEnabled ?? true) !== settings.rainStartEnabled ||
     (existing.rainEndEnabled ?? true) !== settings.rainEndEnabled;
-  if (changed) return true;
+  if (!changed) return 'unchanged';
 
-  const renewedAt = existing.renewedAt ? Date.parse(existing.renewedAt) : Number.NaN;
-  if (Number.isNaN(renewedAt)) return true;
-  return Date.now() - renewedAt >= DEVICE_RECORD_REFRESH_SECONDS * 1000;
+  return sinceWrite >= DEVICE_REWRITE_COOLDOWN_SECONDS * 1000 ? 'write' : 'cooling-down';
 }
 
 async function putDeviceRecord(
@@ -743,6 +771,35 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     );
   }
 
+  const settings: RegistrationSettings = {
+    lat: body.lat,
+    lon: body.lon,
+    leadTimeMinutes: clampLeadTimeMinutes(body.leadTimeMinutes),
+    rainStartEnabled: asBoolean(body.rainStartEnabled, true),
+    rainEndEnabled: asBoolean(body.rainEndEnabled, true),
+  };
+
+  // Decided BEFORE the cell is reserved, not after, and that ordering is
+  // load-bearing rather than tidy. reserveGridCell relocates the token into the
+  // requested cell; returning early afterwards would leave the registry saying
+  // the device is somewhere KV does not, inflating the tally against
+  // MAX_GRID_CELLS and refusing a genuine newcomer for a slot nothing occupies.
+  // A registration we are not going to persist must not move anything.
+  //
+  // A first registration has no stored record, so it is never deferred.
+  if (existing) {
+    const decision = writeDecision(existing, settings);
+    if (decision !== 'write') {
+      const storedKey = toGridKey(existing.lat, existing.lon);
+      console.log(
+        decision === 'unchanged'
+          ? `[Register] Unchanged and still fresh, skipped the write for grid ${storedKey}`
+          : `[Register] Rewrite cooling down, kept grid ${storedKey} for now`
+      );
+      return json({ ok: true, gridKey: storedKey });
+    }
+  }
+
   // Opening a *new* grid cell is the expensive act: it adds ~4,383 WeatherKit
   // calls a month, forever. Registering into a cell the service already covers
   // costs nothing extra and is always allowed, so an existing user is never
@@ -800,26 +857,6 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
       503,
       { 'Retry-After': '3600' }
     );
-  }
-
-  const settings: RegistrationSettings = {
-    lat: body.lat,
-    lon: body.lon,
-    leadTimeMinutes: clampLeadTimeMinutes(body.leadTimeMinutes),
-    rainStartEnabled: asBoolean(body.rainStartEnabled, true),
-    rainEndEnabled: asBoolean(body.rainEndEnabled, true),
-  };
-
-  // The client re-registers on cold launch, on every foreground and after every
-  // successful poll, so most of what arrives here is a byte-for-byte repeat of
-  // what is already stored. Rewriting it would spend the Free plan's 1,000 KV
-  // writes a day on nothing (see the daily allowance in abuse.ts). Skipping it
-  // is only safe because a record still gets rewritten once it is older than
-  // DEVICE_RECORD_REFRESH_SECONDS, which resets the 45-day TTL with weeks to
-  // spare — the renewal the TTL's whole safety argument rests on.
-  if (existing && !needsRewrite(existing, settings)) {
-    console.log(`[Register] Unchanged and still fresh, skipped the write for grid ${gridKey}`);
-    return json({ ok: true, gridKey });
   }
 
   const registration: DeviceRegistration = {

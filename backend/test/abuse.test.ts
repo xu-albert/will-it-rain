@@ -15,6 +15,7 @@ import {
   MAX_DEVICE_RECORDS,
   MAX_GRID_CELLS,
   DEVICE_RECORD_REFRESH_SECONDS,
+  DEVICE_REWRITE_COOLDOWN_SECONDS,
   DEVICE_RECORD_TTL_SECONDS,
   INTERNAL_SUBREQUESTS_PER_DEVICE,
   INTERNAL_SUBREQUESTS_PER_TICK_FIXED,
@@ -216,7 +217,7 @@ describe('per-client rate limit', () => {
     expect(other.status).toBe(200);
   });
 
-  it('tears down an unregistered token without spending any KV writes on it', async () => {
+  it('tears down an unregistered token without spending any KV deletes on it', async () => {
     // /unregister is deliberately unthrottled, so this is the cheapest request
     // an attacker can make. It must stay cheap for us too: teardown is two KV
     // deletes, and unconditionally spending them would drain the Free plan's
@@ -364,16 +365,21 @@ describe('grid-cell cap', () => {
     ).toBe(200);
     expect(kv.raw(`device:${fakeToken(0)}`)).toBeTruthy();
 
+    // Past the rewrite cooldown, so the move is one the gate actually decides on
+    // rather than one it defers.
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + (DEVICE_REWRITE_COOLDOWN_SECONDS + 1) * 1000);
     const moved = await worker.fetch(
       registerRequest(0, { cell: 900, ip: '192.0.2.240' }),
       env
     );
+    vi.useRealTimers();
     expect(moved.status).toBe(503);
     expect(((await moved.json()) as { error: string }).error).toMatch(/cleared/i);
     expect(kv.raw(`device:${fakeToken(0)}`)).toBeUndefined();
   });
 
-  it('refuses an unregistered token without spending any KV writes on it', async () => {
+  it('refuses an unregistered token without spending any KV deletes on it', async () => {
     for (let n = 0; n < MAX_GRID_CELLS; n++) {
       expect((await registerCell(n)).status).toBe(200);
     }
@@ -637,9 +643,9 @@ describe('the cron fan-out budget', () => {
     // times the devices the budget really allows. Every device also pays a
     // `notified-*` dedup get, charged before the push budget is consulted so it
     // lands whether or not the device is notified; and the fixed term has to
-    // carry the failure paths — recordPushFailure reaping a token is 6 internal
-    // subrequests, clearActivityToken another — which are bounded by pushes
-    // attempted, not by devices. Leaving those out let a raised
+    // carry the failure paths — a reap is INTERNAL_SUBREQUESTS_PER_REAP, and
+    // clearActivityToken another two — which are bounded by pushes attempted
+    // and by the reap budget, not by devices. Leaving those out let a raised
     // MAX_DEVICES_PER_CELL stay green while a tick of rejected pushes spent past
     // 1,000, and subrequest 1,001 throws into a per-grid catch that only logs.
     const perTick =
@@ -1041,23 +1047,110 @@ describe('registration records expire', () => {
   });
 
   it('still writes when the jitter crosses into a different cell', async () => {
-    await worker.fetch(registerRequest(1, { cell: 0 }), env);
-    const afterFirst = kv.puts;
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      await worker.fetch(registerRequest(1, { cell: 0 }), env);
+      const afterFirst = kv.puts;
 
-    // 0.05 deg is a whole cell away, which is a real move and must be stored.
-    await worker.fetch(registerRequest(1, { cell: 0, jitter: 0.05 }), env);
-    expect(kv.puts).toBeGreaterThan(afterFirst);
+      // 0.05 deg is a whole cell away, which is a real move and must be stored
+      // once the rewrite cooldown is up.
+      vi.setSystemTime(Date.now() + (DEVICE_REWRITE_COOLDOWN_SECONDS + 1) * 1000);
+      await worker.fetch(registerRequest(1, { cell: 0, jitter: 0.05 }), env);
+      expect(kv.puts).toBeGreaterThan(afterFirst);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('still writes when the request actually changes something', async () => {
-    await worker.fetch(registerRequest(1, { cell: 0 }), env);
-    const afterFirst = kv.puts;
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      await worker.fetch(registerRequest(1, { cell: 0 }), env);
+      const afterFirst = kv.puts;
 
-    await worker.fetch(registerRequest(1, { cell: 1 }), env);
-    expect(kv.puts).toBeGreaterThan(afterFirst);
+      vi.setSystemTime(Date.now() + (DEVICE_REWRITE_COOLDOWN_SECONDS + 1) * 1000);
+      await worker.fetch(registerRequest(1, { cell: 1 }), env);
+      expect(kv.puts).toBeGreaterThan(afterFirst);
 
-    const stored = JSON.parse(kv.raw(`device:${fakeToken(1)}`)!) as { lat: number };
-    expect(stored.lat).toBe(coordsForCell(1).lat);
+      const stored = JSON.parse(kv.raw(`device:${fakeToken(1)}`)!) as { lat: number };
+      expect(stored.lat).toBe(coordsForCell(1).lat);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('defers a second move inside the cooldown, and takes it once the cooldown passes', async () => {
+    // Alternating one token between two cells is a genuine change every time,
+    // so the skip-when-unchanged check cannot see it, and reserve relocates the
+    // token rather than adding one, so neither cap sees it either. Unbounded
+    // that is 20 x 144 = 2,880 `device:` puts a day from one address against a
+    // 1,000-a-day allowance.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      await worker.fetch(registerRequest(1, { cell: 0 }), env);
+
+      const settled = kv.puts;
+      for (let n = 0; n < 8; n++) {
+        vi.setSystemTime(Date.now() + 30_000);
+        const res = await worker.fetch(registerRequest(1, { cell: n % 2 }), env);
+        expect(res.status).toBe(200);
+      }
+      expect(kv.puts).toBe(settled);
+
+      // Deferred, not refused: the move lands as soon as the cooldown is up.
+      vi.setSystemTime(Date.now() + DEVICE_REWRITE_COOLDOWN_SECONDS * 1000);
+      await worker.fetch(registerRequest(1, { cell: 1 }), env);
+      expect(kv.puts).toBe(settled + 1);
+      const stored = JSON.parse(kv.raw(`device:${fakeToken(1)}`)!) as { lat: number };
+      expect(stored.lat).toBe(coordsForCell(1).lat);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not spend a grid cell on a move it declines to persist', async () => {
+    // The reservation has to follow the write decision, not precede it.
+    // reserveGridCell relocates the token into the requested cell, so a deferred
+    // move that still reserved would occupy a cell KV knows nothing about while
+    // leaving the device's real cell occupied by its neighbour — the covered
+    // count climbs to the cap and the next genuine newcomer is refused for a
+    // slot nothing is using.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      for (let n = 0; n < MAX_GRID_CELLS - 1; n++) {
+        expect(
+          (await worker.fetch(registerRequest(n, { cell: n, ip: `192.0.2.${n}` }), env)).status
+        ).toBe(200);
+      }
+      // A neighbour in cell 0, so the mover leaving would not vacate it.
+      expect(
+        (await worker.fetch(registerRequest(700, { cell: 0, ip: '192.0.2.201' }), env)).status
+      ).toBe(200);
+
+      // Device 0 repeatedly tries to move into a brand-new cell, every attempt
+      // inside its cooldown, so nothing is persisted.
+      vi.setSystemTime(Date.now() + 30_000);
+      for (let n = 0; n < 5; n++) {
+        const res = await worker.fetch(registerRequest(0, { cell: 900, ip: '192.0.2.0' }), env);
+        expect(res.status).toBe(200);
+      }
+      expect(kv.raw(`device:${fakeToken(0)}`)).toBeTruthy();
+      expect(storedCells(kv).size).toBe(MAX_GRID_CELLS - 1);
+
+      // So the last slot is still free for a genuine newcomer.
+      const newcomer = await worker.fetch(
+        registerRequest(901, { cell: 901, ip: '192.0.2.202' }),
+        env
+      );
+      expect(newcomer.status).toBe(200);
+      expect(kv.raw(`device:${fakeToken(901)}`)).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('never lets an active device expire, however long it re-registers unchanged', async () => {
@@ -1302,11 +1395,15 @@ describe('re-registration', () => {
   });
 
   it('keeps the original registeredAt, so cell ranking is genuine first-seen order', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
     await reRegister(1, 0);
     const first = (JSON.parse(kv.raw(`device:${fakeToken(1)}`)!) as { registeredAt: string })
       .registeredAt;
 
+    vi.setSystemTime(Date.now() + (DEVICE_REWRITE_COOLDOWN_SECONDS + 1) * 1000);
     await reRegister(1, 1);
+    vi.useRealTimers();
     const after = JSON.parse(kv.raw(`device:${fakeToken(1)}`)!) as {
       registeredAt: string;
       lat: number;

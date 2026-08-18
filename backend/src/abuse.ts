@@ -11,10 +11,23 @@
 //
 //   1. A per-client throttle bounds how fast anyone can register at all.
 //   2. Hard ceilings on distinct grid cells, and on devices inside one cell,
-//      bound what registrations can ever cost, no matter how many clients
-//      cooperate. The throttle can be spread across a botnet; the caps cannot.
+//      bound the cron's per-tick cost and the number of areas the service will
+//      ever track, no matter how many clients cooperate. The throttle can be
+//      spread across a botnet; those two ceilings cannot.
 //   3. A per-invocation push budget bounds what one cron tick can spend, so the
 //      headroom the caps leave is real rather than notional.
+//   4. A per-device rewrite cooldown bounds how often one registration can be
+//      re-persisted, because the ceilings in (2) do not bound that.
+//
+// Be precise about what is NOT bounded, because an overclaim here is what sends
+// the next reader looking in the wrong place. The cell and per-cell caps bound
+// STORAGE SHAPE — cells tracked, records held, work per tick. They do not bound
+// the daily KV WRITE allowance: a token can move between two cells forever
+// without ever adding a cell or a record, and every move is a legitimate
+// rewrite. The cooldown in (4) mitigates that and does not eliminate it — an
+// attacker rotating enough tokens still writes at whatever rate the per-client
+// throttle permits. The daily-allowance block below counts that term honestly
+// rather than filing registration under "bounded".
 //
 // The first two are counted in Durable Objects (durable.ts) rather than KV,
 // because KV cannot count a burst: its reads come from a colo-local cache with
@@ -191,10 +204,11 @@ export const MAX_TTL_MIGRATIONS_PER_TICK = 5;
 //
 // 2 x 2 x 144 = 576/day is the ceiling this sets, and it is only reached if
 // every tick for a whole day finds two dead tokens — 288 devices churning
-// daily against a 300-device cap. Deferring the rest is safe: reaping is
-// idempotent and the next tick retries, so a backlog drains at 288/day rather
-// than being lost. The cost of deferral is that a dead token may absorb one
-// more push before it goes.
+// daily against a 300-device cap. Deferring the rest is safe and now costs no
+// pushes either: a deferred token is flagged pending-reap in the registry and
+// the push loop skips it, and the next tick drains the queue at this same rate
+// rather than losing it. The cost of deferral is only that the record sits in
+// KV, holding its cell slot, until its turn comes.
 export const MAX_DEVICE_REAPS_PER_TICK = 2;
 
 // How stale a record may get before a re-registration rewrites it even though
@@ -209,6 +223,36 @@ export const MAX_DEVICE_REAPS_PER_TICK = 2;
 // because selectCellsWithinCap ranks cells by it and restamping it would let a
 // planted record outrank a live user.
 export const DEVICE_RECORD_REFRESH_SECONDS = 7 * 24 * 60 * 60; // 7 days
+
+// The shortest interval at which one device's record may be re-persisted.
+//
+// The skip-when-unchanged check above bounds repeats; it does nothing about
+// CHANGES, and a change is cheap to manufacture. Alternating one token between
+// two grid cells is a genuine change every time — the cell count never moves,
+// because reserve relocates the token rather than adding one, so neither
+// MAX_GRID_CELLS nor MAX_DEVICES_PER_CELL binds — and at the throttle's 20 per
+// 10 minutes that is 2,880 `device:` puts a day from a single address, nearly
+// three times the whole daily write allowance.
+//
+// 5 minutes caps one device at 1,440/5 = 288 writes a day. That is a mitigation,
+// not a fix: an attacker who rotates ten tokens inside one cell is back at the
+// throttle's own 2,880, so the honest bound on this term is the per-client
+// throttle, not the caps. Lowering the throttle is a captain decision and it
+// stays at 20 per 10 minutes.
+//
+// 5 rather than 10 because of what the cooldown actually costs a real user. A
+// genuine mover's new coordinates do not persist until the cooldown elapses, so
+// the cron keeps alerting them for the cell they left: the cooldown IS the
+// wrong-area alert window. Against a 20-minute lead time, 5 minutes leaves 15
+// minutes of correct warning where 10 would leave 10. The write-budget
+// difference does not decide it — neither value makes the theoretical
+// 300-record maximum fit — so the user-facing cost does.
+//
+// This must never suppress a refresh-due write. Refresh-due (renewedAt older
+// than DEVICE_RECORD_REFRESH_SECONDS) and cooling-down (renewedAt newer than
+// this) read the same field for opposite purposes, and the TTL guarantee
+// outranks the budget: writeDecision in index.ts checks refresh-due first.
+export const DEVICE_REWRITE_COOLDOWN_SECONDS = 5 * 60; // 5 minutes
 
 // ---------------------------------------------------------------------------
 // Internal subrequests per tick — the model the guardrail test asserts
@@ -290,12 +334,26 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //   `notified-*` dedup puts       <= PUSH_BUDGET_PER_INVOCATION x 144 = 4,896/day
 //                                 at the absolute worst, one per push sent.
 //   `apnsfail:` puts              <= one per rejected push, same ceiling.
+//   `device:` puts, adversarial   <= 288/day per device after
+//                                 DEVICE_REWRITE_COOLDOWN_SECONDS, and bounded
+//                                 in aggregate only by the per-client throttle
+//                                 at 20 x 144 = 2,880/day per address. Moving a
+//                                 token between two cells is a real change, so
+//                                 the skip-when-unchanged check cannot see it,
+//                                 and it adds no cell and no record, so neither
+//                                 cap sees it either. This term is why the
+//                                 header above no longer calls registration
+//                                 bounded.
 //   `activity:` puts              1 per Live Activity started.
-//   => Does NOT fit at the caps, and the binding term is not registration — it
-//      is the dedup put, one per alert actually delivered. Roughly 1,000/144
-//      ~= 7 alerts per tick sustained around the clock is the whole day's
-//      allowance, or about 20 devices alerted continuously at the 30-minute
-//      dedup interval.
+//   => Does NOT fit at the caps. Two separate terms exceed the allowance on
+//      their own: at a full 300-device fleet the dedup put does — roughly
+//      1,000/144 ~= 7 alerts per tick sustained around the clock is the whole
+//      day's allowance, about 20 devices alerted continuously at the 30-minute
+//      dedup interval — and with no fleet at all a single throttled address
+//      does, via the adversarial rewrite term above. Exhausting it means
+//      putDeviceRecord throws, so /register 500s for every real user, and
+//      notifyOnce's dedup put throws after a successful send, so a raining cell
+//      re-alerts every 10 minutes until 00:00 UTC.
 //
 // DELETES — 1,000/day, a SEPARATE allowance from writes
 //   cron reaps                    <= MAX_DEVICE_REAPS_PER_TICK x 2 x 144 = 576/day,
@@ -455,7 +513,6 @@ export async function reserveGridCell(
   }
 }
 
-/** Frees the cell slot a device holds. Every path that drops a `device:` record calls this. */
 /**
  * Queues a rejected token for deletion and drops it out of the push rotation.
  *
@@ -491,6 +548,7 @@ export async function readPendingReaps(env: Env): Promise<Set<string>> {
   }
 }
 
+/** Frees the cell slot a device holds. Every path that drops a `device:` record calls this. */
 export async function releaseGridCell(deviceToken: string, env: Env): Promise<void> {
   try {
     await coverageStub(env).fetch('https://coverage/release', {
