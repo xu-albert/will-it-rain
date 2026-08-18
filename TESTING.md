@@ -119,14 +119,27 @@ npx wrangler deploy
 
 Production KV has 5 placeholder tokens (`realtest`, `test123`, `test456`,
 `test789`, `testABC`) and 2 simulator tokens (160-hex — APNs always rejects
-those). Harmless, but they add error-log noise once rain hits their grid:
+those). They add error-log noise once rain hits their grid, and because they are
+the oldest records in KV the cron ranks their cells ahead of every real user's
+(`selectCellsWithinCap`), so at `MAX_GRID_CELLS` = 15 they can hold up to 7 of
+the 15 slots.
+
+**Delete them straight from KV — `/unregister` cannot.** That endpoint validates
+with `isValidDeviceToken` (64–128 hex characters), so all seven are rejected with
+`400 Invalid or missing token`: the placeholders are 8 characters and non-hex,
+and the simulator tokens are 160 hex characters, over the maximum.
 
 ```bash
 NS=142615e17bc84dc7adbd9e64d0b29410
-# list tokens, then for each junk one:
-curl -X DELETE https://will-it-rain.albertwxu.workers.dev/unregister \
-  -H "Content-Type: application/json" -d '{"token":"<junk-token>"}'
+
+# List what is there (NOTE the --remote):
+npx wrangler kv key list --remote --namespace-id $NS | grep '"name": "device:'
+
+# Then delete each junk one by key:
+npx wrangler kv key delete --remote --namespace-id $NS "device:realtest"
 ```
+
+`/unregister` remains the right tool for a real 64-hex device token.
 
 ## G. Registration limits (the abuse gate)
 
@@ -139,7 +152,7 @@ KV cannot count a sub-second burst.
 |---|---|---|
 | `415 unsupported_media_type` | body sent without `Content-Type: application/json` | send the header (the curls in this file all do) |
 | `429 rate_limited` + `Retry-After` | more than 20 registrations from your IP in 10 minutes | wait out `retryAfterSeconds` |
-| `503 coverage_at_capacity` | the request would open a **new** grid cell and the service already covers `MAX_GRID_CELLS` (15) | prune junk cells (section F), or re-run the subrequest arithmetic in `abuse.ts` before raising the cap |
+| `503 coverage_at_capacity` | the request would open a **new** grid cell and the service already covers `MAX_GRID_CELLS` (15) | delete junk `device:` keys from KV (section F — not `/unregister`), or re-run the subrequest arithmetic in `abuse.ts` before raising the cap |
 | `503 cell_at_capacity` | that one grid cell already holds `MAX_DEVICES_PER_CELL` (20) devices | unregister a device in that cell, or raise the cap after re-running the arithmetic |
 
 **Both 503s clear the caller's existing registration.** That is deliberate: a
@@ -153,13 +166,18 @@ cron logs `[Cron] Grid-cell cap hit` if it has to skip cells, and
 `[Cron] Push budget exhausted` if it runs out of pushes; both are `console.error`,
 so `wrangler tail` shows them.
 
-Device records expire 45 days after their last write, and the app rewrites its own
-on cold launch, on every foreground, and after every successful weather poll — so
-this only reaps records nothing is renewing. **Records written before this shipped
-had no expiry at all**, and KV cannot add one after the fact; the cron now rewrites
-up to 5 such records per tick until they all have one. That covers the section-F
-placeholder and simulator tokens too — but only 45 days after the cron reaches
-them, so prune them by hand if you want the error-log noise gone sooner.
+Device records expire 45 days after their last write, and the app re-registers on
+cold launch, on every foreground, and after every successful weather poll — so
+this only reaps records nothing is renewing. A repeat registration that changes
+nothing is **not** rewritten (it would spend the Free plan's 1,000 KV writes a day
+on nothing); a record older than 7 days is rewritten regardless, which resets the
+TTL with weeks to spare.
+
+**Records written before this shipped had no expiry at all**, and KV cannot add
+one after the fact; the cron rewrites up to 5 such records per tick until they all
+have one. The section-F placeholder and simulator tokens are included in that, so
+they will carry a TTL and expire 45 days later — delete them from KV (section F)
+if you want the slots and the error-log noise back sooner.
 
 ## Known gaps (Release 2 follow-ups)
 - Server push says "in your area" (no city name) — backend stores only lat/lon.

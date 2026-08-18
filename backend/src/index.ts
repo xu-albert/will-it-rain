@@ -19,6 +19,7 @@ import {
   secureEquals,
 } from './validate';
 import {
+  DEVICE_RECORD_REFRESH_SECONDS,
   DEVICE_RECORD_TTL_SECONDS,
   MAX_DEVICES_PER_CELL,
   MAX_DEVICE_RECORDS,
@@ -445,6 +446,35 @@ async function discardDeadActivityToken(deviceToken: string, err: unknown, env: 
 // clock, which is correct: every path that writes one is driven by a live
 // device — a registration, a Live Activity the device started, or a push it
 // accepted.
+/** The fields a `/register` body can actually change. */
+interface RegistrationSettings {
+  lat: number;
+  lon: number;
+  leadTimeMinutes: number;
+  rainStartEnabled: boolean;
+  rainEndEnabled: boolean;
+}
+
+// True when the stored record differs from what the request carries, or when it
+// is stale enough that the write is worth spending purely to reset its TTL.
+//
+// A record with no `renewedAt` always counts as due: it predates the field, so
+// there is no evidence of when it was last written and guessing young would risk
+// the very expiry this exists to prevent.
+function needsRewrite(existing: DeviceRegistration, settings: RegistrationSettings): boolean {
+  const changed =
+    existing.lat !== settings.lat ||
+    existing.lon !== settings.lon ||
+    existing.leadTimeMinutes !== settings.leadTimeMinutes ||
+    (existing.rainStartEnabled ?? true) !== settings.rainStartEnabled ||
+    (existing.rainEndEnabled ?? true) !== settings.rainEndEnabled;
+  if (changed) return true;
+
+  const renewedAt = existing.renewedAt ? Date.parse(existing.renewedAt) : Number.NaN;
+  if (Number.isNaN(renewedAt)) return true;
+  return Date.now() - renewedAt >= DEVICE_RECORD_REFRESH_SECONDS * 1000;
+}
+
 async function putDeviceRecord(
   deviceToken: string,
   registration: DeviceRegistration,
@@ -461,7 +491,8 @@ async function putDeviceRecordAtKey(
   registration: DeviceRegistration,
   env: Env
 ): Promise<void> {
-  await env.DEVICES.put(key, JSON.stringify(registration), {
+  const renewed: DeviceRegistration = { ...registration, renewedAt: new Date().toISOString() };
+  await env.DEVICES.put(key, JSON.stringify(renewed), {
     expirationTtl: DEVICE_RECORD_TTL_SECONDS,
   });
 }
@@ -658,14 +689,30 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     );
   }
 
-  const registration: DeviceRegistration = {
-    ...(existing ?? {}),
-    token: body.token,
+  const settings: RegistrationSettings = {
     lat: body.lat,
     lon: body.lon,
     leadTimeMinutes: clampLeadTimeMinutes(body.leadTimeMinutes),
     rainStartEnabled: asBoolean(body.rainStartEnabled, true),
     rainEndEnabled: asBoolean(body.rainEndEnabled, true),
+  };
+
+  // The client re-registers on cold launch, on every foreground and after every
+  // successful poll, so most of what arrives here is a byte-for-byte repeat of
+  // what is already stored. Rewriting it would spend the Free plan's 1,000 KV
+  // writes a day on nothing (see the daily allowance in abuse.ts). Skipping it
+  // is only safe because a record still gets rewritten once it is older than
+  // DEVICE_RECORD_REFRESH_SECONDS, which resets the 45-day TTL with weeks to
+  // spare — the renewal the TTL's whole safety argument rests on.
+  if (existing && !needsRewrite(existing, settings)) {
+    console.log(`[Register] Unchanged and still fresh, skipped the write for grid ${gridKey}`);
+    return json({ ok: true, gridKey });
+  }
+
+  const registration: DeviceRegistration = {
+    ...(existing ?? {}),
+    ...settings,
+    token: body.token,
     registeredAt: existing?.registeredAt ?? new Date().toISOString(),
   };
 

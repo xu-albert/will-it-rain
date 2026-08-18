@@ -18,7 +18,10 @@ export interface DeviceRegistration {
   lat: number;
   lon: number;
   leadTimeMinutes: number;
+  /** First-seen time. Never restamped — selectCellsWithinCap ranks on it. */
   registeredAt: string;
+  /** Last time this record was actually written, i.e. when its TTL was last reset. */
+  renewedAt?: string;
   rainStartEnabled?: boolean;
   rainEndEnabled?: boolean;
   activityToken?: string;

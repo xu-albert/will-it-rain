@@ -76,6 +76,10 @@ import { CoverageMap, CoverageReply, DeviceRegistration, Env, GridCell, RateRepl
 // would go over. Overrunning this bucket throws "Too many subrequests" into the
 // same per-grid catch the push budget exists to keep out of.
 //
+// The per-device and fixed halves of that count are exported below so the
+// guardrail test asserts this model rather than the readCoverage-only figure,
+// which permits roughly twice the device records the budget really allows.
+//
 // Enforcing the push budget is not optional bookkeeping. Overrunning the 50
 // makes the next fetch throw "Too many subrequests"; notifyOnce catches that
 // and hands it to recordPushFailure, which returns early for anything that is
@@ -106,11 +110,22 @@ export const MAX_DEVICE_RECORDS = MAX_GRID_CELLS * MAX_DEVICES_PER_CELL;
 // ---------------------------------------------------------------------------
 
 // The app registers on cold launch, on every foreground, at the end of every
-// successful weather poll, and on any move over 10 km, so a real user might
-// register a handful of times in ten minutes, and a household — or a block of
-// strangers sharing one carrier-NAT egress IP — several times that. 20 per 10
-// minutes leaves all of that untouched while cutting the observed attack (250
-// registrations in 0.47s from one client) off after the first 20.
+// successful weather poll, and on any move over 10 km. `/register-activity`
+// draws on the same per-IP bucket.
+//
+// 20 per 10 minutes does NOT leave all of that untouched, and it is worth being
+// plain about that rather than claiming headroom the foreground trigger spent:
+// someone who flips into the app twenty times in ten minutes will throttle
+// themselves, and a busy household or carrier-NAT block behind one egress IP
+// reaches it sooner. The limit is kept anyway because the consequence is benign
+// and self-healing — the 429 is raised by guardMutation before any stored state
+// is touched, so it changes nothing, and the next foreground simply retries.
+// The one case that is not self-healing is a brand-new user whose very first
+// registration is refused: they get no alerts until they open the app again,
+// with no UI signal, because surfacing throttle state was deliberately left out.
+//
+// Cutting the observed attack (250 registrations in 0.47s from one client) off
+// after the first 20 is what this number is for.
 export const RATE_LIMIT_WINDOW_SECONDS = 600;
 export const RATE_LIMIT_MAX_REQUESTS = 20;
 
@@ -131,6 +146,76 @@ export const DEVICE_RECORD_TTL_SECONDS = 45 * 24 * 60 * 60; // 45 days
 // supply never runs out. It does run out — every writer goes through
 // putDeviceRecord, so a migrated record is never seen again.
 export const MAX_TTL_MIGRATIONS_PER_TICK = 5;
+
+// How stale a record may get before a re-registration rewrites it even though
+// nothing in it changed. The client re-registers constantly (cold launch, every
+// foreground, every successful poll), and writing on each of those spends the
+// daily KV write allowance below on nothing. Skipping the identical write is
+// only safe because this threshold forces one through long before the 45-day
+// TTL runs out: 7 days leaves better than six refreshes of headroom.
+//
+// The freshness check reads `renewedAt`, never `registeredAt`. They are
+// different facts: `registeredAt` is first-seen and must stay first-seen,
+// because selectCellsWithinCap ranks cells by it and restamping it would let a
+// planted record outrank a live user.
+export const DEVICE_RECORD_REFRESH_SECONDS = 7 * 24 * 60 * 60; // 7 days
+
+// ---------------------------------------------------------------------------
+// Internal subrequests per tick — the model the guardrail test asserts
+// ---------------------------------------------------------------------------
+
+/** Every device record costs a readCoverage get plus a `notified-*` dedup get. */
+export const INTERNAL_SUBREQUESTS_PER_DEVICE = 2;
+
+/** The tick's device-count-independent internal traffic. */
+export const INTERNAL_SUBREQUESTS_PER_TICK_FIXED =
+  1 + MAX_TTL_MIGRATIONS_PER_TICK + 1 + PUSH_BUDGET_PER_INVOCATION;
+
+/** Free-plan internal subrequests per invocation. */
+export const INTERNAL_SUBREQUEST_CEILING = 1_000;
+
+// ---------------------------------------------------------------------------
+// The daily KV write allowance
+// ---------------------------------------------------------------------------
+
+// Separate budget, separate period: the Free plan allows **1,000 KV writes per
+// day** across the whole namespace. Everything above is per-invocation, so it
+// says nothing about this one, and this is the budget the client's
+// unconditional foreground re-registration spends fastest.
+//
+// Who writes, per day, at the caps (15 x 20 = 300 devices, 144 ticks):
+//
+//   `device:` puts, /register       ~43/day steady state. Without the
+//                                   skip-when-unchanged check below this would
+//                                   be one write per foreground per device —
+//                                   thousands. With it, an unchanged device
+//                                   writes once per DEVICE_RECORD_REFRESH_SECONDS,
+//                                   so 300/7 ~= 43, plus one per genuine change
+//                                   of coordinates or settings.
+//   `device:` puts, TTL migration   <= 5 x 144 = 720/day, but only until the
+//                                   pre-TTL records are drained; then zero.
+//   `notified-*` dedup puts         <= PUSH_BUDGET_PER_INVOCATION x 144 = 4,896/day
+//                                   at the absolute worst, one per push sent.
+//   `apnsfail:` puts                <= one per rejected push, same ceiling.
+//   rate limit / cell tally         zero. Both live in Durable Object storage,
+//                                   which is not KV.
+//
+// So the honest total does NOT fit at the caps, and the binding term is not
+// registration — it is the dedup put, one per alert actually delivered. Roughly
+// 1,000/144 ~= 7 alerts per tick sustained around the clock is the whole day's
+// allowance, or about 20 devices being alerted continuously at the 30-minute
+// dedup interval.
+//
+// That is a fleet-size ceiling, not a cap that can be tuned away here: lowering
+// MAX_DEVICES_PER_CELL does not touch it, and lowering
+// PUSH_BUDGET_PER_INVOCATION would buy the write budget by dropping alerts the
+// per-invocation budget can afford to send. The honest statement is that these
+// caps are sized for the current fleet (TESTING.md documents ~15 devices, which
+// is an order of magnitude below the crossover) and that running near
+// MAX_GRID_CELLS x MAX_DEVICES_PER_CELL in rainy weather needs the Paid plan.
+// Exceeding the allowance makes KV refuse further writes, so putDeviceRecord
+// throws and /register 500s for the rest of the day — and the 45-day TTL is only
+// safe while live installs can renew.
 
 // ---------------------------------------------------------------------------
 // Client identity

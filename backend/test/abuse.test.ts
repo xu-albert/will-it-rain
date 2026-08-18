@@ -12,8 +12,13 @@ import { describe, expect, it, beforeAll, beforeEach, vi } from 'vitest';
 import worker, { CoverageRegistry, RegistrationLimiter } from '../src/index';
 import {
   MAX_DEVICES_PER_CELL,
+  MAX_DEVICE_RECORDS,
   MAX_GRID_CELLS,
+  DEVICE_RECORD_REFRESH_SECONDS,
   DEVICE_RECORD_TTL_SECONDS,
+  INTERNAL_SUBREQUESTS_PER_DEVICE,
+  INTERNAL_SUBREQUESTS_PER_TICK_FIXED,
+  INTERNAL_SUBREQUEST_CEILING,
   PUSH_BUDGET_PER_INVOCATION,
   RATE_LIMIT_MAX_REQUESTS,
   RATE_LIMIT_WINDOW_SECONDS,
@@ -624,8 +629,15 @@ describe('the cron fan-out budget', () => {
   });
 
   it('bounds the devices one tick reads, so the internal subrequest budget holds', () => {
-    // One KV get per device record, out of the 1,000 internal subrequests.
-    expect(MAX_GRID_CELLS * MAX_DEVICES_PER_CELL).toBeLessThan(1_000);
+    // Counting only readCoverage's one get per record would permit roughly twice
+    // the devices the budget really allows: every device also pays a `notified-*`
+    // dedup get, and that read happens before the push budget is consulted, so
+    // it is charged whether or not the device is notified. At 15 x 32 the
+    // readCoverage-only figure is still 480 of 1,000 while the real tick spends
+    // 1,001 — and subrequest 1,001 throws into a per-grid catch that only logs.
+    const perTick =
+      INTERNAL_SUBREQUESTS_PER_DEVICE * MAX_DEVICE_RECORDS + INTERNAL_SUBREQUESTS_PER_TICK_FIXED;
+    expect(perTick).toBeLessThanOrEqual(INTERNAL_SUBREQUEST_CEILING);
   });
 
   it('is small enough that a full service cannot exhaust the WeatherKit quota', () => {
@@ -830,6 +842,63 @@ describe('registration records expire', () => {
     expect(ttl).toBeGreaterThan(0);
     expect(ttl).toBeLessThanOrEqual(DEVICE_RECORD_TTL_SECONDS);
     expect(ttl).toBeGreaterThan(DEVICE_RECORD_TTL_SECONDS - 60);
+  });
+
+  it('skips the write when the request repeats what is already stored', async () => {
+    await worker.fetch(registerRequest(1, { cell: 0 }), env);
+    const afterFirst = kv.puts;
+
+    // The client sends this same body on every cold launch, every foreground and
+    // after every successful poll. Writing each one would spend the day's KV
+    // allowance on nothing.
+    await worker.fetch(registerRequest(1, { cell: 0 }), env);
+    await worker.fetch(registerRequest(1, { cell: 0 }), env);
+    expect(kv.puts).toBe(afterFirst);
+  });
+
+  it('still writes when the request actually changes something', async () => {
+    await worker.fetch(registerRequest(1, { cell: 0 }), env);
+    const afterFirst = kv.puts;
+
+    await worker.fetch(registerRequest(1, { cell: 1 }), env);
+    expect(kv.puts).toBeGreaterThan(afterFirst);
+
+    const stored = JSON.parse(kv.raw(`device:${fakeToken(1)}`)!) as { lat: number };
+    expect(stored.lat).toBe(coordsForCell(1).lat);
+  });
+
+  it('never lets an active device expire, however long it re-registers unchanged', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      await worker.fetch(registerRequest(1, { cell: 0 }), env);
+
+      const key = `device:${fakeToken(1)}`;
+      const firstSeen = (JSON.parse(kv.raw(key)!) as { registeredAt: string }).registeredAt;
+
+      // A device that never moves and never changes a setting, foregrounding
+      // once a day for a year. Skipping the identical write is only safe while
+      // the staleness refresh still fires, so this fails outright — the record
+      // is simply gone from KV — if the refresh threshold is ever raised past
+      // the TTL, or if the refresh path is dropped.
+      for (let day = 1; day <= 365; day++) {
+        vi.advanceTimersByTime(24 * 60 * 60 * 1000);
+        const res = await worker.fetch(registerRequest(1, { cell: 0 }), env);
+        expect(res.status).toBe(200);
+        expect(kv.raw(key), `record expired on day ${day}`).toBeTruthy();
+        expect(kv.ttlSeconds(key)).toBeGreaterThan(0);
+      }
+
+      // And the ranking key survived every one of those rewrites: restamping it
+      // would let a planted record outrank this user.
+      expect((JSON.parse(kv.raw(key)!) as { registeredAt: string }).registeredAt).toBe(firstSeen);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refreshes well inside the TTL rather than at its edge', () => {
+    expect(DEVICE_RECORD_REFRESH_SECONDS).toBeLessThan(DEVICE_RECORD_TTL_SECONDS);
   });
 
   it('keeps the TTL when a Live Activity token is attached or cleared', async () => {
