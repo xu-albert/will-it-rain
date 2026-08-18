@@ -49,21 +49,30 @@ rescale one PNG into another size. `verify_mark.py` checks that the SwiftUI
   `MAX_DEVICES_PER_CELL` in `backend/src/abuse.ts` are derived together from that one
   budget — read the arithmetic there before touching the cron schedule, the grid
   precision, or any of the three. (The WeatherKit quota is only a cross-check now:
-  a full service uses 13% of it.)
+  a full service uses 13% of it.) Per invocation is not the only ceiling: the same
+  file counts the Free plan's *daily* allowances (100,000 KV reads, 1,000 writes,
+  1,000 deletes, 1,000 lists, plus the Durable Objects' own meters), which is what
+  sizes `MAX_TTL_MIGRATIONS_PER_TICK`, `MAX_DEVICE_REAPS_PER_TICK`,
+  `DEVICE_RECORD_REFRESH_SECONDS` and `DEVICE_REWRITE_COOLDOWN_SECONDS` — and two of
+  those daily KV buckets, writes and reads, do *not* fit at a full-fleet 15 x 20.
 - The registration endpoints are **unauthenticated by construction**: the Worker URL
   ships in the iOS binary and an APNs token cannot be verified server-side. What
   bounds abuse is the gate in `abuse.ts` — per-client throttle, global cell cap,
-  per-cell device cap, record TTL — not authentication. App Attest is the eventual
-  fix, not something in place.
+  per-cell device cap, per-invocation push budget, per-device rewrite cooldown,
+  record TTL — not authentication. App Attest is the eventual fix, not something
+  in place.
 - The gate's counters live in **Durable Objects** (`backend/src/durable.ts`), not KV:
   KV reads come from a colo-local cache with a 60-second floor, so a KV counter
   cannot see a sub-second burst. The wrangler migration must stay on
   `new_sqlite_classes` — `new_classes` is the Paid-only backend and would make the
   Worker undeployable here.
-- A `device:` record's 45-day TTL is only safe because the client genuinely renews it:
-  `ContentView` re-registers on cold launch, unconditionally on `willEnterForeground`,
-  and after every successful weather poll. Breaking any of those turns the TTL into a
-  silent alert outage on day 45.
+- A `device:` record's 45-day TTL is only safe because the client genuinely renews
+  it: `ContentView` re-registers on cold launch, on `willEnterForeground` and after
+  every successful weather poll, and `LocationService` re-registers past a 10 km
+  move. Renewal takes both halves, though — the server skips a re-registration that
+  changes nothing, so what actually resets the TTL is `DEVICE_RECORD_REFRESH_SECONDS`
+  (7 days) forcing a write through. Break either half and the TTL becomes a silent
+  alert outage on day 45.
 
 ## Maintaining this file
 

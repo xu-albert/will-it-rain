@@ -685,9 +685,9 @@ function storedActivityToken(raw: string): string | null {
 // 1,000-a-day allowance — separate from the 1,000 writes, so a delete-driven
 // amplifier cannot be reasoned about against the write budget — while a `get`
 // comes out of the 100,000-a-day read allowance. Read-then-conditional-delete
-// is therefore strictly the cheaper shape against the budget that binds here. Drain the delete allowance and
-// removeDevice throws for the rest of the day, so `/unregister` 500s and the
-// cron cannot reap dead tokens.
+// is therefore strictly the cheaper shape against the budget that binds here.
+// Drain the delete allowance and removeDevice throws for the rest of the day,
+// so `/unregister` 500s and the cron cannot reap dead tokens.
 async function clearActivityToken(deviceToken: string, env: Env): Promise<void> {
   const existing = await env.DEVICES.get(activityKey(deviceToken));
   if (existing === null) return;

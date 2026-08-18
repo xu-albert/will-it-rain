@@ -35,7 +35,13 @@ npx wrangler kv key list --remote --namespace-id $NS | grep '"name": "device:'
 
 # Inspect one:
 npx wrangler kv key get --remote "device:<paste-token>" --namespace-id $NS
-#   -> { token, lat, lon, leadTimeMinutes, rainStartEnabled, rainEndEnabled, registeredAt }
+#   -> { token, lat, lon, leadTimeMinutes, rainStartEnabled, rainEndEnabled,
+#        registeredAt, renewedAt }
+#   registeredAt is first-seen and never restamped (the cron ranks cells by it);
+#   renewedAt is the last write, i.e. when the 45-day TTL was last reset (section G).
+
+# A Live Activity push token is a key of its own, not a field on the record above:
+npx wrangler kv key get --remote "activity:<paste-token>" --namespace-id $NS
 ```
 
 ## B. Confirm YOUR device is registered
@@ -82,14 +88,19 @@ curl -X POST https://will-it-rain.albertwxu.workers.dev/test-cron \
 
 The cron no longer keeps pushing to tokens APNs has rejected:
 
-- **410 Unregistered** → the device record is deleted immediately.
+- **410 Unregistered** → the device record is deleted, but at most
+  `MAX_DEVICE_REAPS_PER_TICK` (2) devices are dropped per cron tick, because the
+  Free plan allows 1,000 KV deletes a day. Beyond that the token is queued in the
+  CoverageRegistry, skipped by the push loop so it costs no further pushes, and
+  reaped by a later tick — `[APNs] Reap budget exhausted` and
+  `[Cron] … still queued for deletion` say so in `wrangler tail`.
 - **BadDeviceToken** → a strike counter (`apnsfail:<token>`, 24h TTL). The
   device is dropped on the 5th strike. It is deliberately not 1, because a
   wrong `APNS_ENV` makes *every* device return BadDeviceToken, and a single
   bad tick must not be able to wipe the whole device list. The app re-registers
   on every foreground, so an over-eager delete heals itself.
-- A rejected **Live Activity** push clears only `activityToken`, leaving the
-  device registered for ordinary rain alerts.
+- A rejected **Live Activity** push clears only that device's `activity:` key,
+  leaving the device registered for ordinary rain alerts.
 
 ## D. Watch the Worker live
 
@@ -156,6 +167,7 @@ KV cannot count a sub-second burst.
 | `503 cell_at_capacity` | that one grid cell already holds `MAX_DEVICES_PER_CELL` (20) devices | unregister a device in that cell, or raise the cap after re-running the arithmetic |
 | `200` but `wrangler kv key get` shows the OLD lead time / toggles | a same-cell settings change inside the 5-minute rewrite cooldown | wait 5 minutes and re-send, or change the coordinates too — a cell change is never deferred |
 | `503 storage_unavailable` + `Retry-After: 60` | KV threw while reading the caller's existing record, so the write was refused rather than risk overwriting it | transient — check `wrangler tail` for the KV error; the caller's stored registration is untouched and still live |
+| `200` from `/register-activity` but the `activity:` key still shows the old `activityUpdatedAt` | the same activity token was re-submitted, and an identical token is never rewritten | expected; a new or changed token is always written immediately |
 
 **The two capacity 503s clear the caller's existing registration.** That is
 deliberate: a user who moves into an area the service cannot cover should get
