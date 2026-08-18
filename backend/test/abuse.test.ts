@@ -8,7 +8,7 @@
 // through the real fetch handler, and through the real Durable Object classes,
 // not a stub of the gate itself.
 
-import { describe, expect, it, beforeEach, vi } from 'vitest';
+import { describe, expect, it, beforeAll, beforeEach, vi } from 'vitest';
 import worker, { CoverageRegistry, RegistrationLimiter } from '../src/index';
 import {
   MAX_DEVICES_PER_CELL,
@@ -31,8 +31,22 @@ interface Harness {
   coverage: DurableObjectNamespaceMock;
 }
 
+// A throwaway P-256 key, so the cron's JWT signing actually succeeds and the
+// tick can reach a real push. With APPLE_PRIVATE_KEY empty, importKey throws
+// and every grid dies in the per-grid catch long before any push is attempted.
+let signingKey = '';
+
+beforeAll(async () => {
+  const pair = (await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, [
+    'sign',
+    'verify',
+  ])) as CryptoKeyPair;
+  const pkcs8 = (await crypto.subtle.exportKey('pkcs8', pair.privateKey)) as ArrayBuffer;
+  signingKey = btoa(String.fromCharCode(...new Uint8Array(pkcs8)));
+});
+
 function makeHarness(
-  options: { kv?: KVMock; failingDurableObjects?: boolean } = {}
+  options: { kv?: KVMock; failingDurableObjects?: boolean; signingKey?: string } = {}
 ): Harness {
   const kv = options.kv ?? new KVMock();
   const doOptions = { failing: options.failingDurableObjects };
@@ -45,7 +59,7 @@ function makeHarness(
     COVERAGE: coverage as unknown as DurableObjectNamespace,
     APPLE_TEAM_ID: 'TEAMID',
     APPLE_KEY_ID: 'KEYID',
-    APPLE_PRIVATE_KEY: '',
+    APPLE_PRIVATE_KEY: options.signingKey ?? '',
     WEATHERKIT_SERVICE_ID: 'service',
     APNS_TOPIC: 'topic',
     APNS_ENV: 'sandbox',
@@ -307,6 +321,25 @@ describe('grid-cell cap', () => {
     expect(kv.raw(`device:${fakeToken(0)}`)).toBeUndefined();
   });
 
+  it('refuses an unregistered token without spending any KV writes on it', async () => {
+    for (let n = 0; n < MAX_GRID_CELLS; n++) {
+      expect((await registerCell(n)).status).toBe(200);
+    }
+
+    // The flood case: fabricated tokens that were never registered. Refusing
+    // has to cost less than admitting, or the gate becomes a KV-delete
+    // amplifier against the Free plan's daily allowance.
+    const before = kv.deletes;
+    for (let n = 0; n < 20; n++) {
+      const refused = await worker.fetch(
+        registerRequest(600 + n, { cell: 900 + n, ip: `192.0.2.${100 + n}` }),
+        env
+      );
+      expect(refused.status).toBe(503);
+    }
+    expect(kv.deletes).toBe(before);
+  });
+
   it('refuses a new device once a single cell is full, and says which limit it hit', async () => {
     for (let n = 0; n < MAX_DEVICES_PER_CELL; n++) {
       const res = await worker.fetch(registerRequest(n, { cell: 7, ip: `192.0.2.${n}` }), env);
@@ -406,6 +439,176 @@ describe('the cron fan-out budget', () => {
     expect(budget.spend()).toBe(false);
     expect(budget.spent).toBe(3);
     expect(budget.denied).toBe(2);
+  });
+});
+
+describe('a cron tick that wants more pushes than the plan allows', () => {
+  // The scenario the cap exists for: every covered cell has rain arriving, and
+  // every device in them is due an alert. Before the budget, the tick issued a
+  // WeatherKit fetch per cell and then a push per device until the runtime threw
+  // "Too many subrequests" — which lands in a per-grid catch that only logs, so
+  // the tick reported success while an arbitrary subset of users got nothing.
+
+  /** Rain starting ~10 minutes out, dry before that: fires the rain-START path. */
+  function rainStartingSoon(now: number): unknown {
+    return {
+      forecastNextHour: {
+        minutes: Array.from({ length: 60 }, (_, i) => ({
+          startTime: new Date(now + i * 60_000).toISOString(),
+          precipitationChance: i >= 10 ? 0.9 : 0,
+          precipitationIntensity: i >= 10 ? 2 : 0,
+        })),
+      },
+    };
+  }
+
+  /** Raining now, stopping in ~10 minutes: fires the rain-END path. */
+  function rainStoppingSoon(now: number): unknown {
+    return {
+      forecastNextHour: {
+        minutes: Array.from({ length: 60 }, (_, i) => ({
+          startTime: new Date(now + i * 60_000).toISOString(),
+          precipitationChance: i < 10 ? 0.9 : 0,
+          precipitationIntensity: i < 10 ? 2 : 0,
+        })),
+      },
+    };
+  }
+
+  interface Tick {
+    weatherFetches: number;
+    pushes: number;
+    externalSubrequests: number;
+  }
+
+  /**
+   * Runs the real scheduled() handler over `cells` x `devicesPerCell` planted
+   * devices, counting every outbound request the way the Workers runtime counts
+   * external subrequests.
+   */
+  async function runCron(options: {
+    cells: number;
+    devicesPerCell: number;
+    forecast: (now: number) => unknown;
+    withActivityToken?: boolean;
+  }): Promise<Tick> {
+    const harness = makeHarness({ signingKey });
+    const now = Date.now();
+
+    let token = 0;
+    for (let cell = 0; cell < options.cells; cell++) {
+      const { lat, lon } = coordsForCell(cell);
+      for (let n = 0; n < options.devicesPerCell; n++) {
+        const deviceToken = fakeToken(token++);
+        await harness.kv.put(
+          `device:${deviceToken}`,
+          JSON.stringify({
+            token: deviceToken,
+            lat,
+            lon,
+            leadTimeMinutes: 30,
+            registeredAt: new Date(now - token * 1000).toISOString(),
+            ...(options.withActivityToken ? { activityToken: deviceToken } : {}),
+          }),
+          { expirationTtl: DEVICE_RECORD_TTL_SECONDS }
+        );
+      }
+    }
+
+    const tick: Tick = { weatherFetches: 0, pushes: 0, externalSubrequests: 0 };
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = String(input instanceof Request ? input.url : input);
+      tick.externalSubrequests += 1;
+      if (url.includes('weatherkit.apple.com')) {
+        tick.weatherFetches += 1;
+        return new Response(JSON.stringify(options.forecast(now)), { status: 200 });
+      }
+      if (url.includes('push.apple.com')) {
+        tick.pushes += 1;
+        return new Response('', { status: 200 });
+      }
+      throw new Error(`Unexpected outbound request to ${url}`);
+    });
+
+    try {
+      await worker.scheduled({} as ScheduledEvent, harness.env, {
+        waitUntil: () => {},
+        passThroughOnException: () => {},
+      } as unknown as ExecutionContext);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    return tick;
+  }
+
+  it('sends every alert it can afford and no more', async () => {
+    // 15 cells x 5 devices = 75 devices all due a rain-start alert, against a
+    // budget of 34.
+    const tick = await runCron({
+      cells: MAX_GRID_CELLS,
+      devicesPerCell: 5,
+      forecast: rainStartingSoon,
+    });
+
+    expect(tick.weatherFetches).toBe(MAX_GRID_CELLS);
+    expect(tick.pushes).toBe(PUSH_BUDGET_PER_INVOCATION);
+    // The invariant the whole cap exists to protect: one invocation, one Free
+    // plan's worth of external subrequests.
+    expect(tick.externalSubrequests).toBeLessThanOrEqual(50);
+  });
+
+  it('counts a Live Activity update against the same budget as the alert', async () => {
+    // Each device now wants two external pushes, so the budget runs out in half
+    // as many devices — and the Live Activity push has to be what stops, not the
+    // subrequest limit.
+    const tick = await runCron({
+      cells: MAX_GRID_CELLS,
+      devicesPerCell: 5,
+      forecast: rainStartingSoon,
+      withActivityToken: true,
+    });
+
+    expect(tick.pushes).toBe(PUSH_BUDGET_PER_INVOCATION);
+    expect(tick.externalSubrequests).toBeLessThanOrEqual(50);
+  });
+
+  it('holds the budget on the rain-ending path too', async () => {
+    const tick = await runCron({
+      cells: MAX_GRID_CELLS,
+      devicesPerCell: 5,
+      forecast: rainStoppingSoon,
+      withActivityToken: true,
+    });
+
+    expect(tick.pushes).toBe(PUSH_BUDGET_PER_INVOCATION);
+    expect(tick.externalSubrequests).toBeLessThanOrEqual(50);
+  });
+
+  it('says out loud how many devices it could not notify', async () => {
+    const errors: string[] = [];
+    vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(' '));
+    });
+
+    await runCron({ cells: MAX_GRID_CELLS, devicesPerCell: 5, forecast: rainStartingSoon });
+
+    // 75 devices wanted an alert, 34 got one. Exhaustion must never be silent —
+    // recordPushFailure ignores anything that is not an APNsError, so a
+    // subrequest overflow would otherwise vanish.
+    const exhausted = errors.find((line) => line.includes('Push budget exhausted'));
+    expect(exhausted).toBeDefined();
+    expect(exhausted).toContain(`dropped ${75 - PUSH_BUDGET_PER_INVOCATION}`);
+  });
+
+  it('gives every tick its own budget rather than a shared one', async () => {
+    const first = await runCron({ cells: 2, devicesPerCell: 5, forecast: rainStartingSoon });
+    const second = await runCron({ cells: 2, devicesPerCell: 5, forecast: rainStartingSoon });
+
+    // 10 devices, well under the budget: a budget carried across invocations
+    // would leave the second tick with less to spend than the first.
+    expect(first.pushes).toBe(10);
+    expect(second.pushes).toBe(first.pushes);
   });
 });
 

@@ -15,6 +15,12 @@ export function gridCenter(gridKey: string): { lat: number; lon: number } {
   return { lat, lon };
 }
 
+export interface LegacyRecord {
+  /** The KV key this was read under, so a rewrite lands on the same key. */
+  key: string;
+  device: DeviceRegistration;
+}
+
 export interface Coverage {
   grids: GridCell[];
   /**
@@ -22,7 +28,7 @@ export interface Coverage {
    * existed. KV only sets a TTL at write time, so these are immortal until
    * something rewrites them.
    */
-  legacy: DeviceRegistration[];
+  legacy: LegacyRecord[];
   /** True when the read stopped at MAX_DEVICE_RECORDS, so `grids` is not the whole picture. */
   truncated: boolean;
 }
@@ -39,7 +45,7 @@ export interface Coverage {
  */
 export async function readCoverage(env: Env): Promise<Coverage> {
   const gridMap = new Map<string, DeviceRegistration[]>();
-  const legacy: DeviceRegistration[] = [];
+  const legacy: LegacyRecord[] = [];
   let read = 0;
   let truncated = false;
 
@@ -56,7 +62,7 @@ export async function readCoverage(env: Env): Promise<Coverage> {
       const value = await env.DEVICES.get(key.name, 'json');
       if (!value) continue;
       const device = value as DeviceRegistration;
-      if (key.expiration === undefined) legacy.push(device);
+      if (key.expiration === undefined) legacy.push({ key: key.name, device });
 
       const gridKey = toGridKey(device.lat, device.lon);
       const existing = gridMap.get(gridKey) || [];

@@ -1,5 +1,5 @@
 import { Env, DeviceRegistration, GridCell, LiveActivityContentState } from './types';
-import { readCoverage, gridCenter, toGridKey } from './grid';
+import { LegacyRecord, readCoverage, gridCenter, toGridKey } from './grid';
 import { fetchForecast } from './weatherkit';
 import {
   APNsError,
@@ -369,16 +369,22 @@ export default {
 // Records written before DEVICE_RECORD_TTL_SECONDS existed carry no expiration,
 // and KV can only set one at write time — so nothing but a rewrite gives them
 // one, and until they get one they are immortal and, being the oldest, first in
-// line for every scarce cell slot. Rewriting is enough on its own: putDeviceRecord
-// stamps the TTL, and the record is then never seen here again.
-async function migrateLegacyRecords(legacy: DeviceRegistration[], env: Env): Promise<void> {
+// line for every scarce cell slot.
+//
+// The rewrite goes back to the key the record was *read* under, not to one
+// rebuilt from its `token` field. That is what makes this loop terminate by
+// construction: a record whose body disagreed with its key — hand-written,
+// truncated, missing a token — would otherwise leave the original TTL-less key
+// untouched, so it would come back every tick, consume the whole per-tick
+// migration budget forever, and write a fresh `device:undefined` each time.
+async function migrateLegacyRecords(legacy: LegacyRecord[], env: Env): Promise<void> {
   const batch = legacy.slice(0, MAX_TTL_MIGRATIONS_PER_TICK);
   if (batch.length === 0) return;
 
   let migrated = 0;
-  for (const device of batch) {
+  for (const record of batch) {
     try {
-      await putDeviceRecord(device.token, device, env);
+      await putDeviceRecordAtKey(record.key, record.device, env);
       migrated += 1;
     } catch (err) {
       console.warn(`[Cron] Could not add a TTL to a legacy device record: ${err}`);
@@ -443,7 +449,18 @@ async function putDeviceRecord(
   registration: DeviceRegistration,
   env: Env
 ): Promise<void> {
-  await env.DEVICES.put(`device:${deviceToken}`, JSON.stringify(registration), {
+  await putDeviceRecordAtKey(`device:${deviceToken}`, registration, env);
+}
+
+// The one place a `device:` record is actually written. Callers that already
+// hold the KV key — the legacy-TTL migration reads it from the listing — use
+// this directly rather than rebuilding the key from the record body.
+async function putDeviceRecordAtKey(
+  key: string,
+  registration: DeviceRegistration,
+  env: Env
+): Promise<void> {
+  await env.DEVICES.put(key, JSON.stringify(registration), {
     expirationTtl: DEVICE_RECORD_TTL_SECONDS,
   });
 }
@@ -592,14 +609,24 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
       `[Register] Refused (${cell.code}): ${cell.cells}/${MAX_GRID_CELLS} cells, ` +
         `${cell.devices}/${MAX_DEVICES_PER_CELL} devices in this cell`
     );
-    // The token is validated by this point, so we can act on it: drop whatever
-    // registration this device already had. Leaving it in place would keep
-    // pushing rain alerts for wherever the user used to be, which is worse than
-    // no alerts at all.
-    try {
-      await removeDevice(body.token, env);
-    } catch (err) {
-      console.error(`[Register] Could not clear the stale registration: ${err}`);
+    // A device that really was registered gets that registration dropped:
+    // leaving it in place would keep pushing rain alerts for wherever the user
+    // used to be, which is worse than no alerts at all.
+    //
+    // Only then, though. This is the abuse gate, so refusing has to cost us less
+    // than it costs the caller, and `removeDevice` is four KV deletes plus a
+    // round trip to the one global CoverageRegistry. Spending that on a
+    // fabricated token that was never registered — the overwhelmingly common
+    // case in a flood — would turn every refusal into an amplifier against the
+    // Free plan's daily KV write allowance. The reserve call above has already
+    // released whatever cell slot this token held, so skipping here leaks
+    // nothing.
+    if (existing) {
+      try {
+        await removeDevice(body.token, env);
+      } catch (err) {
+        console.error(`[Register] Could not clear the stale registration: ${err}`);
+      }
     }
 
     const atCell = cell.code === 'cell_at_capacity';

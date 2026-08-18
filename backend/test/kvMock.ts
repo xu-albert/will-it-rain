@@ -28,6 +28,7 @@ export class KVMock {
   private snapshot = new Map<string, Entry>();
   readonly options: KVMockOptions;
   puts = 0;
+  deletes = 0;
 
   constructor(options: KVMockOptions = {}) {
     this.options = options;
@@ -72,6 +73,9 @@ export class KVMock {
 
   async delete(key: string): Promise<void> {
     if (this.options.failing) throw new Error('KV unavailable');
+    // Counted whether or not the key existed: KV bills a delete either way, and
+    // that is exactly what makes an unconditional cleanup an amplifier.
+    this.deletes += 1;
     this.store.delete(key);
   }
 

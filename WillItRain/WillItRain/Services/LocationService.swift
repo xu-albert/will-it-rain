@@ -15,7 +15,15 @@ enum LocationError: LocalizedError {
 @MainActor
 final class LocationService: NSObject, ObservableObject {
     private let manager = CLLocationManager()
-    private var continuation: CheckedContinuation<CLLocation, Error>?
+
+    // Every caller waiting on the one in-flight `requestLocation()`. This is a
+    // list, not a single slot, because there is genuinely more than one caller:
+    // the weather poller and the foreground re-registration can both start on
+    // the same MainActor turn when the app returns from the background. A single
+    // slot let the second caller overwrite the first, and an overwritten
+    // CheckedContinuation is never resumed — the orphaned `await` hangs for the
+    // lifetime of the process.
+    private var waiters: [CheckedContinuation<CLLocation, Error>] = []
 
     @Published var locationName: String = ""
 
@@ -102,9 +110,24 @@ final class LocationService: NSObject, ObservableObject {
         }
 
         return try await withCheckedThrowingContinuation { continuation in
-            self.continuation = continuation
+            self.waiters.append(continuation)
             self.manager.delegate = self
-            self.manager.requestLocation()
+            // `requestLocation()` promises exactly one delegate callback, and
+            // that callback resumes every waiter, so a caller arriving while a
+            // request is already in flight rides along with it instead of
+            // starting a second one.
+            if self.waiters.count == 1 {
+                self.manager.requestLocation()
+            }
+        }
+    }
+
+    /// Hands one location fix — or one failure — to everyone waiting on it.
+    private func resumeWaiters(with result: Result<CLLocation, Error>) {
+        let pending = waiters
+        waiters.removeAll()
+        for continuation in pending {
+            continuation.resume(with: result)
         }
     }
 
@@ -123,9 +146,8 @@ extension LocationService: CLLocationManagerDelegate {
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let location = locations.first else { return }
         Task { @MainActor in
-            if let continuation = self.continuation {
-                continuation.resume(returning: location)
-                self.continuation = nil
+            if !self.waiters.isEmpty {
+                self.resumeWaiters(with: .success(location))
             } else if self.shouldRegister(location) {
                 // Significant location change — register with backend if moved >10km
                 let settings = NotificationSettings()
@@ -143,8 +165,7 @@ extension LocationService: CLLocationManagerDelegate {
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         Task { @MainActor in
-            continuation?.resume(throwing: error)
-            continuation = nil
+            self.resumeWaiters(with: .failure(error))
         }
     }
 }
