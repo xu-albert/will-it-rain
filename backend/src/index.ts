@@ -215,7 +215,22 @@ export default {
     // longest are the ones served — instead of letting the runtime throw "Too
     // many subrequests" into a catch that swallows it.
     const budget = createPushBudget();
-    const activityTokens = await readActivityTokens(env);
+
+    // Live Activity updates are the optional half of a tick and must never be
+    // able to take the mandatory half down with them — the same invariant the
+    // per-push catches below state. Unguarded, a `list` that throws here aborts
+    // scheduled() before a single rain alert goes out, which is the product's
+    // entire purpose. Degrade to "no Live Activity updates this tick" instead:
+    // the next tick retries, and the card keeps refreshing on-device meanwhile.
+    let activityTokens = new Map<string, string>();
+    try {
+      activityTokens = await readActivityTokens(env);
+    } catch (err) {
+      console.error(
+        `[Cron] Could not read Live Activity tokens: ${err}. Rain alerts still go out this ` +
+          `tick; no Live Activity is updated.`
+      );
+    }
 
     const processGrid = async (grid: GridCell) => {
       const { lat, lon } = gridCenter(grid.gridKey);
@@ -541,7 +556,23 @@ async function putActivityToken(
 }
 
 // Drop the stored activity token once its Live Activity has been ended.
+//
+// The read is not waste and must not be "optimised" away as one. It is the same
+// invariant removeDevice states below — a delete has to be earned by something
+// actually being there — and it is load-bearing for the same reason:
+// `/unregister-activity` is deliberately unthrottled, because a user tearing
+// down must never be told to come back later, so an unconditional delete would
+// let anyone spend one KV delete per request on a fabricated token. The
+// economics are lopsided on purpose: KV deletes come out of the Free plan's
+// 1,000-writes-a-day allowance, the same one every real registration and every
+// dedup key draws on, while a `get` comes out of the far larger read allowance.
+// Read-then-conditional-delete is therefore strictly the cheaper shape against
+// the budget that actually binds here. Drain the delete allowance and
+// removeDevice throws for the rest of the day, so `/unregister` 500s and the
+// cron cannot reap dead tokens.
 async function clearActivityToken(deviceToken: string, env: Env): Promise<void> {
+  const existing = await env.DEVICES.get(activityKey(deviceToken));
+  if (existing === null) return;
   await env.DEVICES.delete(activityKey(deviceToken));
 }
 

@@ -71,20 +71,23 @@ import { CoverageMap, CoverageReply, DeviceRegistration, Env, GridCell, RateRepl
 //        is 1 get + 1 put per strike, or 1 get + 4 deletes
 //        + 1 DO call when it reaps — 6 at most, and bounded
 //        by pushes attempted, i.e. by PUSH_BUDGET_PER_INVOCATION
-//    34  clearActivityToken, 1 delete per terminal Live
-//        Activity, likewise bounded by pushes attempted
+//    68  clearActivityToken, 1 get + 1 delete per terminal
+//        Live Activity, likewise bounded by pushes attempted.
+//        It reads before deleting so an unthrottled teardown
+//        cannot spend the daily KV delete allowance on tokens
+//        that were never registered
 //   ---
-//   280  fixed, i.e. 8 per push plus 8 that do not scale at all
+//   314  fixed, i.e. 9 per push plus 8 that do not scale at all
 //
-//   280 + 600 per-device = 880 of 1,000 at the caps.
+//   314 + 600 per-device = 914 of 1,000 at the caps.
 //
 // The activity token deliberately costs one `list` for the whole tick rather
 // than one `get` per device: it rides in the key's metadata (see
 // readActivityTokens). Reading it per-device would make this 3 per device,
 // 900 + 280 = 1,180, and would not fit.
 //
-// So the margin is roughly 12%, not the 3x that counting readCoverage alone
-// suggests, and the real ceiling is under (1,000 - 280) / 2 = 360 device
+// So the margin is roughly 9%, not the 3x that counting readCoverage alone
+// suggests, and the real ceiling is under (1,000 - 314) / 2 = 343 device
 // records — under, not at, because a tick that spends the 1,000th subrequest
 // has no room for anything this model has not thought of, and the 1,001st
 // throws "Too many subrequests" into the same per-grid catch the push budget
@@ -185,11 +188,12 @@ export const INTERNAL_SUBREQUESTS_PER_DEVICE = 2;
 /**
  * The worst case per push actually attempted: the `notified-*` dedup put, plus
  * recordPushFailure reaping a dead token (1 get + 4 deletes + 1 DO call), plus
- * a terminal Live Activity's delete. All bounded by PUSH_BUDGET_PER_INVOCATION,
- * so this is fixed traffic, not per-device — which is exactly why it belongs in
- * the term below rather than being left out of the model as happy-path-only.
+ * a terminal Live Activity's get-then-delete. All bounded by
+ * PUSH_BUDGET_PER_INVOCATION, so this is fixed traffic, not per-device — which
+ * is exactly why it belongs in the term below rather than being left out of the
+ * model as happy-path-only.
  */
-const INTERNAL_SUBREQUESTS_PER_PUSH_WORST_CASE = 8;
+const INTERNAL_SUBREQUESTS_PER_PUSH_WORST_CASE = 9;
 
 /** The tick's device-count-independent internal traffic. */
 export const INTERNAL_SUBREQUESTS_PER_TICK_FIXED =

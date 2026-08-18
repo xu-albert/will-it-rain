@@ -710,6 +710,7 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
     devicesPerCell: number;
     forecast: (now: number) => unknown;
     withActivityToken?: boolean;
+    failActivityList?: boolean;
   }): Promise<Tick> {
     const harness = makeHarness({ signingKey });
     const now = Date.now();
@@ -738,6 +739,14 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
           );
         }
       }
+    }
+
+    if (options.failActivityList) {
+      const realList = harness.kv.list.bind(harness.kv);
+      harness.kv.list = (async (listOptions?: { prefix?: string; cursor?: string }) => {
+        if (listOptions?.prefix === 'activity:') throw new Error('KV list unavailable');
+        return realList(listOptions);
+      }) as typeof harness.kv.list;
     }
 
     const tick: Tick = { weatherFetches: 0, pushes: 0, externalSubrequests: 0 };
@@ -824,6 +833,28 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
     const exhausted = errors.find((line) => line.includes('Push budget exhausted'));
     expect(exhausted).toBeDefined();
     expect(exhausted).toContain(`dropped ${75 - PUSH_BUDGET_PER_INVOCATION}`);
+  });
+
+  it('still sends rain alerts when the Live Activity tokens cannot be read', async () => {
+    const errors: string[] = [];
+    vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(' '));
+    });
+
+    // Every device here holds a Live Activity, so with the list working this
+    // tick would spend its whole budget two pushes at a time. The list throws
+    // instead: the Live Activity updates are what must be lost, not the alerts.
+    const tick = await runCron({
+      cells: 2,
+      devicesPerCell: 3,
+      forecast: rainStartingSoon,
+      withActivityToken: true,
+      failActivityList: true,
+    });
+
+    expect(tick.weatherFetches).toBe(2);
+    expect(tick.pushes).toBe(6);
+    expect(errors.some((line) => line.includes('Could not read Live Activity tokens'))).toBe(true);
   });
 
   it('gives every tick its own budget rather than a shared one', async () => {
@@ -962,6 +993,44 @@ describe('registration records expire', () => {
     expect(detach.status).toBe(200);
     expect(kv.ttlSeconds(`device:${fakeToken(1)}`)).toBeGreaterThan(0);
     expect(kv.raw(`activity:${fakeToken(1)}`)).toBeUndefined();
+  });
+
+  it('charges no KV delete to tear down a Live Activity that was never registered', async () => {
+    // `/unregister-activity` is deliberately unthrottled, so nothing else bounds
+    // how often a fabricated token can reach it. A delete costs the Free plan's
+    // 1,000-a-day write allowance — the same one every real registration draws
+    // on — so a teardown has to be free until there is something to tear down.
+    const detach = (n: number) =>
+      worker.fetch(
+        new Request('https://worker.test/unregister-activity', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.7' },
+          body: JSON.stringify({ token: fakeToken(n) }),
+        }),
+        env
+      );
+
+    const before = kv.deletes;
+    for (let n = 0; n < 50; n++) {
+      expect((await detach(1_000 + n)).status).toBe(200);
+    }
+    expect(kv.deletes).toBe(before);
+
+    // And a device that really does hold one still gets it removed.
+    await worker.fetch(registerRequest(1), env);
+    await worker.fetch(
+      new Request('https://worker.test/register-activity', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.7' },
+        body: JSON.stringify({ token: fakeToken(1), activityToken: fakeToken(2) }),
+      }),
+      env
+    );
+    expect(kv.raw(`activity:${fakeToken(1)}`)).toBeDefined();
+
+    expect((await detach(1)).status).toBe(200);
+    expect(kv.raw(`activity:${fakeToken(1)}`)).toBeUndefined();
+    expect(kv.deletes).toBe(before + 1);
   });
 
   it('gives pre-TTL records an expiry the next time the cron sees them', async () => {
