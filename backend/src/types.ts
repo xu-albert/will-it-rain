@@ -1,5 +1,9 @@
 export interface Env {
   DEVICES: KVNamespace;
+  /** Per-client registration throttle. One instance per hashed client address. */
+  REGISTRATION_LIMITER: DurableObjectNamespace;
+  /** The authoritative grid-cell / per-cell-device tally. One global instance. */
+  COVERAGE: DurableObjectNamespace;
   APPLE_TEAM_ID: string;
   APPLE_KEY_ID: string;
   APPLE_PRIVATE_KEY: string;
@@ -24,6 +28,25 @@ export interface DeviceRegistration {
 export interface GridCell {
   gridKey: string;
   devices: DeviceRegistration[];
+}
+
+/** Grid key -> the device tokens registered in it. The CoverageRegistry's whole state. */
+export type CoverageMap = Record<string, string[]>;
+
+export interface RateReply {
+  ok: boolean;
+  /** Seconds until the caller's window rolls over. Only meaningful when !ok. */
+  retryAfterSeconds: number;
+}
+
+export interface CoverageReply {
+  ok: boolean;
+  /** Which cap was hit. Only present when !ok. */
+  code?: 'coverage_at_capacity' | 'cell_at_capacity';
+  /** Distinct cells currently covered. */
+  cells: number;
+  /** Devices in the requested cell. */
+  devices: number;
 }
 
 export interface WeatherKitForecast {

@@ -7,87 +7,108 @@
 // coordinate, and every one of those coordinates became a permanent line item
 // in the cron's WeatherKit fan-out.
 //
-// Two independent limits close that, and they are deliberately different in
-// kind:
+// Three limits close that, and they are deliberately different in kind:
 //
 //   1. A per-client throttle bounds how fast anyone can register at all.
-//   2. A hard ceiling on distinct grid cells bounds what registrations can
-//      ever cost, no matter how many clients cooperate. The throttle can be
-//      spread across a botnet; the cell cap cannot.
+//   2. Hard ceilings on distinct grid cells, and on devices inside one cell,
+//      bound what registrations can ever cost, no matter how many clients
+//      cooperate. The throttle can be spread across a botnet; the caps cannot.
+//   3. A per-invocation push budget bounds what one cron tick can spend, so the
+//      headroom the caps leave is real rather than notional.
 //
-// Neither one authenticates anybody. Making fabricated tokens impossible needs
+// The first two are counted in Durable Objects (durable.ts) rather than KV,
+// because KV cannot count a burst: its reads come from a colo-local cache with
+// a 60-second floor, so every request in a sub-second flood reads the same
+// pre-flood value.
+//
+// None of this authenticates anybody. Making fabricated tokens impossible needs
 // App Attest (see the security review's item 9); this is the bound that holds
 // until then.
 
-import { Env, GridCell } from './types';
+import { CoverageMap, CoverageReply, Env, GridCell, RateReply } from './types';
 
 // ---------------------------------------------------------------------------
-// The cell cap
+// The fan-out budget
 // ---------------------------------------------------------------------------
 
-// Hard ceiling on the number of distinct ~1.1 km grid cells this service will
-// ever fetch weather for. It is the smaller of two independent ceilings:
+// This Worker runs on the Cloudflare Workers FREE plan, which allows **50
+// external subrequests per invocation** — one shared pool for everything the
+// cron does over the network. Durable Object calls and KV operations are
+// INTERNAL subrequests and come out of a separate 1,000-per-invocation bucket,
+// so they must not be counted against the 50.
 //
-//   1. WeatherKit quota. The cron is `*/10 * * * *` (wrangler.toml), so it
-//      fires 144 times a day = 144 x 30.44 ~= 4,383 times a month, and issues
-//      exactly one WeatherKit fetch per distinct cell per tick. Apple's
-//      Developer Program includes 500,000 calls/month, so the quota alone
-//      allows 500,000 / 4,383 ~= 114 cells - and that allotment is shared with
-//      every on-device WeatherKit call the app itself makes.
+// One cron tick spends, out of that 50:
 //
-//   2. Workers subrequest limit. One Worker invocation may make 50 external
-//      subrequests on the Free plan, and the cron fans out one fetch per cell
-//      inside a single invocation, so the 51st cell breaks the cron outright.
-//      (The Paid plan raises this to 10,000; we do not assume Paid, and this
-//      number is correct under either.)
+//   * 1 WeatherKit fetch per distinct grid cell            (weatherkit.ts)
+//   * up to 2 pushes per notified device — the rain alert,
+//     plus a Live Activity update when the device has an
+//     activityToken                                        (apns.ts)
 //
-// 50 is the Free-plan-safe figure. At 50 cells the cron costs
-// 50 x 4,383 = 219,150 WeatherKit calls/month - 44% of the allotment - leaving
-// the rest for the app's own foreground forecasts.
+// so the ceiling on cells and the ceiling on pushes have to be chosen together:
 //
-// Raising this is a deliberate act: check the Workers plan first (a value above
-// 50 requires Paid) and re-run the quota arithmetic above.
-export const MAX_GRID_CELLS = 50;
+//   MAX_GRID_CELLS             = 15 -> 15 external fetches, leaving 35 of the 50
+//   PUSH_BUDGET_PER_INVOCATION = 34 -> 17 notified devices at 2 pushes each, +1
+//                                      spare
+//   MAX_DEVICES_PER_CELL       = 20 -> at most 15 x 20 = 300 device records, so
+//                                      300 internal KV gets in readCoverage,
+//                                      comfortably under the 1,000 internal
+//                                      ceiling
+//
+// Enforcing the push budget is not optional bookkeeping. Overrunning the 50
+// makes the next fetch throw "Too many subrequests"; notifyOnce catches that
+// and hands it to recordPushFailure, which returns early for anything that is
+// not an APNsError — so the overrun would be swallowed, the tick would report
+// success, and alerts would stop for an arbitrary, scheduling-order-dependent
+// subset of users. createPushBudget below refuses deterministically instead,
+// oldest cell first, and says so with console.error.
+//
+// WeatherKit quota cross-check — informative, not the binding constraint: the
+// cron is `*/10 * * * *` (wrangler.toml), so it fires 144 times a day = 144 x
+// 30.44 ~= 4,383 times a month, and 15 cells x 4,383 = 65,745 calls/month, 13%
+// of the 500,000 Apple's Developer Program includes. The rest is left for the
+// app's own on-device forecasts.
+//
+// The cap is set by the Free-plan subrequest budget, NOT by the WeatherKit
+// quota. Raising it means moving to the Workers Paid plan — which raises the
+// external subrequest limit to 1,000 per invocation — and re-running every line
+// of arithmetic above.
+export const MAX_GRID_CELLS = 15;
+export const PUSH_BUDGET_PER_INVOCATION = 34;
+export const MAX_DEVICES_PER_CELL = 20;
+
+/** The most `device:` records one cron tick will read, = MAX_GRID_CELLS x MAX_DEVICES_PER_CELL. */
+export const MAX_DEVICE_RECORDS = MAX_GRID_CELLS * MAX_DEVICES_PER_CELL;
 
 // ---------------------------------------------------------------------------
 // The registration throttle
 // ---------------------------------------------------------------------------
 
-// The app re-registers on every foreground and on any move over 10 km
-// (LocationService.swift), so a real user might register a handful of times in
-// ten minutes, and a household - or a block of strangers sharing one
-// carrier-NAT egress IP - several times that. 20 per 10 minutes leaves all of
-// that untouched while cutting the observed attack (250 registrations in 0.47s
-// from one client) off after the first 20.
+// The app registers on cold launch, on every foreground, at the end of every
+// successful weather poll, and on any move over 10 km, so a real user might
+// register a handful of times in ten minutes, and a household — or a block of
+// strangers sharing one carrier-NAT egress IP — several times that. 20 per 10
+// minutes leaves all of that untouched while cutting the observed attack (250
+// registrations in 0.47s from one client) off after the first 20.
 export const RATE_LIMIT_WINDOW_SECONDS = 600;
 export const RATE_LIMIT_MAX_REQUESTS = 20;
 
-// How long a `device:` record survives without being refreshed. The app
-// re-registers on foreground and on any significant move, so a live install
-// renews its own record continuously; a fabricated one, which nothing ever
-// refreshes, evaporates. Before this existed the only pruning path was a push
-// failure, which never fires for a coordinate where it never rains - which is
-// why planted registrations used to be permanent.
+// How long a `device:` record survives without being refreshed. Renewal is not
+// incidental: ContentView re-registers on cold launch, unconditionally on
+// willEnterForeground, and after every successful weather poll, and
+// LocationService re-registers on any move over 10 km — so a live install
+// rewrites its own record long before 45 days pass, while a fabricated one,
+// which nothing ever refreshes, evaporates. Before this existed the only
+// pruning path was a push failure, which never fires for a coordinate where it
+// never rains — which is why planted registrations used to be permanent.
 export const DEVICE_RECORD_TTL_SECONDS = 45 * 24 * 60 * 60; // 45 days
 
-// KV's minimum accepted expirationTtl.
-const MIN_KV_TTL_SECONDS = 60;
-
-const RATE_LIMIT_PREFIX = 'ratelimit:';
-const CELL_MARKER_PREFIX = 'gridcell:';
-const CELL_COUNT_KEY = 'gridcells:count';
-
-export interface RateDecision {
-  ok: boolean;
-  /** Seconds until the caller's window rolls over. Only meaningful when !ok. */
-  retryAfterSeconds: number;
-}
-
-export interface CellDecision {
-  ok: boolean;
-  /** Distinct cells currently accounted for. Only meaningful when !ok. */
-  cells: number;
-}
+// Records written before the TTL existed carry no expiration and KV cannot add
+// one after the fact, so the cron rewrites them as it meets them. Bounded per
+// tick because the Free plan allows 1,000 KV writes a day and this shares that
+// budget: 5 x 144 ticks = 720/day even in the pathological case where the
+// supply never runs out. It does run out — every writer goes through
+// putDeviceRecord, so a migrated record is never seen again.
+export const MAX_TTL_MIGRATIONS_PER_TICK = 5;
 
 // ---------------------------------------------------------------------------
 // Client identity
@@ -101,9 +122,10 @@ function clientAddress(request: Request): string {
   return request.headers.get('CF-Connecting-IP') ?? 'unknown';
 }
 
-// The address is hashed before it becomes a KV key so that a rate-limit key is
-// not a short-lived log of who talked to us. This is bookkeeping hygiene, not
-// anonymisation: the IPv4 space is small enough to brute-force a hash.
+// The address is hashed before it names a Durable Object so that the instance
+// name is not a short-lived log of who talked to us. This is bookkeeping
+// hygiene, not anonymisation: the IPv4 space is small enough to brute-force a
+// hash.
 async function clientBucket(request: Request): Promise<string> {
   const digest = await crypto.subtle.digest(
     'SHA-256',
@@ -115,143 +137,162 @@ async function clientBucket(request: Request): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// In-isolate burst counter
-// ---------------------------------------------------------------------------
-
-// KV reads are served from a colo-local cache with a 60-second floor, so a
-// burst can out-run the durable counter below: every request in a
-// half-second flood may read the same stale value and conclude it is the
-// first. The isolate serving that flood, on the other hand, sees every request
-// synchronously.
-//
-// So this counter sits in *front* of the KV counter rather than replacing it.
-// It is explicitly best-effort - per-isolate, lost on eviction, invisible to
-// other colos - and it is not the thing that makes the system safe on its own.
-// It exists because it is precisely, and only, good at the case KV is
-// precisely, and only, bad at.
-const burstCounts = new Map<string, number>();
-let burstWindow = -1;
-
-// Bound on distinct clients tracked in one window, so a rotating-source flood
-// cannot grow this map without limit. Overflow drops the map and starts again:
-// the KV counter still holds.
-const MAX_TRACKED_CLIENTS = 10_000;
-
-function countBurst(bucket: string, window: number): number {
-  if (window !== burstWindow || burstCounts.size >= MAX_TRACKED_CLIENTS) {
-    burstCounts.clear();
-    burstWindow = window;
-  }
-  const next = (burstCounts.get(bucket) ?? 0) + 1;
-  burstCounts.set(bucket, next);
-  return next;
-}
-
-/** Test seam: drop the in-isolate burst state. */
-export function resetBurstCounter(): void {
-  burstCounts.clear();
-  burstWindow = -1;
-}
-
-// ---------------------------------------------------------------------------
 // Rate limit
 // ---------------------------------------------------------------------------
 
 export async function checkRegistrationRate(request: Request, env: Env): Promise<RateDecision> {
-  const now = Date.now();
-  const windowMs = RATE_LIMIT_WINDOW_SECONDS * 1000;
-  const window = Math.floor(now / windowMs);
-  const retryAfterSeconds = Math.max(1, Math.ceil(((window + 1) * windowMs - now) / 1000));
-
   const bucket = await clientBucket(request);
-  const key = `${RATE_LIMIT_PREFIX}${bucket}:${window}`;
-
-  if (countBurst(key, window) > RATE_LIMIT_MAX_REQUESTS) {
-    return { ok: false, retryAfterSeconds };
-  }
 
   try {
-    const seen = parseInt((await env.DEVICES.get(key)) ?? '0', 10) || 0;
-    if (seen >= RATE_LIMIT_MAX_REQUESTS) {
-      return { ok: false, retryAfterSeconds };
-    }
-    await env.DEVICES.put(key, String(seen + 1), {
-      expirationTtl: RATE_LIMIT_WINDOW_SECONDS + MIN_KV_TTL_SECONDS,
+    const stub = env.REGISTRATION_LIMITER.get(env.REGISTRATION_LIMITER.idFromName(bucket));
+    const response = await stub.fetch('https://limiter/check', {
+      method: 'POST',
+      body: JSON.stringify({
+        windowSeconds: RATE_LIMIT_WINDOW_SECONDS,
+        maxRequests: RATE_LIMIT_MAX_REQUESTS,
+      }),
+    });
+    return (await response.json()) as RateReply;
+  } catch (err) {
+    // An infrastructure blip must not lock every real user out of registering.
+    // Failing open here cannot uncap the expensive thing: the coverage registry
+    // is a separate object, and selectCellsWithinCap bounds the cron's fan-out
+    // no matter what the registration side let through.
+    console.warn(`[Abuse] Rate-limit bookkeeping failed, allowing request: ${err}`);
+    return { ok: true, retryAfterSeconds: 0 };
+  }
+}
+
+export type RateDecision = RateReply;
+export type CellDecision = CoverageReply;
+
+// ---------------------------------------------------------------------------
+// Coverage caps
+// ---------------------------------------------------------------------------
+
+/**
+ * Admits a device into `gridKey`, enforcing MAX_GRID_CELLS and
+ * MAX_DEVICES_PER_CELL against the strongly consistent tally in
+ * CoverageRegistry.
+ *
+ * A device already registered in that cell is always admitted — existing users
+ * can re-register, move within their cell, or change their lead time even once
+ * the service is full. Only a device that is new to a full cell, or that would
+ * open a cell beyond the global cap (and so add ~4,383 WeatherKit calls a
+ * month, forever), is turned away.
+ */
+export async function reserveGridCell(
+  gridKey: string,
+  deviceToken: string,
+  env: Env
+): Promise<CellDecision> {
+  try {
+    const response = await coverageStub(env).fetch('https://coverage/reserve', {
+      method: 'POST',
+      body: JSON.stringify({
+        gridKey,
+        deviceToken,
+        maxCells: MAX_GRID_CELLS,
+        maxDevicesPerCell: MAX_DEVICES_PER_CELL,
+      }),
+    });
+    return (await response.json()) as CoverageReply;
+  } catch (err) {
+    // As with the throttle: prefer a working service over a strictly-accounted
+    // one. selectCellsWithinCap is what actually protects the quota.
+    console.warn(`[Abuse] Grid-cell bookkeeping failed, allowing registration: ${err}`);
+    return { ok: true, cells: 0, devices: 0 };
+  }
+}
+
+/** Frees the cell slot a device holds. Every path that drops a `device:` record calls this. */
+export async function releaseGridCell(deviceToken: string, env: Env): Promise<void> {
+  try {
+    await coverageStub(env).fetch('https://coverage/release', {
+      method: 'POST',
+      body: JSON.stringify({ deviceToken }),
     });
   } catch (err) {
-    // A KV blip must not lock every real user out of registering. Failing open
-    // here cannot reopen the flood hole, because the burst counter above has
-    // already run and does not touch KV.
-    console.warn(`[Abuse] Rate-limit bookkeeping failed, allowing request: ${err}`);
+    console.warn(`[Abuse] Could not release grid-cell slot: ${err}`);
   }
-
-  return { ok: true, retryAfterSeconds: 0 };
 }
 
-// ---------------------------------------------------------------------------
-// Cell cap
-// ---------------------------------------------------------------------------
-
 /**
- * Admits a registration into `gridKey`, enforcing MAX_GRID_CELLS.
+ * Truth-up: hands the registry what KV actually holds, once per cron tick.
  *
- * A cell that is already tracked is always admitted - existing users can always
- * re-register, move within their cell, or change their lead time, even once the
- * service is full. Only a registration that would open a *new* cell, and so add
- * ~4,383 WeatherKit calls a month, can be turned away.
+ * Device records expire on their own TTL and nothing tells the registry, so
+ * without this the tally would only ever grow and would eventually refuse real
+ * users on behalf of cells that no longer exist.
  */
-export async function reserveGridCell(gridKey: string, env: Env): Promise<CellDecision> {
-  const markerKey = `${CELL_MARKER_PREFIX}${gridKey}`;
+export async function reconcileCoverage(grids: GridCell[], env: Env): Promise<void> {
+  const coverage: CoverageMap = {};
+  for (const grid of grids) {
+    coverage[grid.gridKey] = grid.devices.map((device) => device.token);
+  }
 
-  let cells = 0;
   try {
-    const [marker, counted] = await Promise.all([
-      env.DEVICES.get(markerKey),
-      env.DEVICES.get(CELL_COUNT_KEY),
-    ]);
-    cells = parseInt(counted ?? '0', 10) || 0;
+    await coverageStub(env).fetch('https://coverage/reconcile', {
+      method: 'POST',
+      body: JSON.stringify({ coverage }),
+    });
+  } catch (err) {
+    console.warn(`[Abuse] Could not reconcile grid-cell coverage: ${err}`);
+  }
+}
 
-    if (marker === null) {
-      if (cells >= MAX_GRID_CELLS) {
-        return { ok: false, cells };
+function coverageStub(env: Env): DurableObjectStub {
+  return env.COVERAGE.get(env.COVERAGE.idFromName('global'));
+}
+
+// ---------------------------------------------------------------------------
+// Push budget
+// ---------------------------------------------------------------------------
+
+export interface PushBudget {
+  /** Claims one external push. False means the budget is gone and nothing was sent. */
+  spend(): boolean;
+  /** Pushes claimed so far. */
+  readonly spent: number;
+  /** Pushes refused because the budget was exhausted. */
+  readonly denied: number;
+}
+
+export function createPushBudget(limit = PUSH_BUDGET_PER_INVOCATION): PushBudget {
+  let spent = 0;
+  let denied = 0;
+  return {
+    spend(): boolean {
+      if (spent >= limit) {
+        denied += 1;
+        return false;
       }
-      // Marker and count are two writes and cannot be atomic; the cron
-      // recomputes the true count from KV every tick (recordGridCellCount), so
-      // any drift from concurrent registrations self-corrects within 10
-      // minutes, and selectCellsWithinCap enforces the cap absolutely in the
-      // meantime.
-      await env.DEVICES.put(CELL_COUNT_KEY, String(cells + 1));
-    }
-
-    // The marker's lifetime tracks the registration's, so a cell whose devices
-    // have all expired stops being remembered at roughly the same time.
-    await env.DEVICES.put(markerKey, '1', { expirationTtl: DEVICE_RECORD_TTL_SECONDS });
-  } catch (err) {
-    // As above: prefer a working service over a strictly-accounted one. The
-    // cron-side cap is what actually protects the quota.
-    console.warn(`[Abuse] Grid-cell bookkeeping failed, allowing registration: ${err}`);
-  }
-
-  return { ok: true, cells };
+      spent += 1;
+      return true;
+    },
+    get spent() {
+      return spent;
+    },
+    get denied() {
+      return denied;
+    },
+  };
 }
 
-/** Publishes the authoritative distinct-cell count for reserveGridCell to budget against. */
-export async function recordGridCellCount(cells: number, env: Env): Promise<void> {
-  try {
-    await env.DEVICES.put(CELL_COUNT_KEY, String(cells));
-  } catch (err) {
-    console.warn(`[Abuse] Could not record grid-cell count: ${err}`);
-  }
-}
+// ---------------------------------------------------------------------------
+// Cron-side cap
+// ---------------------------------------------------------------------------
 
 /**
- * The cap's last line of defence: whatever ends up in KV, the cron never fans
- * out to more than MAX_GRID_CELLS cells in one invocation. This is what makes
- * the Free plan's 50-subrequest ceiling unreachable even if the registration
- * side is raced, mis-counted, or bypassed entirely.
+ * The caps' last line of defence: whatever ends up in KV, the cron never fans
+ * out to more than MAX_GRID_CELLS cells in one invocation. This is what keeps
+ * the Free plan's external-subrequest ceiling out of reach even if the
+ * registration side is raced, mis-counted, or bypassed entirely.
  *
  * Cells are kept oldest-registration-first, so a flood of new coordinates
- * cannot displace the users who were already here.
+ * cannot displace the users who were already here. That ordering is only
+ * truthful because handleRegister preserves a device's original `registeredAt`
+ * across re-registrations — restamping it would invert this ranking, handing
+ * every slot to whoever registered least recently.
  */
 export function selectCellsWithinCap(grids: GridCell[]): { cells: GridCell[]; skipped: number } {
   if (grids.length <= MAX_GRID_CELLS) return { cells: grids, skipped: 0 };
@@ -262,10 +303,16 @@ export function selectCellsWithinCap(grids: GridCell[]): { cells: GridCell[]; sk
       '9999'
     );
 
-  const ranked = [...grids].sort((a, b) => {
-    const byAge = oldest(a).localeCompare(oldest(b));
-    return byAge !== 0 ? byAge : a.gridKey.localeCompare(b.gridKey);
-  });
+  // Decorate-sort-undecorate: `oldest` is a full pass over a cell's devices, and
+  // a comparator runs O(n log n) times.
+  const ranked = grids
+    .map((cell) => ({ cell, oldest: oldest(cell) }))
+    .sort((a, b) => {
+      if (a.oldest !== b.oldest) return a.oldest < b.oldest ? -1 : 1;
+      if (a.cell.gridKey === b.cell.gridKey) return 0;
+      return a.cell.gridKey < b.cell.gridKey ? -1 : 1;
+    })
+    .map((entry) => entry.cell);
 
   return { cells: ranked.slice(0, MAX_GRID_CELLS), skipped: grids.length - MAX_GRID_CELLS };
 }

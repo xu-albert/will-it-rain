@@ -1,5 +1,5 @@
-import { Env, DeviceRegistration, LiveActivityContentState } from './types';
-import { getDevicesByGrid, gridCenter, toGridKey } from './grid';
+import { Env, DeviceRegistration, GridCell, LiveActivityContentState } from './types';
+import { readCoverage, gridCenter, toGridKey } from './grid';
 import { fetchForecast } from './weatherkit';
 import {
   APNsError,
@@ -20,12 +20,22 @@ import {
 } from './validate';
 import {
   DEVICE_RECORD_TTL_SECONDS,
+  MAX_DEVICES_PER_CELL,
+  MAX_DEVICE_RECORDS,
   MAX_GRID_CELLS,
+  MAX_TTL_MIGRATIONS_PER_TICK,
+  PUSH_BUDGET_PER_INVOCATION,
   checkRegistrationRate,
-  recordGridCellCount,
+  createPushBudget,
+  reconcileCoverage,
+  releaseGridCell,
   reserveGridCell,
   selectCellsWithinCap,
 } from './abuse';
+
+// The Durable Objects that hold the gate's counters. Exported here because
+// wrangler resolves class_name bindings against this module (see wrangler.toml).
+export { RegistrationLimiter, CoverageRegistry } from './durable';
 
 // Live Activity segment math is normalized over this window, matching the widget's ring.
 const ACTIVITY_WINDOW_MINUTES = 90;
@@ -162,26 +172,42 @@ export default {
 
   // Cron trigger: check weather for all registered devices
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    const allGrids = await getDevicesByGrid(env);
+    const coverage = await readCoverage(env);
+    if (coverage.truncated) {
+      console.error(
+        `[Cron] Stopped reading device records at MAX_DEVICE_RECORDS=${MAX_DEVICE_RECORDS}; ` +
+          `KV holds more than the registration caps allow, so this tick sees only part of the fleet.`
+      );
+    }
 
-    // Publish the true distinct-cell count so /register budgets against
-    // reality rather than against a counter that has drifted.
-    await recordGridCellCount(allGrids.length, env);
+    await migrateLegacyRecords(coverage.legacy, env);
+
+    // Hand the registry what KV actually holds, so its tally cannot drift as
+    // records expire. Skipped after a truncated read: a partial picture must
+    // never be written back as the truth.
+    if (!coverage.truncated) await reconcileCoverage(coverage.grids, env);
 
     // One WeatherKit fetch per cell, all inside this one invocation: without a
-    // ceiling here, enough registrations exhaust the monthly quota and, on the
-    // Free plan, blow the 50-subrequest limit and take the whole tick down.
-    const { cells: grids, skipped } = selectCellsWithinCap(allGrids);
+    // ceiling here, enough registrations exhaust the Free plan's external
+    // subrequest budget and take the whole tick down.
+    const { cells: grids, skipped } = selectCellsWithinCap(coverage.grids);
     if (skipped > 0) {
       console.error(
-        `[Cron] Grid-cell cap hit: serving the ${grids.length} oldest of ${allGrids.length} cells, ` +
+        `[Cron] Grid-cell cap hit: serving the ${grids.length} oldest of ${coverage.grids.length} cells, ` +
           `skipping ${skipped}. Cap is MAX_GRID_CELLS=${MAX_GRID_CELLS}; raising it needs the ` +
-          `quota arithmetic in abuse.ts re-run and a Paid Workers plan above 50.`
+          `subrequest arithmetic in abuse.ts re-run and the Workers Paid plan.`
       );
     }
     console.log(`[Cron] Processing ${grids.length} grid cells`);
 
-    const promises = grids.map(async (grid) => {
+    // Every push below is an external subrequest out of the same 50 the
+    // WeatherKit fetches come from. The budget makes exhaustion deterministic —
+    // cells are already ordered oldest-first, and this loop is sequential, so
+    // the users who were here longest are the ones served — instead of letting
+    // the runtime throw "Too many subrequests" into a catch that swallows it.
+    const budget = createPushBudget();
+
+    const processGrid = async (grid: GridCell) => {
       const { lat, lon } = gridCenter(grid.gridKey);
       try {
         const forecast = await fetchForecast(lat, lon, env);
@@ -209,6 +235,9 @@ export default {
           const metaKey = `notified-${kind}:${device.token}`;
           const lastNotified = await env.DEVICES.get(metaKey);
           if (lastNotified && now - parseInt(lastNotified) < 30 * 60 * 1000) return;
+          // Claimed after the dedup check, so a push we were never going to
+          // send does not spend budget a later device could have used.
+          if (!budget.spend()) return;
           try {
             await send();
             await env.DEVICES.put(metaKey, now.toString(), { expirationTtl: 3600 });
@@ -230,7 +259,7 @@ export default {
               // Live Activity: rain incoming (State A). Only relevant within the same
               // lead-time window as the alert above; a push failure here must never
               // break the alert-push loop.
-              if (device.activityToken) {
+              if (device.activityToken && budget.spend()) {
                 try {
                   const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
                   const contentState: LiveActivityContentState = {
@@ -270,7 +299,7 @@ export default {
             // raining (State B), independent of the alert's 30-min/dedup gate above.
             // Once the dry minute actually arrives, send the terminal state and drop
             // the activity token — a push failure here must never break the alert loop.
-            if (device.activityToken) {
+            if (device.activityToken && budget.spend()) {
               try {
                 if (minutesUntilEnd > 0) {
                   const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
@@ -320,11 +349,46 @@ export default {
       } catch (err) {
         console.error(`[Cron] Failed to fetch weather for grid ${grid.gridKey}: ${err}`);
       }
-    });
+    };
 
-    await Promise.all(promises);
+    for (const grid of grids) {
+      await processGrid(grid);
+    }
+
+    if (budget.denied > 0) {
+      console.error(
+        `[Cron] Push budget exhausted: sent ${budget.spent} of the ` +
+          `PUSH_BUDGET_PER_INVOCATION=${PUSH_BUDGET_PER_INVOCATION} external pushes this tick and ` +
+          `dropped ${budget.denied}. Those devices were NOT notified. See the subrequest arithmetic ` +
+          `in abuse.ts before raising either the budget or MAX_GRID_CELLS.`
+      );
+    }
   },
 };
+
+// Records written before DEVICE_RECORD_TTL_SECONDS existed carry no expiration,
+// and KV can only set one at write time — so nothing but a rewrite gives them
+// one, and until they get one they are immortal and, being the oldest, first in
+// line for every scarce cell slot. Rewriting is enough on its own: putDeviceRecord
+// stamps the TTL, and the record is then never seen here again.
+async function migrateLegacyRecords(legacy: DeviceRegistration[], env: Env): Promise<void> {
+  const batch = legacy.slice(0, MAX_TTL_MIGRATIONS_PER_TICK);
+  if (batch.length === 0) return;
+
+  let migrated = 0;
+  for (const device of batch) {
+    try {
+      await putDeviceRecord(device.token, device, env);
+      migrated += 1;
+    } catch (err) {
+      console.warn(`[Cron] Could not add a TTL to a legacy device record: ${err}`);
+    }
+  }
+
+  console.log(
+    `[Cron] Gave ${migrated} pre-TTL device record(s) an expiry; ${legacy.length - batch.length} still to go.`
+  );
+}
 
 // Collapse the minute-by-minute forecast into contiguous wet stretches, normalized
 // to 0...1 fractions of `windowMinutes` — this is what the Live Activity ring/bar
@@ -490,22 +554,67 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
 
   const gridKey = toGridKey(body.lat, body.lon);
 
+  // Read before write. A fresh literal here would erase two things the request
+  // does not carry: the Live Activity push token (which the client only ever
+  // sends once, on Activity.request, while it re-registers after every weather
+  // poll — so a literal wipes it within minutes and the server-side Live
+  // Activity branches never fire again), and `registeredAt`, which is what
+  // selectCellsWithinCap ranks cells by. Restamping `registeredAt` on every
+  // re-registration would invert that ranking: an active install would look
+  // newer than a planted record nobody has touched in three days, and the
+  // planted ones would take the cell slots.
+  //
+  // A failed read must not fall through to writing a fresh literal — that is
+  // exactly the erasure this read exists to prevent — so it refuses instead,
+  // legibly and before any cell slot has been claimed.
+  let existing: DeviceRegistration | null;
+  try {
+    existing = (await env.DEVICES.get(`device:${body.token}`, 'json')) as DeviceRegistration | null;
+  } catch (err) {
+    console.error(`[Register] Could not read the existing registration: ${err}`);
+    return json(
+      {
+        error: 'Registration storage is temporarily unavailable. Existing alerts are unaffected; retry shortly.',
+        code: 'storage_unavailable',
+      },
+      503,
+      { 'Retry-After': '60' }
+    );
+  }
+
   // Opening a *new* grid cell is the expensive act: it adds ~4,383 WeatherKit
   // calls a month, forever. Registering into a cell the service already covers
   // costs nothing extra and is always allowed, so an existing user is never
   // turned away by the cap.
-  const cell = await reserveGridCell(gridKey, env);
+  const cell = await reserveGridCell(gridKey, body.token, env);
   if (!cell.ok) {
     console.error(
-      `[Register] Refused a new grid cell: at capacity (${cell.cells}/${MAX_GRID_CELLS} cells)`
+      `[Register] Refused (${cell.code}): ${cell.cells}/${MAX_GRID_CELLS} cells, ` +
+        `${cell.devices}/${MAX_DEVICES_PER_CELL} devices in this cell`
     );
+    // The token is validated by this point, so we can act on it: drop whatever
+    // registration this device already had. Leaving it in place would keep
+    // pushing rain alerts for wherever the user used to be, which is worse than
+    // no alerts at all.
+    try {
+      await removeDevice(body.token, env);
+    } catch (err) {
+      console.error(`[Register] Could not clear the stale registration: ${err}`);
+    }
+
+    const atCell = cell.code === 'cell_at_capacity';
     return json(
       {
-        error:
-          'This service is at its coverage limit and cannot take on a new area right now. ' +
-          'Alerts for areas already covered are unaffected.',
-        code: 'coverage_at_capacity',
+        error: atCell
+          ? 'This area already has as many registered devices as the service can notify. ' +
+            'Any earlier registration for this device has been cleared, so it will not keep ' +
+            'sending alerts for a previous location; retry later to set alerts up again.'
+          : 'This service is at its coverage limit and cannot take on a new area right now. ' +
+            'Any earlier registration for this device has been cleared, so it will not keep ' +
+            'sending alerts for a previous location; retry later to set alerts up again.',
+        code: cell.code ?? 'coverage_at_capacity',
         maxGridCells: MAX_GRID_CELLS,
+        maxDevicesPerCell: MAX_DEVICES_PER_CELL,
       },
       503,
       { 'Retry-After': '3600' }
@@ -513,21 +622,23 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   }
 
   const registration: DeviceRegistration = {
+    ...(existing ?? {}),
     token: body.token,
     lat: body.lat,
     lon: body.lon,
     leadTimeMinutes: clampLeadTimeMinutes(body.leadTimeMinutes),
     rainStartEnabled: asBoolean(body.rainStartEnabled, true),
     rainEndEnabled: asBoolean(body.rainEndEnabled, true),
-    registeredAt: new Date().toISOString(),
+    registeredAt: existing?.registeredAt ?? new Date().toISOString(),
   };
 
   // Key by device token for easy lookup/update
   try {
     // Location and push token are the two pieces of user data here — log that a
     // write happened, not what was written. The record carries a TTL, which is
-    // what makes junk transient: a live install refreshes its own on every
-    // foreground, a fabricated one never does (see DEVICE_RECORD_TTL_SECONDS).
+    // what makes junk transient: a live install rewrites its own on cold launch,
+    // on foreground and after every weather poll, a fabricated one never does
+    // (see DEVICE_RECORD_TTL_SECONDS).
     await putDeviceRecord(body.token, registration, env);
     console.log(`[Register] Stored registration for grid ${gridKey}`);
   } catch (err) {
@@ -553,12 +664,16 @@ async function handleUnregister(request: Request, env: Env): Promise<Response> {
 // Drops a device and every key keyed off its token. The dedup keys the cron
 // writes are `notified-start:` / `notified-end:`; an earlier version deleted a
 // `notified:` key that nothing has ever written.
+//
+// The cell slot goes back too. Without that, a cell whose devices had all left
+// would stay "already covered" and hold a slot that nothing occupies.
 async function removeDevice(deviceToken: string, env: Env): Promise<void> {
   await Promise.all([
     env.DEVICES.delete(`device:${deviceToken}`),
     env.DEVICES.delete(`notified-start:${deviceToken}`),
     env.DEVICES.delete(`notified-end:${deviceToken}`),
     env.DEVICES.delete(`apnsfail:${deviceToken}`),
+    releaseGridCell(deviceToken, env),
   ]);
 }
 

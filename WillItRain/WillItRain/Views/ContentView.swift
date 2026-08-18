@@ -89,6 +89,8 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             if case .error(.locationDenied) = appState {
                 Task { await fetchWeather() }
+            } else {
+                Task { await renewPushRegistration() }
             }
         }
         .sheet(isPresented: $showSettings) {
@@ -270,6 +272,31 @@ struct ContentView: View {
     }
 
     // MARK: - Data Fetching
+
+    /// Rewrite this device's server-side registration on every foreground.
+    ///
+    /// The backend expires a `device:` record 45 days after its last write, which
+    /// is what makes fabricated registrations transient — but it only makes a
+    /// *live* install safe if the install genuinely renews itself. Nothing else
+    /// guarantees that: the weather poller only re-registers after a successful
+    /// fetch, LocationService only fires past 10 km, and background refresh never
+    /// registers at all. Without this, someone who opens the app daily but never
+    /// cold-launches it and never travels would silently lose every rain alert on
+    /// day 45.
+    ///
+    /// Cheap and safe to repeat: it is a no-op until APNs has handed us a token,
+    /// and the server's per-client throttle (20 per 10 minutes) is far above any
+    /// plausible foregrounding rate.
+    private func renewPushRegistration() async {
+        guard let location = try? await locationService.currentLocation() else { return }
+        await PushRegistrationService.shared.registerLocation(
+            lat: location.coordinate.latitude,
+            lon: location.coordinate.longitude,
+            leadTimeMinutes: settings.leadTime,
+            rainStartEnabled: settings.rainStartEnabled,
+            rainEndEnabled: settings.rainEndEnabled
+        )
+    }
 
     private func fetchWeather() async {
         // Don't show loading spinner on background refreshes

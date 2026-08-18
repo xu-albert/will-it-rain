@@ -42,18 +42,28 @@ rescale one PNG into another size. `verify_mark.py` checks that the SwiftUI
 - `backend/` is a Cloudflare Worker with **no runtime npm dependencies**; `wrangler`,
   `typescript` and `vitest` are dev-only. Verify headlessly with `npm run typecheck`,
   `npm test`, and `npx wrangler deploy --dry-run`.
-- **Every distinct ~1.1 km grid cell costs ~4,383 WeatherKit calls a month, forever** —
-  the cron fans out one fetch per cell, every 10 minutes, and Apple's allotment is
-  500k/month. That arithmetic, and the hard cell ceiling it sets, live in
-  `backend/src/abuse.ts` (`MAX_GRID_CELLS`). Read the comment there before changing
-  the cron schedule, the grid precision, or the cap.
+- **This account is on the Workers FREE plan, and that is what sets every cap.** One
+  invocation gets 50 *external* subrequests, shared by the cron's WeatherKit fetches
+  *and* its APNs pushes; Durable Object and KV calls are *internal* and come from a
+  separate 1,000 bucket. `MAX_GRID_CELLS`, `PUSH_BUDGET_PER_INVOCATION` and
+  `MAX_DEVICES_PER_CELL` in `backend/src/abuse.ts` are derived together from that one
+  budget — read the arithmetic there before touching the cron schedule, the grid
+  precision, or any of the three. (The WeatherKit quota is only a cross-check now:
+  a full service uses 13% of it.)
 - The registration endpoints are **unauthenticated by construction**: the Worker URL
   ships in the iOS binary and an APNs token cannot be verified server-side. What
-  bounds abuse is the gate in `abuse.ts` (per-client KV throttle + cell cap + record
-  TTL), not authentication. App Attest is the eventual fix, not something in place.
-- Workers KV serves reads from a colo-local cache with a 60-second floor, so a KV
-  counter alone cannot stop a sub-second burst. `abuse.ts` puts an in-isolate counter
-  in front of the KV one for exactly that case; don't remove it as redundant.
+  bounds abuse is the gate in `abuse.ts` — per-client throttle, global cell cap,
+  per-cell device cap, record TTL — not authentication. App Attest is the eventual
+  fix, not something in place.
+- The gate's counters live in **Durable Objects** (`backend/src/durable.ts`), not KV:
+  KV reads come from a colo-local cache with a 60-second floor, so a KV counter
+  cannot see a sub-second burst. The wrangler migration must stay on
+  `new_sqlite_classes` — `new_classes` is the Paid-only backend and would make the
+  Worker undeployable here.
+- A `device:` record's 45-day TTL is only safe because the client genuinely renews it:
+  `ContentView` re-registers on cold launch, unconditionally on `willEnterForeground`,
+  and after every successful weather poll. Breaking any of those turns the TTL into a
+  silent alert outage on day 45.
 
 ## Maintaining this file
 

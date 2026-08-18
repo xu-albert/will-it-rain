@@ -2,12 +2,14 @@
 //
 // It models two behaviours the real thing has and a naive Map does not:
 //
-//   * expirationTtl, so a test can assert that a record was written to expire
-//     rather than to live forever;
+//   * expirationTtl — both that a record was written to expire rather than to
+//     live forever, and that `list` reports an `expiration` only for keys that
+//     have one, which is how the cron spots pre-TTL records;
 //   * read staleness. Workers KV serves `get` from a colo-local cache with a
-//     60-second floor, so a burst of requests can all read the same
-//     pre-burst value. `staleReads: true` reproduces that, which is the only
-//     honest way to test whether a throttle survives a half-second flood.
+//     60-second floor, so a burst of requests can all read the same pre-burst
+//     value. `staleReads: true` reproduces that. Nothing in the gate counts in
+//     KV any more — the counters live in Durable Objects — and a test freezes
+//     reads to show the gate holds even so.
 
 interface Entry {
   value: string;
@@ -73,17 +75,29 @@ export class KVMock {
     this.store.delete(key);
   }
 
+  // `expiration` is present on a listed key only when that key was written with
+  // an expirationTtl, exactly as the real KV list does — that absence is the
+  // only way to tell a pre-TTL record from a current one.
   async list(options?: { prefix?: string; cursor?: string }): Promise<{
-    keys: Array<{ name: string }>;
+    keys: Array<{ name: string; expiration?: number }>;
     list_complete: boolean;
     cursor?: string;
   }> {
     if (this.options.failing) throw new Error('KV unavailable');
     const prefix = options?.prefix ?? '';
-    const keys = [...this.store.keys()]
-      .filter((name) => name.startsWith(prefix) && this.live(this.store, name))
-      .map((name) => ({ name }));
+    const keys = [...this.store.entries()]
+      .filter(([name]) => name.startsWith(prefix) && this.live(this.store, name))
+      .map(([name, entry]) =>
+        entry.expiresAt === null
+          ? { name }
+          : { name, expiration: Math.round(entry.expiresAt / 1000) }
+      );
     return { keys, list_complete: true };
+  }
+
+  /** Test-only: plant a record exactly as a pre-TTL deploy left it — no expiration. */
+  putWithoutTtl(key: string, value: string): void {
+    this.store.set(key, { value, expiresAt: null });
   }
 
   /** Test-only: the TTL a key was written with, in seconds, or null if none. */

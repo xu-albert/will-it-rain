@@ -131,18 +131,35 @@ curl -X DELETE https://will-it-rain.albertwxu.workers.dev/unregister \
 ## G. Registration limits (the abuse gate)
 
 `/register` and `/register-activity` are unauthenticated, so they are bounded
-rather than trusted. Three limits, all in `backend/src/abuse.ts`:
+rather than trusted. The limits all live in `backend/src/abuse.ts`; the counters
+behind them live in Durable Objects (`backend/src/durable.ts`), because Workers
+KV cannot count a sub-second burst.
 
 | Symptom while testing | Cause | What to do |
 |---|---|---|
 | `415 unsupported_media_type` | body sent without `Content-Type: application/json` | send the header (the curls in this file all do) |
 | `429 rate_limited` + `Retry-After` | more than 20 registrations from your IP in 10 minutes | wait out `retryAfterSeconds` |
-| `503 coverage_at_capacity` | the request would open a **new** grid cell and the service is already tracking `MAX_GRID_CELLS` (50) | prune junk cells (section F), or re-run the quota arithmetic in `abuse.ts` before raising the cap |
+| `503 coverage_at_capacity` | the request would open a **new** grid cell and the service already covers `MAX_GRID_CELLS` (15) | prune junk cells (section F), or re-run the subrequest arithmetic in `abuse.ts` before raising the cap |
+| `503 cell_at_capacity` | that one grid cell already holds `MAX_DEVICES_PER_CELL` (20) devices | unregister a device in that cell, or raise the cap after re-running the arithmetic |
 
-Device records now expire 45 days after their last write. A live install
-refreshes its own on every foreground, so this only reaps records nothing is
-renewing — including the placeholder tokens in section F. The cron logs
-`[Cron] Grid-cell cap hit` (as an error) if it ever has to skip cells.
+**Both 503s clear the caller's existing registration.** That is deliberate: a
+user who moves into an area the service cannot cover should get *no* alerts, not
+alerts for where they used to live. Re-register once capacity frees up.
+
+The caps are set by the Workers **Free** plan's 50-external-subrequests-per-invocation
+budget, which the cron shares between one WeatherKit fetch per cell and up to two
+APNs pushes per notified device — 15 + `PUSH_BUDGET_PER_INVOCATION` (34) ≤ 50. The
+cron logs `[Cron] Grid-cell cap hit` if it has to skip cells, and
+`[Cron] Push budget exhausted` if it runs out of pushes; both are `console.error`,
+so `wrangler tail` shows them.
+
+Device records expire 45 days after their last write, and the app rewrites its own
+on cold launch, on every foreground, and after every successful weather poll — so
+this only reaps records nothing is renewing. **Records written before this shipped
+had no expiry at all**, and KV cannot add one after the fact; the cron now rewrites
+up to 5 such records per tick until they all have one. That covers the section-F
+placeholder and simulator tokens too — but only 45 days after the cron reaches
+them, so prune them by hand if you want the error-log noise gone sooner.
 
 ## Known gaps (Release 2 follow-ups)
 - Server push says "in your area" (no city name) — backend stores only lat/lon.
