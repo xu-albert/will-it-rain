@@ -113,6 +113,23 @@ export class CoverageRegistry {
     return (await this.ctx.storage.get<CoverageMap>(COVERAGE_KEY)) ?? {};
   }
 
+  /**
+   * Drops a token's recent-admission note.
+   *
+   * `recent` exists to say "this device was admitted so lately that a cron
+   * snapshot may not have caught up yet", so it has to stop saying that the
+   * moment the device stops occupying the cell. Otherwise reconcile's grace
+   * loop re-adds a device the registry has already released, resurrecting an
+   * empty cell and holding a slot that a real user is then refused — and
+   * refused destructively, because the caller deletes their record.
+   */
+  private async forgetRecent(deviceToken: string, now: number): Promise<void> {
+    const recent = await this.loadRecent(now);
+    if (!(deviceToken in recent)) return;
+    delete recent[deviceToken];
+    await this.ctx.storage.put(RECENT_KEY, recent);
+  }
+
   /** Recent admissions, with anything past the grace window dropped. */
   private async loadRecent(now: number): Promise<RecentAdmissions> {
     const stored = (await this.ctx.storage.get<RecentAdmissions>(RECENT_KEY)) ?? {};
@@ -172,6 +189,7 @@ export class CoverageRegistry {
       if (!occupants.includes(deviceToken)) {
         if (occupants.length >= maxDevicesPerCell && !incumbent) {
           if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
+          await this.forgetRecent(deviceToken, now);
           return reply(this.refusal('cell_at_capacity', cells, gridKey));
         }
         occupants.push(deviceToken);
@@ -180,6 +198,7 @@ export class CoverageRegistry {
     } else {
       if (Object.keys(cells).length >= maxCells && !incumbent) {
         if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
+        await this.forgetRecent(deviceToken, now);
         return reply(this.refusal('coverage_at_capacity', cells, gridKey));
       }
       cells[gridKey] = [deviceToken];
@@ -216,6 +235,7 @@ export class CoverageRegistry {
   /** Frees whatever cell slot a device holds. Called whenever its record is dropped. */
   private async release(request: Request): Promise<Response> {
     const { deviceToken } = (await request.json()) as { deviceToken: string };
+    const now = Date.now();
     const cells = await this.load();
 
     let changed = false;
@@ -227,6 +247,7 @@ export class CoverageRegistry {
       changed = true;
     }
     if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
+    await this.forgetRecent(deviceToken, now);
 
     return reply({ ok: true, cells: Object.keys(cells).length, devices: 0 } satisfies CoverageReply);
   }

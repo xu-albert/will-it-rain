@@ -383,6 +383,45 @@ describe('grid-cell cap', () => {
     expect(kv.deletes).toBe(before);
   });
 
+  it('frees a vacated cell for good, rather than resurrecting it at the next tick', async () => {
+    // The grace window that protects a just-registered device from an
+    // eventually-consistent snapshot must not also protect a device that has
+    // since left. A cell whose last device unregistered is genuinely free, and
+    // reconcile re-adding it would hold the slot against a real user — who is
+    // then refused AND has their record deleted.
+    for (let n = 0; n < MAX_GRID_CELLS; n++) {
+      expect((await registerCell(n)).status).toBe(200);
+    }
+
+    await worker.fetch(
+      new Request('https://worker.test/unregister', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '192.0.2.200' },
+        body: JSON.stringify({ token: fakeToken(0) }),
+      }),
+      env
+    );
+
+    // A cron tick lands while that departure is still inside the grace window.
+    const remaining = kv.keysWithPrefix('device:');
+    await reconcileCoverage(
+      remaining.map((key) => {
+        const record = JSON.parse(kv.raw(key)!) as { token: string; lat: number; lon: number };
+        return {
+          gridKey: `${record.lat.toFixed(2)},${record.lon.toFixed(2)}`,
+          devices: [record as never],
+        };
+      }),
+      env
+    );
+
+    const newcomer = await worker.fetch(
+      registerRequest(900, { cell: 900, ip: '192.0.2.232' }),
+      env
+    );
+    expect(newcomer.status).toBe(200);
+  });
+
   it('never refuses an incumbent, even after a stale cron snapshot loses its cell', async () => {
     // Workers KV `list` is eventually consistent, so the cron can read a
     // snapshot taken before the newest registration landed. Reconciling that

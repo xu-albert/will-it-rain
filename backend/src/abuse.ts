@@ -49,10 +49,32 @@ import { CoverageMap, CoverageReply, DeviceRegistration, Env, GridCell, RateRepl
 //   MAX_GRID_CELLS             = 15 -> 15 external fetches, leaving 35 of the 50
 //   PUSH_BUDGET_PER_INVOCATION = 34 -> 17 notified devices at 2 pushes each, +1
 //                                      spare
-//   MAX_DEVICES_PER_CELL       = 20 -> at most 15 x 20 = 300 device records, so
-//                                      300 internal KV gets in readCoverage,
-//                                      comfortably under the 1,000 internal
-//                                      ceiling
+//   MAX_DEVICES_PER_CELL       = 20 -> at most 15 x 20 = 300 device records
+//
+// The INTERNAL bucket has to be counted over the whole tick, not just over the
+// read that dominates it. At the caps, with rain in every cell and every device
+// eligible, one invocation spends:
+//
+//     1  KV list                                          readCoverage
+//   300  KV gets, one per device record                   readCoverage
+//     5  KV puts, MAX_TTL_MIGRATIONS_PER_TICK             migrateLegacyRecords
+//     1  DO call                                          reconcileCoverage
+//   300  KV gets on `notified-*`, one per device          notifyOnce
+//    34  KV puts on `notified-*`, one per push sent       notifyOnce
+//   ---
+//   641  before anything goes wrong
+//
+// and, in the worst case where every push is rejected and every Live Activity
+// ends on the same tick, up to ~270 more: recordPushFailure is 1 get + 1 put per
+// strike or, when it reaps, 1 get + 4 deletes + 1 DO call, and clearActivityToken
+// is 1 get + 1 put. Call it ~910 of 1,000.
+//
+// That fits, but the margin is roughly 9%, not the 3x that counting readCoverage
+// alone suggests. Raising MAX_DEVICES_PER_CELL costs 2 internal subrequests per
+// device (the record read plus the dedup read, which is paid before the push
+// budget is consulted so every device pays it whether or not it is notified) and
+// would go over. Overrunning this bucket throws "Too many subrequests" into the
+// same per-grid catch the push budget exists to keep out of.
 //
 // Enforcing the push budget is not optional bookkeeping. Overrunning the 50
 // makes the next fetch throw "Too many subrequests"; notifyOnce catches that
