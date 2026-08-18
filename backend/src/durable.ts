@@ -21,6 +21,7 @@ import { CoverageMap, CoverageReply, RateReply } from './types';
 
 const COVERAGE_KEY = 'cells';
 const RECENT_KEY = 'recent';
+const PENDING_KEY = 'pendingReap';
 const WINDOW_KEY = 'window';
 
 // How long an admission is protected from being reconciled away. Workers KV
@@ -30,6 +31,9 @@ const RECONCILE_GRACE_MS = 120_000;
 
 /** Tokens admitted recently, with the cell they were admitted into. */
 type RecentAdmissions = Record<string, { gridKey: string; at: number }>;
+
+/** Tokens APNs has rejected that are queued for deletion, with when they were flagged. */
+type PendingReaps = Record<string, number>;
 
 function reply(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -106,6 +110,8 @@ export class CoverageRegistry {
     if (action === '/reserve') return this.reserve(request);
     if (action === '/release') return this.release(request);
     if (action === '/reconcile') return this.reconcile(request);
+    if (action === '/flag-reap') return this.flagReap(request);
+    if (action === '/pending-reaps') return this.pendingReaps();
     return new Response('Not found', { status: 404 });
   }
 
@@ -128,6 +134,54 @@ export class CoverageRegistry {
     if (!(deviceToken in recent)) return;
     delete recent[deviceToken];
     await this.ctx.storage.put(RECENT_KEY, recent);
+  }
+
+  /**
+   * Queues a token for deletion and takes it out of the push rotation.
+   *
+   * The reap budget bounds deletes per tick, so a token APNs has rejected can
+   * wait several ticks for its turn. Waiting must not cost anything: notifyOnce
+   * writes its `notified-*` dedup key only after the push resolves, so a push
+   * that throws leaves no dedup key and is retried on the very next tick — and
+   * because cells and devices are ordered oldest-first, an uninstalled
+   * long-standing user is walked BEFORE live ones. A backlog of dead tokens
+   * would otherwise eat PUSH_BUDGET_PER_INVOCATION every tick until it drained,
+   * and live users' alerts would be the ones dropped. Cleanup must never outrank
+   * an alert.
+   *
+   * This lives in the Durable Object rather than KV deliberately: it is a flag
+   * read once per tick and written at most once per failed push, and DO storage
+   * costs neither the 1,000 daily KV writes nor the 1,000 daily deletes.
+   *
+   * The flag is cleared when the device is actually reaped (via release), when
+   * it re-registers (via reserve — evidence it may be alive again), and when
+   * reconcile finds it is no longer in KV at all. A live install re-registers on
+   * cold launch, on every foreground and after every successful poll, so no live
+   * device can stay muted.
+   */
+  private async flagReap(request: Request): Promise<Response> {
+    const { deviceToken } = (await request.json()) as { deviceToken: string };
+    const pending = await this.loadPending();
+    if (deviceToken in pending) return reply({ ok: true } satisfies { ok: boolean });
+    pending[deviceToken] = Date.now();
+    await this.ctx.storage.put(PENDING_KEY, pending);
+    return reply({ ok: true } satisfies { ok: boolean });
+  }
+
+  /** The tokens the cron should skip this tick. One call per tick. */
+  private async pendingReaps(): Promise<Response> {
+    return reply({ tokens: Object.keys(await this.loadPending()) });
+  }
+
+  private async loadPending(): Promise<PendingReaps> {
+    return (await this.ctx.storage.get<PendingReaps>(PENDING_KEY)) ?? {};
+  }
+
+  private async forgetPending(deviceToken: string): Promise<void> {
+    const pending = await this.loadPending();
+    if (!(deviceToken in pending)) return;
+    delete pending[deviceToken];
+    await this.ctx.storage.put(PENDING_KEY, pending);
   }
 
   /** Recent admissions, with anything past the grace window dropped. */
@@ -210,6 +264,7 @@ export class CoverageRegistry {
     const recent = await this.loadRecent(now);
     recent[deviceToken] = { gridKey, at: now };
     await this.ctx.storage.put(RECENT_KEY, recent);
+    await this.forgetPending(deviceToken);
 
     const admitted: CoverageReply = {
       ok: true,
@@ -248,6 +303,7 @@ export class CoverageRegistry {
     }
     if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
     await this.forgetRecent(deviceToken, now);
+    await this.forgetPending(deviceToken);
 
     return reply({ ok: true, cells: Object.keys(cells).length, devices: 0 } satisfies CoverageReply);
   }
@@ -290,6 +346,18 @@ export class CoverageRegistry {
 
     await this.ctx.storage.put(COVERAGE_KEY, next);
     await this.ctx.storage.put(RECENT_KEY, recent);
+
+    // A pending-reap flag only exists to keep the cron from pushing to a token,
+    // so once that token is out of the reconciled map it has nothing left to do
+    // and would otherwise accumulate forever. Devices still in KV — including
+    // the recent admissions merged in above — keep theirs.
+    const covered = new Set(Object.values(next).flat());
+    const pending = await this.loadPending();
+    const live: PendingReaps = {};
+    for (const [token, at] of Object.entries(pending)) {
+      if (covered.has(token)) live[token] = at;
+    }
+    await this.ctx.storage.put(PENDING_KEY, live);
 
     return reply({ ok: true, cells: Object.keys(next).length, devices: 0 } satisfies CoverageReply);
   }

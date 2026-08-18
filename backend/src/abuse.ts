@@ -61,17 +61,23 @@ import { CoverageMap, CoverageReply, DeviceRegistration, Env, GridCell, RateRepl
 //        — charged before budget.spend(), so every device
 //          pays it whether or not it is notified
 //
-//   PER PUSH ATTEMPTED (5 each, so 170 at PUSH_BUDGET_PER_INVOCATION):
+//   PER PUSH ATTEMPTED (6 each, so 204 at PUSH_BUDGET_PER_INVOCATION):
 //     1  KV put on `notified-*`, the dedup key             notifyOnce
 //     2  recordPushFailure taking a BadDeviceToken strike:
 //        1 get + 1 put on `apnsfail:`
+//     1  DO call flagging a rejected token for reaping     flagPendingReap
 //     2  clearActivityToken on a terminal Live Activity:
 //        1 get + 1 delete. It reads before deleting so an
 //        unthrottled teardown cannot spend the daily KV
 //        delete allowance on tokens never registered
 //
-//   PER DEVICE REAPED (4 each, so 8 at MAX_DEVICE_REAPS_PER_TICK):
-//     1  KV get + 2 KV deletes + 1 DO call                 removeDevice
+//   PER DEVICE REAPED (5 each, so 10 at MAX_DEVICE_REAPS_PER_TICK):
+//     1  KV get + 1 KV delete on `device:`                 removeDevice
+//     2  clearActivityToken, 1 get + 1 delete — and the
+//        delete only when the device actually held one, so
+//        a device that never started a Live Activity costs
+//        1 KV delete here, not 2
+//     1  DO call releasing the cell slot
 //        Reaps are budgeted separately rather than folded
 //        into the per-push term: without their own ceiling
 //        every one of the 34 pushes could reap, and the
@@ -83,18 +89,19 @@ import { CoverageMap, CoverageReply, DeviceRegistration, Env, GridCell, RateRepl
 //     1  KV list of `activity:`                            readActivityTokens
 //     5  KV puts, MAX_TTL_MIGRATIONS_PER_TICK              migrateLegacyRecords
 //     1  DO call                                           reconcileCoverage
+//     1  DO call reading the pending-reap set              readPendingReaps
 //   ---
-//   186  = 8 + 34 x 5 + 2 x 4
+//   223  = 9 + 34 x 6 + 2 x 5
 //
-//   186 + 600 per-device = 786 of 1,000 at the caps.
+//   223 + 600 per-device = 823 of 1,000 at the caps.
 //
 // The activity token deliberately costs one `list` for the whole tick rather
 // than one `get` per device: it rides in the key's metadata (see
 // readActivityTokens). Reading it per-device would make this 3 per device,
-// 900 + 186 = 1,086, and would not fit.
+// 900 + 223 = 1,123, and would not fit.
 //
-// So the margin is roughly 21%, not the 3x that counting readCoverage alone
-// suggests, and the real ceiling is under (1,000 - 186) / 2 = 407 device
+// So the margin is roughly 18%, not the 3x that counting readCoverage alone
+// suggests, and the real ceiling is under (1,000 - 223) / 2 = 388 device
 // records — under, not at, because a tick that spends the 1,000th subrequest
 // has no room for anything this model has not thought of, and the 1,001st
 // throws "Too many subrequests" into the same per-grid catch the push budget
@@ -212,22 +219,27 @@ export const INTERNAL_SUBREQUESTS_PER_DEVICE = 2;
 
 /**
  * The worst case per push actually attempted: the `notified-*` dedup put, plus
- * recordPushFailure taking a BadDeviceToken strike (1 get + 1 put), plus a
- * terminal Live Activity's get-then-delete. Bounded by
+ * recordPushFailure taking a BadDeviceToken strike (1 get + 1 put), plus the DO
+ * call that flags a rejected token for reaping, plus a terminal Live Activity's
+ * get-then-delete. Bounded by
  * PUSH_BUDGET_PER_INVOCATION, so this is fixed traffic, not per-device — which
  * is exactly why it belongs in the term below rather than being left out of the
  * model as happy-path-only.
  */
-const INTERNAL_SUBREQUESTS_PER_PUSH_WORST_CASE = 5;
+const INTERNAL_SUBREQUESTS_PER_PUSH_WORST_CASE = 6;
 
-/** removeDevice: 1 get, 2 deletes (`device:` and `activity:`), 1 DO release. */
-const INTERNAL_SUBREQUESTS_PER_REAP = 4;
+/**
+ * removeDevice: 1 get + 1 delete on `device:`, clearActivityToken's 1 get and
+ * (only for a device that held one) 1 delete, and 1 DO release.
+ */
+const INTERNAL_SUBREQUESTS_PER_REAP = 5;
 
 /** The tick's device-count-independent internal traffic. */
 export const INTERNAL_SUBREQUESTS_PER_TICK_FIXED =
   2 + // one KV list for `device:`, one for `activity:`
   MAX_TTL_MIGRATIONS_PER_TICK +
   1 + // the reconcile DO call
+  1 + // the pending-reap DO read
   PUSH_BUDGET_PER_INVOCATION * INTERNAL_SUBREQUESTS_PER_PUSH_WORST_CASE +
   MAX_DEVICE_REAPS_PER_TICK * INTERNAL_SUBREQUESTS_PER_REAP;
 
@@ -259,7 +271,11 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //                                 term that scales with user activity rather
 //                                 than fleet size.
 //   /unregister, /unregister-*    1 per request, the guard get.
-//   => ~96,500 before a single registration. Does NOT fit at the caps.
+//   => ~96,500 of 100,000 before a single registration, so /register reads are
+//      what push it over. Note this is a deliberately pessimistic ceiling: it
+//      assumes rain in every one of the 15 cells for all 144 ticks and a full
+//      300-device fleet. Real load is single-digit devices, three orders of
+//      magnitude below it.
 //
 // WRITES — 1,000/day
 //   `device:` puts, /register     ~43/day steady state. Without the
@@ -282,7 +298,11 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //      dedup interval.
 //
 // DELETES — 1,000/day, a SEPARATE allowance from writes
-//   cron reaps                    <= MAX_DEVICE_REAPS_PER_TICK x 2 x 144 = 576/day.
+//   cron reaps                    <= MAX_DEVICE_REAPS_PER_TICK x 2 x 144 = 576/day,
+//                                 and half that for the common device that
+//                                 never started a Live Activity, since
+//                                 clearActivityToken only deletes a key that
+//                                 is actually there.
 //                                 This is the one term the tick can bound by
 //                                 itself, and MAX_DEVICE_REAPS_PER_TICK exists
 //                                 to bound it; unbounded it would be 9,792.
@@ -313,13 +333,26 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //   => Fits with room, and is the only bucket that does.
 //
 // So two of the four buckets do not fit at MAX_GRID_CELLS x MAX_DEVICES_PER_CELL,
-// and that is a fleet-size ceiling rather than a cap that can be tuned away
-// here: lowering MAX_DEVICES_PER_CELL does not touch the dedup put, and
-// lowering PUSH_BUDGET_PER_INVOCATION would buy the write budget by dropping
-// alerts the per-invocation budget can afford to send. The honest statement is
-// that these caps are sized for the current fleet (TESTING.md documents ~15
-// devices, an order of magnitude below every crossover above) and that running
-// near the caps needs the Paid plan. Exceeding an allowance makes KV refuse
+// and the two are not alike — do not read one argument as covering both.
+//
+//   The WRITE bucket is NOT tunable here. Lowering MAX_DEVICES_PER_CELL does
+//   not touch the dedup put, which is one per alert delivered, and lowering
+//   PUSH_BUDGET_PER_INVOCATION would buy the write budget by dropping alerts
+//   the per-invocation budget can afford to send. It is a genuine fleet-size
+//   ceiling.
+//
+//   The READ bucket IS tunable here, and by exactly the constant above. Its
+//   dominant term is 2 x MAX_GRID_CELLS x MAX_DEVICES_PER_CELL x 144, i.e.
+//   86,400 of the 100,000 daily reads — about 86% — at MAX_DEVICES_PER_CELL =
+//   20, and roughly 53,000 at 10, which would leave room for registrations.
+//   MAX_DEVICES_PER_CELL is deliberately left at 20 anyway: 86,400 is the
+//   theoretical maximum-fleet ceiling, not current load, and real traffic is
+//   single-digit devices. Anyone approaching the caps for real should lower it
+//   rather than assume the bucket cannot move.
+//
+// The honest statement is that these caps are sized for the current fleet
+// (TESTING.md documents ~15 devices, an order of magnitude below every
+// crossover above) and that running near the caps needs the Paid plan. Exceeding an allowance makes KV refuse
 // that operation for the rest of the UTC day — writes gone means putDeviceRecord
 // throws and /register 500s, and the 45-day TTL is only safe while live installs
 // can renew; deletes gone means /unregister 500s and dead tokens cannot be
@@ -423,6 +456,41 @@ export async function reserveGridCell(
 }
 
 /** Frees the cell slot a device holds. Every path that drops a `device:` record calls this. */
+/**
+ * Queues a rejected token for deletion and drops it out of the push rotation.
+ *
+ * Fails open: a flag that does not stick costs one wasted push next tick, while
+ * throwing here would take down the alert loop this exists to protect.
+ */
+export async function flagPendingReap(deviceToken: string, env: Env): Promise<void> {
+  try {
+    await coverageStub(env).fetch('https://coverage/flag-reap', {
+      method: 'POST',
+      body: JSON.stringify({ deviceToken }),
+    });
+  } catch (err) {
+    console.warn(`[Abuse] Could not flag device for reaping: ${err}`);
+  }
+}
+
+/**
+ * The tokens this tick must skip, because APNs already rejected them and they
+ * are only waiting on the reap budget. One DO call for the whole tick.
+ *
+ * Fails open to an empty set: skipping is an optimisation for the push budget,
+ * never a correctness requirement, so a registry blip must not stop alerts.
+ */
+export async function readPendingReaps(env: Env): Promise<Set<string>> {
+  try {
+    const res = await coverageStub(env).fetch('https://coverage/pending-reaps', { method: 'POST' });
+    const { tokens } = (await res.json()) as { tokens: string[] };
+    return new Set(tokens);
+  } catch (err) {
+    console.warn(`[Abuse] Could not read pending reaps: ${err}`);
+    return new Set();
+  }
+}
+
 export async function releaseGridCell(deviceToken: string, env: Env): Promise<void> {
   try {
     await coverageStub(env).fetch('https://coverage/release', {

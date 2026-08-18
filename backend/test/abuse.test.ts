@@ -218,9 +218,10 @@ describe('per-client rate limit', () => {
 
   it('tears down an unregistered token without spending any KV writes on it', async () => {
     // /unregister is deliberately unthrottled, so this is the cheapest request
-    // an attacker can make. It must stay cheap for us too: four KV deletes each
-    // would drain the Free plan's daily delete allowance in one 250-request
-    // burst and break teardown for real users for the rest of the day.
+    // an attacker can make. It must stay cheap for us too: teardown is two KV
+    // deletes, and unconditionally spending them would drain the Free plan's
+    // 1,000-a-day delete allowance in one 500-request burst and break teardown
+    // for real users until 00:00 UTC.
     const before = kv.deletes;
     for (let n = 0; n < 25; n++) {
       const res = await worker.fetch(
@@ -884,20 +885,103 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
     });
 
     expect(harness.kv.keysWithPrefix('device:')).toHaveLength(devices - MAX_DEVICE_REAPS_PER_TICK);
-    expect(harness.kv.deletes).toBe(MAX_DEVICE_REAPS_PER_TICK * 2);
+    // One delete each: these devices never started a Live Activity, so
+    // clearActivityToken finds nothing and spends nothing.
+    expect(harness.kv.deletes).toBe(MAX_DEVICE_REAPS_PER_TICK);
     expect(errors.some((line) => line.includes('Reap budget exhausted'))).toBe(true);
 
-    // Deferred, not lost: the next tick takes the next batch.
-    await runCron({
+    // Deferred, not lost: the queue drains at the same rate every tick until it
+    // is empty, whether or not those devices are pushed to again.
+    for (let tick = 2; tick * MAX_DEVICE_REAPS_PER_TICK < devices; tick++) {
+      await runCron({
+        cells: 1,
+        devicesPerCell: 0,
+        forecast: rainStartingSoon,
+        apnsRejects: true,
+        harness,
+      });
+      expect(harness.kv.keysWithPrefix('device:')).toHaveLength(
+        devices - tick * MAX_DEVICE_REAPS_PER_TICK
+      );
+    }
+  });
+
+  it('does not let a backlog of dead tokens spend the push budget on itself', async () => {
+    // Every device here is uninstalled, so every push comes back 410 and only
+    // MAX_DEVICE_REAPS_PER_TICK of them can be deleted per tick. The rest are
+    // queued — and a queued token must stop costing a push, because notifyOnce
+    // writes its dedup key only after the push resolves, so a failed push is
+    // retried on the very next tick. Ordering makes it worse: devices are walked
+    // oldest-first and a long-uninstalled device has the oldest registeredAt, so
+    // an unguarded backlog is walked ahead of every live user.
+    const harness = makeHarness({ signingKey });
+    const devices = MAX_DEVICE_REAPS_PER_TICK + 6;
+
+    const first = await runCron({
+      cells: 1,
+      devicesPerCell: devices,
+      forecast: rainStartingSoon,
+      apnsRejects: true,
+      harness,
+    });
+    expect(first.pushes).toBe(devices);
+
+    // Second tick: the ones reaped are gone, and the ones still queued must not
+    // be pushed to again.
+    const second = await runCron({
       cells: 1,
       devicesPerCell: 0,
       forecast: rainStartingSoon,
       apnsRejects: true,
       harness,
     });
-    expect(harness.kv.keysWithPrefix('device:')).toHaveLength(
-      devices - 2 * MAX_DEVICE_REAPS_PER_TICK
+    expect(second.pushes).toBe(0);
+  });
+
+  it('unmutes a queued device as soon as it re-registers', async () => {
+    // Skipping a queued token is only safe because the flag cannot outlive the
+    // evidence for it. A live install re-registers on cold launch, on every
+    // foreground and after every successful poll, and that has to be enough to
+    // put it back in the rotation — otherwise a device APNs rejected once
+    // during, say, a wrong-APNS_ENV window would stay silently muted.
+    const harness = makeHarness({ signingKey });
+    const devices = MAX_DEVICE_REAPS_PER_TICK + 2;
+    await runCron({
+      cells: 1,
+      devicesPerCell: devices,
+      forecast: rainStartingSoon,
+      apnsRejects: true,
+      harness,
+    });
+
+    const queued = harness.kv
+      .keysWithPrefix('device:')
+      .map((key) => key.slice('device:'.length));
+    expect(queued).toHaveLength(devices - MAX_DEVICE_REAPS_PER_TICK);
+
+    const revived = queued[0];
+    const { lat, lon } = coordsForCell(0);
+    const back = await worker.fetch(
+      new Request('https://worker.test/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.9' },
+        body: JSON.stringify({ token: revived, lat, lon, leadTimeMinutes: 30 }),
+      }),
+      harness.env
     );
+    expect(back.status).toBe(200);
+
+    // APNs is healthy again: the revived device must be pushed to and kept,
+    // while the ones still queued are drained rather than pushed.
+    const next = await runCron({
+      cells: 1,
+      devicesPerCell: 0,
+      forecast: rainStartingSoon,
+      apnsRejects: false,
+      harness,
+    });
+    expect(next.pushes).toBe(1);
+    expect(harness.kv.raw(`device:${revived}`)).toBeDefined();
   });
 
   it('gives every tick its own budget rather than a shared one', async () => {
@@ -1041,8 +1125,9 @@ describe('registration records expire', () => {
   it('charges no KV delete to tear down a Live Activity that was never registered', async () => {
     // `/unregister-activity` is deliberately unthrottled, so nothing else bounds
     // how often a fabricated token can reach it. A delete costs the Free plan's
-    // 1,000-a-day write allowance — the same one every real registration draws
-    // on — so a teardown has to be free until there is something to tear down.
+    // 1,000-a-day DELETE allowance — a separate bucket from the 1,000 writes,
+    // and far scarcer than the 100,000 daily reads a guard get comes from — so
+    // a teardown has to be free until there is something to tear down.
     const detach = (n: number) =>
       worker.fetch(
         new Request('https://worker.test/unregister-activity', {

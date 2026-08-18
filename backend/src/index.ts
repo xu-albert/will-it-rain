@@ -36,6 +36,8 @@ import {
   checkRegistrationRate,
   createPushBudget,
   createReapBudget,
+  flagPendingReap,
+  readPendingReaps,
   TickBudget,
   MAX_DEVICE_REAPS_PER_TICK,
   reconcileCoverage,
@@ -220,6 +222,44 @@ export default {
     const budget = createPushBudget();
     const reaps = createReapBudget();
 
+    // Tokens APNs has already rejected, waiting on the reap budget. Draining
+    // them here rather than only when a push happens to fail is what makes the
+    // queue finite: the push loop below skips whatever is still flagged, so a
+    // flagged device never fails another push and would otherwise sit in KV
+    // holding a cell slot until its 45-day TTL ran out.
+    //
+    // Draining first also fixes the precedence. notifyOnce writes its dedup key
+    // only after the push resolves, so a throwing push leaves nothing behind and
+    // is retried next tick; devices are walked oldest-first and a long-
+    // uninstalled device has the oldest registeredAt; so an unguarded backlog
+    // spends the push budget on the dead before the living, every tick until it
+    // clears. Cleanup must never outrank an alert.
+    //
+    // readPendingReaps fails open to an empty set, so a registry blip costs some
+    // wasted pushes rather than the whole tick.
+    // The set stays whole after draining, because it is also the skip list: this
+    // tick's readCoverage snapshot was taken before the deletes below, so a
+    // device reaped here is still in `grid.devices` and pushing to it would be
+    // pure waste.
+    const pendingReaps = await readPendingReaps(env);
+    let queuedReaps = pendingReaps.size;
+    for (const deviceToken of pendingReaps) {
+      if (!reaps.spend()) break;
+      try {
+        await removeDevice(deviceToken, env);
+        queuedReaps -= 1;
+      } catch (err) {
+        console.error(`[Cron] Could not reap queued device: ${err}`);
+      }
+    }
+    if (queuedReaps > 0) {
+      console.error(
+        `[Cron] ${queuedReaps} rejected device tokens still queued for deletion; the cap is ` +
+          `MAX_DEVICE_REAPS_PER_TICK=${MAX_DEVICE_REAPS_PER_TICK}, sized from the Free plan's ` +
+          `daily KV delete allowance in abuse.ts. They are skipped this tick and retried next.`
+      );
+    }
+
     // Live Activity updates are the optional half of a tick and must never be
     // able to take the mandatory half down with them — the same invariant the
     // per-push catches below state. Unguarded, a `list` that throws here aborts
@@ -277,6 +317,7 @@ export default {
         };
 
         for (const device of grid.devices) {
+          if (pendingReaps.has(device.token)) continue;
           const activityToken = activityTokens.get(device.token);
           if (rainStart && device.rainStartEnabled !== false) {
             const minutesUntilRain = Math.round((new Date(rainStart.startTime).getTime() - now) / 60000);
@@ -383,15 +424,6 @@ export default {
 
     for (const grid of grids) {
       await processGrid(grid);
-    }
-
-    if (reaps.denied > 0) {
-      console.error(
-        `[Cron] Reap budget exhausted: dropped ${reaps.spent} dead device tokens this tick and ` +
-          `deferred ${reaps.denied}. They will be retried next tick; the cap is ` +
-          `MAX_DEVICE_REAPS_PER_TICK=${MAX_DEVICE_REAPS_PER_TICK}, sized from the Free plan's ` +
-          `daily KV delete allowance in abuse.ts.`
-      );
     }
 
     if (budget.denied > 0) {
@@ -860,7 +892,7 @@ async function removeDevice(deviceToken: string, env: Env): Promise<void> {
 
   await Promise.all([
     env.DEVICES.delete(`device:${deviceToken}`),
-    env.DEVICES.delete(activityKey(deviceToken)),
+    clearActivityToken(deviceToken, env),
     releaseGridCell(deviceToken, env),
   ]);
 }
@@ -879,7 +911,14 @@ async function removeDevice(deviceToken: string, env: Env): Promise<void> {
 // deletes out of a daily allowance the cron cannot otherwise limit. Refusing
 // defers rather than loses: the strike count is not written back when the
 // threshold was already reached, and a 410 recurs, so the next tick reaps the
-// same token. The cost of deferral is one more wasted push to a dead token.
+// same token.
+//
+// A deferred token is flagged in the registry so the push loop stops walking it
+// while it waits. Without that it would cost a push on every tick until its
+// turn came — notifyOnce writes its dedup key only after the push resolves, so
+// a throwing push leaves nothing behind — and oldest-first ordering puts
+// long-uninstalled devices ahead of live ones, so a backlog would spend the
+// budget on the dead before the living.
 async function recordPushFailure(
   deviceToken: string,
   err: unknown,
@@ -890,9 +929,10 @@ async function recordPushFailure(
 
   const reap = async (why: string): Promise<void> => {
     if (!reaps.spend()) {
+      await flagPendingReap(deviceToken, env);
       console.error(
         `[APNs] Reap budget exhausted (MAX_DEVICE_REAPS_PER_TICK=${MAX_DEVICE_REAPS_PER_TICK}); ` +
-          `deferring ${why} to the next tick.`
+          `deferring ${why} to the next tick. The device is skipped until then.`
       );
       return;
     }
