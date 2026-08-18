@@ -39,9 +39,18 @@ final class PushRegistrationService {
         )
 
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let http = response as? HTTPURLResponse
+            if http?.statusCode == 200 {
                 print("[Push] Registered with backend")
+            } else {
+                // The backend refuses registrations it cannot afford: 429 when
+                // this network has registered too often, 503 when the service
+                // is at its grid-cell coverage limit. Both are recoverable and
+                // both come with an explanation in the body — say so, rather
+                // than letting a rejected registration look like a success.
+                let detail = String(data: data, encoding: .utf8) ?? "<no body>"
+                print("[Push] Registration rejected (HTTP \(http?.statusCode ?? -1)): \(detail)")
             }
         } catch {
             print("[Push] Registration failed: \(error)")

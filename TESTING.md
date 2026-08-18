@@ -128,10 +128,25 @@ curl -X DELETE https://will-it-rain.albertwxu.workers.dev/unregister \
   -H "Content-Type: application/json" -d '{"token":"<junk-token>"}'
 ```
 
+## G. Registration limits (the abuse gate)
+
+`/register` and `/register-activity` are unauthenticated, so they are bounded
+rather than trusted. Three limits, all in `backend/src/abuse.ts`:
+
+| Symptom while testing | Cause | What to do |
+|---|---|---|
+| `415 unsupported_media_type` | body sent without `Content-Type: application/json` | send the header (the curls in this file all do) |
+| `429 rate_limited` + `Retry-After` | more than 20 registrations from your IP in 10 minutes | wait out `retryAfterSeconds` |
+| `503 coverage_at_capacity` | the request would open a **new** grid cell and the service is already tracking `MAX_GRID_CELLS` (50) | prune junk cells (section F), or re-run the quota arithmetic in `abuse.ts` before raising the cap |
+
+Device records now expire 45 days after their last write. A live install
+refreshes its own on every foreground, so this only reaps records nothing is
+renewing — including the placeholder tokens in section F. The cron logs
+`[Cron] Grid-cell cap hit` (as an error) if it ever has to skip cells.
+
 ## Known gaps (Release 2 follow-ups)
 - Server push says "in your area" (no city name) — backend stores only lat/lon.
   Add `locationName` to the `/register` payload to name the city.
 - Server can't tell rain vs snow (WeatherKit `forecastNextHour` has no type) —
   only the on-device path is type-aware.
 - Cron reads only the next ~hour, so it can't warn earlier than ~75 min out.
-- Stale device tokens accumulate; add 410-Gone cleanup in the APNs path later.

@@ -18,6 +18,14 @@ import {
   isValidDeviceToken,
   secureEquals,
 } from './validate';
+import {
+  DEVICE_RECORD_TTL_SECONDS,
+  MAX_GRID_CELLS,
+  checkRegistrationRate,
+  recordGridCellCount,
+  reserveGridCell,
+  selectCellsWithinCap,
+} from './abuse';
 
 // Live Activity segment math is normalized over this window, matching the widget's ring.
 const ACTIVITY_WINDOW_MINUTES = 90;
@@ -26,10 +34,10 @@ const ACTIVITY_WINDOW_MINUTES = 90;
 // See recordPushFailure for why this isn't 1.
 const BAD_TOKEN_STRIKES = 5;
 
-function json(body: unknown, status = 200): Response {
+function json(body: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...extraHeaders },
   });
 }
 
@@ -52,25 +60,91 @@ function isAuthorizedAdmin(request: Request, env: Env): boolean {
   return secureEquals(provided, env.ADMIN_TOKEN);
 }
 
+// A cross-origin POST with `Content-Type: text/plain` is a CORS "simple
+// request": no preflight, so any web page could make each of its visitors
+// register a device, spreading a flood across thousands of residential IPs —
+// exactly the shape a per-client throttle cannot see. Demanding
+// application/json forces a preflight, which, since we send no
+// Access-Control-Allow-Origin, browsers refuse. Non-browser clients are
+// unaffected; throttling them is the rate limiter's job, not this check's.
+function hasJsonContentType(request: Request): boolean {
+  const contentType = request.headers.get('Content-Type') ?? '';
+  return contentType.split(';')[0].trim().toLowerCase() === 'application/json';
+}
+
+// Front door for every state-changing endpoint. Returns a response to send
+// instead of running the handler, or null to proceed.
+//
+// Every rejection here says what happened and when to come back, because the
+// alternative — dropping a real user's registration on the floor and returning
+// something they cannot act on — is how a rate limit turns into a silent
+// outage.
+async function guardMutation(
+  request: Request,
+  env: Env,
+  options: { throttle: boolean }
+): Promise<Response | null> {
+  if (!hasJsonContentType(request)) {
+    return json(
+      {
+        error: 'Content-Type must be application/json.',
+        code: 'unsupported_media_type',
+      },
+      415
+    );
+  }
+
+  if (!options.throttle) return null;
+
+  const rate = await checkRegistrationRate(request, env);
+  if (!rate.ok) {
+    console.log(`[Abuse] Throttled a registration request for ${rate.retryAfterSeconds}s`);
+    return json(
+      {
+        error:
+          'Too many registration requests from this network. Alerts already set up are unaffected; retry shortly.',
+        code: 'rate_limited',
+        retryAfterSeconds: rate.retryAfterSeconds,
+      },
+      429,
+      { 'Retry-After': String(rate.retryAfterSeconds) }
+    );
+  }
+
+  return null;
+}
+
 export default {
   // HTTP API for device registration
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // /register and /register-activity are throttled: they are the two routes
+    // that grow stored state and, through it, the cron's WeatherKit bill. The
+    // two teardown routes are only content-type checked — a user leaving should
+    // never be told to come back later.
     if (request.method === 'POST' && url.pathname === '/register') {
-      return handleRegister(request, env);
+      return (await guardMutation(request, env, { throttle: true })) ?? handleRegister(request, env);
     }
 
     if (request.method === 'DELETE' && url.pathname === '/unregister') {
-      return handleUnregister(request, env);
+      return (
+        (await guardMutation(request, env, { throttle: false })) ?? handleUnregister(request, env)
+      );
     }
 
     if (request.method === 'POST' && url.pathname === '/register-activity') {
-      return handleRegisterActivity(request, env);
+      return (
+        (await guardMutation(request, env, { throttle: true })) ??
+        handleRegisterActivity(request, env)
+      );
     }
 
     if (request.method === 'POST' && url.pathname === '/unregister-activity') {
-      return handleUnregisterActivity(request, env);
+      return (
+        (await guardMutation(request, env, { throttle: false })) ??
+        handleUnregisterActivity(request, env)
+      );
     }
 
     if (request.method === 'POST' && url.pathname === '/test-rain') {
@@ -88,7 +162,23 @@ export default {
 
   // Cron trigger: check weather for all registered devices
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    const grids = await getDevicesByGrid(env);
+    const allGrids = await getDevicesByGrid(env);
+
+    // Publish the true distinct-cell count so /register budgets against
+    // reality rather than against a counter that has drifted.
+    await recordGridCellCount(allGrids.length, env);
+
+    // One WeatherKit fetch per cell, all inside this one invocation: without a
+    // ceiling here, enough registrations exhaust the monthly quota and, on the
+    // Free plan, blow the 50-subrequest limit and take the whole tick down.
+    const { cells: grids, skipped } = selectCellsWithinCap(allGrids);
+    if (skipped > 0) {
+      console.error(
+        `[Cron] Grid-cell cap hit: serving the ${grids.length} oldest of ${allGrids.length} cells, ` +
+          `skipping ${skipped}. Cap is MAX_GRID_CELLS=${MAX_GRID_CELLS}; raising it needs the ` +
+          `quota arithmetic in abuse.ts re-run and a Paid Workers plan above 50.`
+      );
+    }
     console.log(`[Cron] Processing ${grids.length} grid cells`);
 
     const promises = grids.map(async (grid) => {
@@ -279,6 +369,21 @@ async function discardDeadActivityToken(deviceToken: string, err: unknown, env: 
   console.log(`[Activity] Cleared dead activity token (${err.reason})`);
 }
 
+// Every write of a `device:` record goes through here so none can silently
+// re-create the immortal, TTL-less record this replaced. Re-writing resets the
+// clock, which is correct: every path that writes one is driven by a live
+// device — a registration, a Live Activity the device started, or a push it
+// accepted.
+async function putDeviceRecord(
+  deviceToken: string,
+  registration: DeviceRegistration,
+  env: Env
+): Promise<void> {
+  await env.DEVICES.put(`device:${deviceToken}`, JSON.stringify(registration), {
+    expirationTtl: DEVICE_RECORD_TTL_SECONDS,
+  });
+}
+
 // Drop the stored activity token once its Live Activity has been ended.
 async function clearActivityToken(deviceToken: string, env: Env): Promise<void> {
   const key = `device:${deviceToken}`;
@@ -288,7 +393,7 @@ async function clearActivityToken(deviceToken: string, env: Env): Promise<void> 
   const registration = existing as DeviceRegistration;
   delete registration.activityToken;
   delete registration.activityUpdatedAt;
-  await env.DEVICES.put(key, JSON.stringify(registration));
+  await putDeviceRecord(deviceToken, registration, env);
 }
 
 async function handleTestRain(request: Request, env: Env): Promise<Response> {
@@ -383,6 +488,30 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     return json({ error: 'Invalid or missing lat/lon' }, 400);
   }
 
+  const gridKey = toGridKey(body.lat, body.lon);
+
+  // Opening a *new* grid cell is the expensive act: it adds ~4,383 WeatherKit
+  // calls a month, forever. Registering into a cell the service already covers
+  // costs nothing extra and is always allowed, so an existing user is never
+  // turned away by the cap.
+  const cell = await reserveGridCell(gridKey, env);
+  if (!cell.ok) {
+    console.error(
+      `[Register] Refused a new grid cell: at capacity (${cell.cells}/${MAX_GRID_CELLS} cells)`
+    );
+    return json(
+      {
+        error:
+          'This service is at its coverage limit and cannot take on a new area right now. ' +
+          'Alerts for areas already covered are unaffected.',
+        code: 'coverage_at_capacity',
+        maxGridCells: MAX_GRID_CELLS,
+      },
+      503,
+      { 'Retry-After': '3600' }
+    );
+  }
+
   const registration: DeviceRegistration = {
     token: body.token,
     lat: body.lat,
@@ -396,15 +525,17 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   // Key by device token for easy lookup/update
   try {
     // Location and push token are the two pieces of user data here — log that a
-    // write happened, not what was written.
-    await env.DEVICES.put(`device:${body.token}`, JSON.stringify(registration));
-    console.log(`[Register] Stored registration for grid ${toGridKey(body.lat, body.lon)}`);
+    // write happened, not what was written. The record carries a TTL, which is
+    // what makes junk transient: a live install refreshes its own on every
+    // foreground, a fabricated one never does (see DEVICE_RECORD_TTL_SECONDS).
+    await putDeviceRecord(body.token, registration, env);
+    console.log(`[Register] Stored registration for grid ${gridKey}`);
   } catch (err) {
     console.error(`[Register] KV write failed: ${err}`);
     return json({ error: 'KV write failed' }, 500);
   }
 
-  return json({ ok: true, gridKey: toGridKey(body.lat, body.lon) });
+  return json({ ok: true, gridKey });
 }
 
 async function handleUnregister(request: Request, env: Env): Promise<Response> {
@@ -481,7 +612,7 @@ async function handleRegisterActivity(request: Request, env: Env): Promise<Respo
   registration.activityToken = body.activityToken;
   registration.activityUpdatedAt = new Date().toISOString();
 
-  await env.DEVICES.put(key, JSON.stringify(registration));
+  await putDeviceRecord(body.token, registration, env);
   console.log(`[Activity] Registered activity token for device`);
 
   return json({ ok: true });
@@ -500,7 +631,7 @@ async function handleUnregisterActivity(request: Request, env: Env): Promise<Res
     const registration = existing as DeviceRegistration;
     delete registration.activityToken;
     delete registration.activityUpdatedAt;
-    await env.DEVICES.put(key, JSON.stringify(registration));
+    await putDeviceRecord(body.token, registration, env);
     console.log(`[Activity] Unregistered activity token for device`);
   }
 
