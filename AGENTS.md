@@ -5,7 +5,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 ## Build & test
 
 - The Xcode project is `WillItRain/WillItRain.xcodeproj`, shared scheme `WillItRain` (targets: app, `WillItRainWidgets` extension, `WillItRainTests` unit tests hosted in the app).
-- CI is `.github/workflows/ci.yml`: unsigned simulator build + headless `xcodebuild test` on macos-26 with Xcode pinned via `DEVELOPER_DIR`. Keep that pin in sync with the Xcode version the project needs; runner image contents are listed in actions/runner-images `macos-26-Readme.md`.
+- CI is `.github/workflows/ci.yml`: an iOS job (unsigned simulator build + headless `xcodebuild test` on macos-26, Xcode pinned via `DEVELOPER_DIR`) and a backend job (`npm ci && npm run typecheck && npm test` in `backend/`). Keep the Xcode pin in sync with the version the project needs; runner image contents are listed in actions/runner-images `macos-26-Readme.md`.
 - Local headless verification (don't open Simulator.app unless the session is explicitly doing GUI capture work like the screenshot section below):
   `xcodebuild build-for-testing -project WillItRain/WillItRain.xcodeproj -scheme WillItRain -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO` then `xcodebuild test-without-building ... -destination 'platform=iOS Simulator,name=iPhone 17 Pro'`; shut the sim down afterwards with `xcrun simctl shutdown`.
 - The app's Info.plist is generated (`GENERATE_INFOPLIST_FILE=YES`): INFOPLIST_KEY_* build settings in the pbxproj are the source of truth (e.g. the portrait lock). `BuildProductTests` asserts on the merged plist of the built product — update those tests when changing those settings deliberately.
@@ -36,6 +36,43 @@ throwaway activity before capturing.
 PNG is regenerated from it at its own pixel size by `render_appicon.py` — never
 rescale one PNG into another size. `verify_mark.py` checks that the SwiftUI
 `AppIconMark` geometry still matches the SVG.
+
+## Backend Worker
+
+- `backend/` is a Cloudflare Worker with **no runtime npm dependencies**; `wrangler`,
+  `typescript` and `vitest` are dev-only. Verify headlessly with `npm run typecheck`,
+  `npm test`, and `npx wrangler deploy --dry-run`.
+- **This account is on the Workers FREE plan, and that is what sets every cap.** One
+  invocation gets 50 *external* subrequests, shared by the cron's WeatherKit fetches
+  *and* its APNs pushes; Durable Object and KV calls are *internal* and come from a
+  separate 1,000 bucket. `MAX_GRID_CELLS`, `PUSH_BUDGET_PER_INVOCATION` and
+  `MAX_DEVICES_PER_CELL` in `backend/src/abuse.ts` are derived together from that one
+  budget — read the arithmetic there before touching the cron schedule, the grid
+  precision, or any of the three. (The WeatherKit quota is only a cross-check now:
+  a full service uses 13% of it.) Per invocation is not the only ceiling: the same
+  file counts the Free plan's *daily* allowances (100,000 KV reads, 1,000 writes,
+  1,000 deletes, 1,000 lists, plus the Durable Objects' own meters), which is what
+  sizes `MAX_TTL_MIGRATIONS_PER_TICK`, `MAX_DEVICE_REAPS_PER_TICK`,
+  `DEVICE_RECORD_REFRESH_SECONDS` and `DEVICE_REWRITE_COOLDOWN_SECONDS` — and two of
+  those daily KV buckets, writes and reads, do *not* fit at a full-fleet 15 x 20.
+- The registration endpoints are **unauthenticated by construction**: the Worker URL
+  ships in the iOS binary and an APNs token cannot be verified server-side. What
+  bounds abuse is the gate in `abuse.ts` — per-client throttle, global cell cap,
+  per-cell device cap, per-invocation push budget, per-device rewrite cooldown,
+  record TTL — not authentication. App Attest is the eventual fix, not something
+  in place.
+- The gate's counters live in **Durable Objects** (`backend/src/durable.ts`), not KV:
+  KV reads come from a colo-local cache with a 60-second floor, so a KV counter
+  cannot see a sub-second burst. The wrangler migration must stay on
+  `new_sqlite_classes` — `new_classes` is the Paid-only backend and would make the
+  Worker undeployable here.
+- A `device:` record's 45-day TTL is only safe because the client genuinely renews
+  it: `ContentView` re-registers on cold launch, on `willEnterForeground` and after
+  every successful weather poll, and `LocationService` re-registers past a 10 km
+  move. Renewal takes both halves, though — the server skips a re-registration that
+  changes nothing, so what actually resets the TTL is `DEVICE_RECORD_REFRESH_SECONDS`
+  (7 days) forcing a write through. Break either half and the TTL becomes a silent
+  alert outage on day 45.
 
 ## Maintaining this file
 

@@ -9,5 +9,21 @@ crons = ["*/10 * * * *"]
 binding = "DEVICES"
 id = "142615e17bc84dc7adbd9e64d0b29410"
 
+[[durable_objects.bindings]]
+name = "REGISTRATION_LIMITER"
+class_name = "RegistrationLimiter"
+
+[[durable_objects.bindings]]
+name = "COVERAGE"
+class_name = "CoverageRegistry"
+
+# new_sqlite_classes, NOT new_classes: the key-value Durable Object backend is
+# Paid-plan only, and this account is on the Workers Free plan, where the SQLite
+# backend is the only one available. Getting this wrong makes the Worker
+# undeployable rather than merely slower.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RegistrationLimiter", "CoverageRegistry"]
+
 [observability]
 enabled = true

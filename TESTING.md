@@ -35,7 +35,13 @@ npx wrangler kv key list --remote --namespace-id $NS | grep '"name": "device:'
 
 # Inspect one:
 npx wrangler kv key get --remote "device:<paste-token>" --namespace-id $NS
-#   -> { token, lat, lon, leadTimeMinutes, rainStartEnabled, rainEndEnabled, registeredAt }
+#   -> { token, lat, lon, leadTimeMinutes, rainStartEnabled, rainEndEnabled,
+#        registeredAt, renewedAt }
+#   registeredAt is first-seen and never restamped (the cron ranks cells by it);
+#   renewedAt is the last write, i.e. when the 45-day TTL was last reset (section G).
+
+# A Live Activity push token is a key of its own, not a field on the record above:
+npx wrangler kv key get --remote "activity:<paste-token>" --namespace-id $NS
 ```
 
 ## B. Confirm YOUR device is registered
@@ -82,14 +88,19 @@ curl -X POST https://will-it-rain.albertwxu.workers.dev/test-cron \
 
 The cron no longer keeps pushing to tokens APNs has rejected:
 
-- **410 Unregistered** → the device record is deleted immediately.
+- **410 Unregistered** → the device record is deleted, but at most
+  `MAX_DEVICE_REAPS_PER_TICK` (2) devices are dropped per cron tick, because the
+  Free plan allows 1,000 KV deletes a day. Beyond that the token is queued in the
+  CoverageRegistry, skipped by the push loop so it costs no further pushes, and
+  reaped by a later tick — `[APNs] Reap budget exhausted` and
+  `[Cron] … still queued for deletion` say so in `wrangler tail`.
 - **BadDeviceToken** → a strike counter (`apnsfail:<token>`, 24h TTL). The
   device is dropped on the 5th strike. It is deliberately not 1, because a
   wrong `APNS_ENV` makes *every* device return BadDeviceToken, and a single
   bad tick must not be able to wipe the whole device list. The app re-registers
   on every foreground, so an over-eager delete heals itself.
-- A rejected **Live Activity** push clears only `activityToken`, leaving the
-  device registered for ordinary rain alerts.
+- A rejected **Live Activity** push clears only that device's `activity:` key,
+  leaving the device registered for ordinary rain alerts.
 
 ## D. Watch the Worker live
 
@@ -119,14 +130,79 @@ npx wrangler deploy
 
 Production KV has 5 placeholder tokens (`realtest`, `test123`, `test456`,
 `test789`, `testABC`) and 2 simulator tokens (160-hex — APNs always rejects
-those). Harmless, but they add error-log noise once rain hits their grid:
+those). They add error-log noise once rain hits their grid, and because they are
+the oldest records in KV the cron ranks their cells ahead of every real user's
+(`selectCellsWithinCap`), so at `MAX_GRID_CELLS` = 15 they can hold up to 7 of
+the 15 slots.
+
+**Delete them straight from KV — `/unregister` cannot.** That endpoint validates
+with `isValidDeviceToken` (64–128 hex characters), so all seven are rejected with
+`400 Invalid or missing token`: the placeholders are 8 characters and non-hex,
+and the simulator tokens are 160 hex characters, over the maximum.
 
 ```bash
 NS=142615e17bc84dc7adbd9e64d0b29410
-# list tokens, then for each junk one:
-curl -X DELETE https://will-it-rain.albertwxu.workers.dev/unregister \
-  -H "Content-Type: application/json" -d '{"token":"<junk-token>"}'
+
+# List what is there (NOTE the --remote):
+npx wrangler kv key list --remote --namespace-id $NS | grep '"name": "device:'
+
+# Then delete each junk one by key:
+npx wrangler kv key delete --remote --namespace-id $NS "device:realtest"
 ```
+
+`/unregister` remains the right tool for a real 64-hex device token.
+
+## G. Registration limits (the abuse gate)
+
+`/register` and `/register-activity` are unauthenticated, so they are bounded
+rather than trusted. The limits all live in `backend/src/abuse.ts`; the counters
+behind them live in Durable Objects (`backend/src/durable.ts`), because Workers
+KV cannot count a sub-second burst.
+
+| Symptom while testing | Cause | What to do |
+|---|---|---|
+| `415 unsupported_media_type` | body sent without `Content-Type: application/json` | send the header (the curls in this file all do) |
+| `429 rate_limited` + `Retry-After` | more than 20 registrations from your IP in 10 minutes | wait out `retryAfterSeconds` |
+| `503 coverage_at_capacity` | the request would open a **new** grid cell and the service already covers `MAX_GRID_CELLS` (15) | delete junk `device:` keys from KV (section F — not `/unregister`), or re-run the subrequest arithmetic in `abuse.ts` before raising the cap |
+| `503 cell_at_capacity` | that one grid cell already holds `MAX_DEVICES_PER_CELL` (20) devices | unregister a device in that cell, or raise the cap after re-running the arithmetic |
+| `200` but `wrangler kv key get` shows the OLD lead time / toggles | a same-cell settings change inside the 5-minute rewrite cooldown | wait 5 minutes and re-send, or change the coordinates too — a cell change is never deferred |
+| `503 storage_unavailable` + `Retry-After: 60` | KV threw while reading the caller's existing record, so the write was refused rather than risk overwriting it | transient — check `wrangler tail` for the KV error; the caller's stored registration is untouched and still live |
+| `200` from `/register-activity` but the `activity:` key still shows the old `activityUpdatedAt` | the same activity token was re-submitted, and an identical token is never rewritten | expected; a new or changed token is always written immediately |
+
+**The two capacity 503s clear the caller's existing registration.** That is
+deliberate: a user who moves into an area the service cannot cover should get
+*no* alerts, not alerts for where they used to live. Re-register once capacity
+frees up. `storage_unavailable` is the exception — it clears nothing, precisely
+because the whole point of that refusal is to avoid touching stored state it
+could not read.
+
+The caps are set by the Workers **Free** plan's 50-external-subrequests-per-invocation
+budget, which the cron shares between one WeatherKit fetch per cell and up to two
+APNs pushes per notified device — 15 + `PUSH_BUDGET_PER_INVOCATION` (34) ≤ 50. The
+cron logs `[Cron] Grid-cell cap hit` if it has to skip cells, and
+`[Cron] Push budget exhausted` if it runs out of pushes; both are `console.error`,
+so `wrangler tail` shows them.
+
+Device records expire 45 days after their last write, and the app re-registers on
+cold launch, on every foreground, and after every successful weather poll — so
+this only reaps records nothing is renewing. A repeat registration that changes
+nothing is **not** rewritten (it would spend the Free plan's 1,000 KV writes a day
+on nothing); a record older than 7 days is rewritten regardless, which resets the
+TTL with weeks to spare.
+
+A registration that changes only *settings* (`leadTimeMinutes`, `rainStartEnabled`,
+`rainEndEnabled`) within the same grid cell is also held back for up to 5 minutes
+after the last write, for the same budget reason. It returns `200` with the grid
+key the record still has, and self-heals on the next registration — which the app
+issues after every successful weather poll. **A move to a different grid cell is
+never held back**: it is written immediately, because a device alerted for the
+cell it left is exactly the silent break the gate exists to prevent.
+
+**Records written before this shipped had no expiry at all**, and KV cannot add
+one after the fact; the cron rewrites up to 5 such records per tick until they all
+have one. The section-F placeholder and simulator tokens are included in that, so
+they will carry a TTL and expire 45 days later — delete them from KV (section F)
+if you want the slots and the error-log noise back sooner.
 
 ## Known gaps (Release 2 follow-ups)
 - Server push says "in your area" (no city name) — backend stores only lat/lon.
@@ -134,4 +210,3 @@ curl -X DELETE https://will-it-rain.albertwxu.workers.dev/unregister \
 - Server can't tell rain vs snow (WeatherKit `forecastNextHour` has no type) —
   only the on-device path is type-aware.
 - Cron reads only the next ~hour, so it can't warn earlier than ~75 min out.
-- Stale device tokens accumulate; add 410-Gone cleanup in the APNs path later.
