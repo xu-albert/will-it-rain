@@ -9,7 +9,7 @@
 // not a stub of the gate itself.
 
 import { describe, expect, it, beforeAll, beforeEach, vi } from 'vitest';
-import worker, { CoverageRegistry, RegistrationLimiter } from '../src/index';
+import worker from '../src/index';
 import {
   MAX_DEVICES_PER_CELL,
   MAX_DEVICE_RECORDS,
@@ -30,61 +30,14 @@ import {
 } from '../src/abuse';
 import { DeviceRegistration, Env, GridCell } from '../src/types';
 import { KVMock } from './kvMock';
-import { DurableObjectNamespaceMock } from './doMock';
+import { Harness, coordsForCell, fakeToken, generateSigningKey, makeHarness } from './harness';
 
-interface Harness {
-  env: Env;
-  kv: KVMock;
-  limiter: DurableObjectNamespaceMock;
-  coverage: DurableObjectNamespaceMock;
-}
-
-// A throwaway P-256 key, so the cron's JWT signing actually succeeds and the
-// tick can reach a real push. With APPLE_PRIVATE_KEY empty, importKey throws
-// and every grid dies in the per-grid catch long before any push is attempted.
+// See generateSigningKey: without a real key no tick can reach a push.
 let signingKey = '';
 
 beforeAll(async () => {
-  const pair = (await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, [
-    'sign',
-    'verify',
-  ])) as CryptoKeyPair;
-  const pkcs8 = (await crypto.subtle.exportKey('pkcs8', pair.privateKey)) as ArrayBuffer;
-  signingKey = btoa(String.fromCharCode(...new Uint8Array(pkcs8)));
+  signingKey = await generateSigningKey();
 });
-
-function makeHarness(
-  options: { kv?: KVMock; failingDurableObjects?: boolean; signingKey?: string } = {}
-): Harness {
-  const kv = options.kv ?? new KVMock();
-  const doOptions = { failing: options.failingDurableObjects };
-  const limiter = new DurableObjectNamespaceMock(RegistrationLimiter, doOptions);
-  const coverage = new DurableObjectNamespaceMock(CoverageRegistry, doOptions);
-
-  const env: Env = {
-    DEVICES: kv as unknown as KVNamespace,
-    REGISTRATION_LIMITER: limiter as unknown as DurableObjectNamespace,
-    COVERAGE: coverage as unknown as DurableObjectNamespace,
-    APPLE_TEAM_ID: 'TEAMID',
-    APPLE_KEY_ID: 'KEYID',
-    APPLE_PRIVATE_KEY: options.signingKey ?? '',
-    WEATHERKIT_SERVICE_ID: 'service',
-    APNS_TOPIC: 'topic',
-    APNS_ENV: 'sandbox',
-  };
-
-  return { env, kv, limiter, coverage };
-}
-
-/** A syntactically valid — and entirely fabricated — 64-char hex device token. */
-function fakeToken(n: number): string {
-  return n.toString(16).padStart(4, '0').repeat(16);
-}
-
-/** Distinct coordinates 0.05 deg apart, so each maps to its own grid cell. */
-function coordsForCell(n: number): { lat: number; lon: number } {
-  return { lat: 30 + (n % 200) * 0.05, lon: -120 - Math.floor(n / 200) * 0.05 };
-}
 
 /** A device registration whose only interesting property is when it was first seen. */
 function device(n: number, registeredAt: string): DeviceRegistration {
