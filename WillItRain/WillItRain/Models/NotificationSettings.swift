@@ -2,7 +2,7 @@ import Foundation
 import Combine
 
 class NotificationSettings: ObservableObject {
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
 
     @Published var leadTime: Int {
         didSet { defaults.set(leadTime, forKey: "leadTime") }
@@ -11,10 +11,10 @@ class NotificationSettings: ObservableObject {
         didSet { defaults.set(quietHoursEnabled, forKey: "quietHoursEnabled") }
     }
     @Published var quietHoursStart: Date {
-        didSet { defaults.set(quietHoursStart.timeIntervalSinceReferenceDate, forKey: "quietHoursStart") }
+        didSet { persist(quietHoursStart, forKey: "quietHoursStart") }
     }
     @Published var quietHoursEnd: Date {
-        didSet { defaults.set(quietHoursEnd.timeIntervalSinceReferenceDate, forKey: "quietHoursEnd") }
+        didSet { persist(quietHoursEnd, forKey: "quietHoursEnd") }
     }
     @Published var rainStartEnabled: Bool {
         didSet { defaults.set(rainStartEnabled, forKey: "rainStartEnabled") }
@@ -31,51 +31,21 @@ class NotificationSettings: ObservableObject {
 
     // State tracking for duplicate prevention
     @Published var lastNotifiedPrecipStart: Date? {
-        didSet {
-            if let date = lastNotifiedPrecipStart {
-                defaults.set(date.timeIntervalSinceReferenceDate, forKey: "lastNotifiedPrecipStart")
-            } else {
-                defaults.removeObject(forKey: "lastNotifiedPrecipStart")
-            }
-        }
+        didSet { persist(lastNotifiedPrecipStart, forKey: "lastNotifiedPrecipStart") }
     }
     @Published var lastNotifiedPrecipEnd: Date? {
-        didSet {
-            if let date = lastNotifiedPrecipEnd {
-                defaults.set(date.timeIntervalSinceReferenceDate, forKey: "lastNotifiedPrecipEnd")
-            } else {
-                defaults.removeObject(forKey: "lastNotifiedPrecipEnd")
-            }
-        }
+        didSet { persist(lastNotifiedPrecipEnd, forKey: "lastNotifiedPrecipEnd") }
     }
 
     // Confirmation state for two-pass notification
     @Published var pendingPrecipStart: Date? {
-        didSet {
-            if let date = pendingPrecipStart {
-                defaults.set(date.timeIntervalSinceReferenceDate, forKey: "pendingPrecipStart")
-            } else {
-                defaults.removeObject(forKey: "pendingPrecipStart")
-            }
-        }
+        didSet { persist(pendingPrecipStart, forKey: "pendingPrecipStart") }
     }
     @Published var pendingPrecipEnd: Date? {
-        didSet {
-            if let date = pendingPrecipEnd {
-                defaults.set(date.timeIntervalSinceReferenceDate, forKey: "pendingPrecipEnd")
-            } else {
-                defaults.removeObject(forKey: "pendingPrecipEnd")
-            }
-        }
+        didSet { persist(pendingPrecipEnd, forKey: "pendingPrecipEnd") }
     }
     @Published var lastRainEndTime: Date? {
-        didSet {
-            if let date = lastRainEndTime {
-                defaults.set(date.timeIntervalSinceReferenceDate, forKey: "lastRainEndTime")
-            } else {
-                defaults.removeObject(forKey: "lastRainEndTime")
-            }
-        }
+        didSet { persist(lastRainEndTime, forKey: "lastRainEndTime") }
     }
 
     /// Check if two dates refer to the same event (within 10 minutes).
@@ -84,7 +54,10 @@ class NotificationSettings: ObservableObject {
         return abs(a.timeIntervalSince(b)) < 10 * 60
     }
 
-    init() {
+    /// `defaults` is where every setting lives; the app uses the standard suite,
+    /// tests hand in an isolated one.
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         let d = defaults
         self.leadTime = d.object(forKey: "leadTime") as? Int ?? 20
         self.quietHoursEnabled = d.bool(forKey: "quietHoursEnabled")
@@ -94,32 +67,31 @@ class NotificationSettings: ObservableObject {
         self.useCelsius = d.bool(forKey: "useCelsius")
 
         let calendar = Calendar.current
-        if d.object(forKey: "quietHoursStart") != nil {
-            self.quietHoursStart = Date(timeIntervalSinceReferenceDate: d.double(forKey: "quietHoursStart"))
-        } else {
-            self.quietHoursStart = calendar.date(from: DateComponents(hour: 22, minute: 0)) ?? Date()
-        }
-        if d.object(forKey: "quietHoursEnd") != nil {
-            self.quietHoursEnd = Date(timeIntervalSinceReferenceDate: d.double(forKey: "quietHoursEnd"))
-        } else {
-            self.quietHoursEnd = calendar.date(from: DateComponents(hour: 7, minute: 0)) ?? Date()
-        }
+        self.quietHoursStart = Self.storedDate(forKey: "quietHoursStart", in: d)
+            ?? calendar.date(from: DateComponents(hour: 22, minute: 0)) ?? Date()
+        self.quietHoursEnd = Self.storedDate(forKey: "quietHoursEnd", in: d)
+            ?? calendar.date(from: DateComponents(hour: 7, minute: 0)) ?? Date()
 
-        self.lastNotifiedPrecipStart = d.object(forKey: "lastNotifiedPrecipStart") != nil
-            ? Date(timeIntervalSinceReferenceDate: d.double(forKey: "lastNotifiedPrecipStart"))
-            : nil
-        self.lastNotifiedPrecipEnd = d.object(forKey: "lastNotifiedPrecipEnd") != nil
-            ? Date(timeIntervalSinceReferenceDate: d.double(forKey: "lastNotifiedPrecipEnd"))
-            : nil
-        self.pendingPrecipStart = d.object(forKey: "pendingPrecipStart") != nil
-            ? Date(timeIntervalSinceReferenceDate: d.double(forKey: "pendingPrecipStart"))
-            : nil
-        self.pendingPrecipEnd = d.object(forKey: "pendingPrecipEnd") != nil
-            ? Date(timeIntervalSinceReferenceDate: d.double(forKey: "pendingPrecipEnd"))
-            : nil
-        self.lastRainEndTime = d.object(forKey: "lastRainEndTime") != nil
-            ? Date(timeIntervalSinceReferenceDate: d.double(forKey: "lastRainEndTime"))
-            : nil
+        self.lastNotifiedPrecipStart = Self.storedDate(forKey: "lastNotifiedPrecipStart", in: d)
+        self.lastNotifiedPrecipEnd = Self.storedDate(forKey: "lastNotifiedPrecipEnd", in: d)
+        self.pendingPrecipStart = Self.storedDate(forKey: "pendingPrecipStart", in: d)
+        self.pendingPrecipEnd = Self.storedDate(forKey: "pendingPrecipEnd", in: d)
+        self.lastRainEndTime = Self.storedDate(forKey: "lastRainEndTime", in: d)
+    }
+
+    // Dates are stored as seconds since the reference date. A nil clears the key,
+    // so an absent key reads back as nil rather than as the reference date itself.
+    private func persist(_ date: Date?, forKey key: String) {
+        if let date {
+            defaults.set(date.timeIntervalSinceReferenceDate, forKey: key)
+        } else {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
+    private static func storedDate(forKey key: String, in defaults: UserDefaults) -> Date? {
+        guard defaults.object(forKey: key) != nil else { return nil }
+        return Date(timeIntervalSinceReferenceDate: defaults.double(forKey: key))
     }
 
     func isInQuietHours(at date: Date = Date()) -> Bool {

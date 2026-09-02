@@ -2,34 +2,48 @@ import Foundation
 import UserNotifications
 
 final class NotificationService {
+    /// Hands one composed alert to the system.
+    ///
+    /// Injected so the gate below can be tested without UNUserNotificationCenter,
+    /// whose `add` needs a granted authorization and a running app. The shared
+    /// instance delivers through the real center.
+    typealias Deliver = (_ title: String, _ body: String, _ identifier: String) -> Void
+
     static let shared = NotificationService()
-    private let center = UNUserNotificationCenter.current()
+    private static let center = UNUserNotificationCenter.current()
+
+    private let deliver: Deliver
+
+    init(deliver: Deliver? = nil) {
+        self.deliver = deliver ?? Self.deliverImmediately
+    }
 
     func requestPermission() async -> Bool {
         do {
-            return try await center.requestAuthorization(options: [.alert, .sound])
+            return try await Self.center.requestAuthorization(options: [.alert, .sound])
         } catch {
             return false
         }
     }
 
-    func evaluateAndSchedule(forecast: RainForecast, settings: NotificationSettings) {
-        let now = Date()
-
+    /// Decides, for one forecast evaluation at `now`, which alerts are due and
+    /// delivers them. Every decision is recorded in `settings`, so the two-pass
+    /// confirmation and the duplicate suppression survive across polls and launches.
+    func evaluateAndSchedule(forecast: RainForecast, settings: NotificationSettings, now: Date = Date()) {
         guard !settings.isInQuietHours(at: now) else { return }
 
         let formatter = DateFormatter()
         formatter.dateFormat = "h:mm a"
 
         // Track lastRainEndTime
-        if forecast.isCurrentlyPrecipitating {
+        if forecast.isPrecipitating(at: now) {
             settings.lastRainEndTime = nil
         } else if settings.lastRainEndTime == nil {
             settings.lastRainEndTime = now
         }
 
         // --- Rain starting (two-pass confirmation) ---
-        if settings.rainStartEnabled, let next = forecast.nextPrecipitationPeriod {
+        if settings.rainStartEnabled, let next = forecast.nextPrecipitationPeriod(at: now) {
             let timeUntil = next.start.timeIntervalSince(now)
             let leadTimeSeconds = Double(settings.leadTime * 60)
 
@@ -42,10 +56,10 @@ final class NotificationService {
                         let typeLower = type.lowercased()
                         let intensity = next.peakIntensity == .none ? "" : "\(next.peakIntensity.rawValue) "
                         let mins = max(1, Int(next.start.timeIntervalSince(now) / 60))
-                        scheduleImmediate(
-                            title: mins <= 5 ? "\(type) starting soon" : "\(type) in ~\(mins) min",
-                            body: "\(intensity)\(typeLower) expected around \(formatter.string(from: next.start)), lasting to \(formatter.string(from: next.end)).",
-                            identifier: "precip-start"
+                        deliver(
+                            mins <= 5 ? "\(type) starting soon" : "\(type) in ~\(mins) min",
+                            "\(intensity)\(typeLower) expected around \(formatter.string(from: next.start)), lasting to \(formatter.string(from: next.end)).",
+                            "precip-start"
                         )
                         settings.lastNotifiedPrecipStart = next.start
                         settings.pendingPrecipStart = nil
@@ -66,7 +80,7 @@ final class NotificationService {
         }
 
         // --- Rain ending (two-pass confirmation) ---
-        if settings.rainEndEnabled, let current = forecast.currentPrecipitationPeriod {
+        if settings.rainEndEnabled, let current = forecast.currentPrecipitationPeriod(at: now) {
             let timeUntilEnd = current.end.timeIntervalSince(now)
 
             if timeUntilEnd <= 1800 && timeUntilEnd > 0 {
@@ -75,10 +89,10 @@ final class NotificationService {
                     if settings.isSameEvent(pending, current.end)
                         && !settings.isSameEvent(settings.lastNotifiedPrecipEnd, current.end) {
                         let type = current.type.rawValue
-                        scheduleImmediate(
-                            title: "\(type) ending soon",
-                            body: "\(type) should stop around \(formatter.string(from: current.end)).",
-                            identifier: "precip-end"
+                        deliver(
+                            "\(type) ending soon",
+                            "\(type) should stop around \(formatter.string(from: current.end)).",
+                            "precip-end"
                         )
                         settings.lastNotifiedPrecipEnd = current.end
                         settings.pendingPrecipEnd = nil
@@ -98,25 +112,25 @@ final class NotificationService {
 
         // --- Rain resuming after brief gap ---
         if settings.rainStartEnabled,
-           !forecast.isCurrentlyPrecipitating,
+           !forecast.isPrecipitating(at: now),
            let lastEnd = settings.lastRainEndTime,
            now.timeIntervalSince(lastEnd) <= 10 * 60,
-           let next = forecast.nextPrecipitationPeriod,
+           let next = forecast.nextPrecipitationPeriod(at: now),
            next.start.timeIntervalSince(now) <= 60 * 60,
            !settings.isSameEvent(settings.lastNotifiedPrecipStart, next.start) {
             let mins = max(1, Int(next.start.timeIntervalSince(now) / 60))
             let type = next.type.rawValue
-            scheduleImmediate(
-                title: "More \(type.lowercased()) coming",
-                body: "\(type) returns in about \(mins) min.",
-                identifier: "precip-resume"
+            deliver(
+                "More \(type.lowercased()) coming",
+                "\(type) returns in about \(mins) min.",
+                "precip-resume"
             )
             settings.lastNotifiedPrecipStart = next.start
             print("[Notifications] Rain resuming notification sent")
         }
     }
 
-    private func scheduleImmediate(title: String, body: String, identifier: String) {
+    private static func deliverImmediately(title: String, body: String, identifier: String) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -133,6 +147,6 @@ final class NotificationService {
     }
 
     func cancelAll() {
-        center.removeAllPendingNotificationRequests()
+        Self.center.removeAllPendingNotificationRequests()
     }
 }
