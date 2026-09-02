@@ -177,13 +177,7 @@ extension LocationService: CLLocationManagerDelegate {
             if !hadWaiters, self.shouldRegister(location) {
                 // Significant location change — register with backend if moved >10km
                 let settings = NotificationSettings()
-                await PushRegistrationService.shared.registerLocation(
-                    lat: location.coordinate.latitude,
-                    lon: location.coordinate.longitude,
-                    leadTimeMinutes: settings.leadTime,
-                    rainStartEnabled: settings.rainStartEnabled,
-                    rainEndEnabled: settings.rainEndEnabled
-                )
+                await PushRegistrationService.shared.registerLocation(location, settings: settings)
                 self.saveRegisteredLocation(location)
             }
         }

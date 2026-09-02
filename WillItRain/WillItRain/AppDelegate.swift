@@ -20,13 +20,7 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         Task {
             if let location = try? await locationService.currentLocation() {
                 let settings = NotificationSettings()
-                await PushRegistrationService.shared.registerLocation(
-                    lat: location.coordinate.latitude,
-                    lon: location.coordinate.longitude,
-                    leadTimeMinutes: settings.leadTime,
-                    rainStartEnabled: settings.rainStartEnabled,
-                    rainEndEnabled: settings.rainEndEnabled
-                )
+                await PushRegistrationService.shared.registerLocation(location, settings: settings)
             }
         }
     }

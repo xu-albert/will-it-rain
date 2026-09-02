@@ -290,13 +290,7 @@ struct ContentView: View {
     private func renewPushRegistration() async {
         guard PushRegistrationService.shared.hasStoredToken else { return }
         guard let location = try? await locationService.currentLocation() else { return }
-        await PushRegistrationService.shared.registerLocation(
-            lat: location.coordinate.latitude,
-            lon: location.coordinate.longitude,
-            leadTimeMinutes: settings.leadTime,
-            rainStartEnabled: settings.rainStartEnabled,
-            rainEndEnabled: settings.rainEndEnabled
-        )
+        await PushRegistrationService.shared.registerLocation(location, settings: settings)
     }
 
     private func fetchWeather() async {
@@ -325,13 +319,7 @@ struct ContentView: View {
                 await MainActor.run { UIApplication.shared.registerForRemoteNotifications() }
                 // Wait briefly for APNs to deliver the device token
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                await PushRegistrationService.shared.registerLocation(
-                    lat: location.coordinate.latitude,
-                    lon: location.coordinate.longitude,
-                    leadTimeMinutes: settings.leadTime,
-                    rainStartEnabled: settings.rainStartEnabled,
-                    rainEndEnabled: settings.rainEndEnabled
-                )
+                await PushRegistrationService.shared.registerLocation(location, settings: settings)
             }
 
             let interval = forecast.nextPollInterval(leadTimeMinutes: settings.leadTime)
