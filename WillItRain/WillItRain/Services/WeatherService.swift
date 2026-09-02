@@ -50,7 +50,7 @@ final class WeatherService {
 
         dataPoints.sort { $0.date < $1.date }
 
-        let periods = findPrecipitationPeriods(from: dataPoints)
+        let periods = PrecipitationPeriod.detect(in: dataPoints)
         let condition = currentWeatherCondition(current: weather.2, periods: periods)
 
         let dailySummaries = weather.3.forecast.prefix(7).map { day in
@@ -83,62 +83,6 @@ final class WeatherService {
         case .none: return .none
         default: return .rain
         }
-    }
-
-    /// A point counts as precipitation when a specific amount is predicted (`intensity != .none`)
-    /// OR when rain is more likely than not (`probability >= 0.5`). Keying off amount alone made the
-    /// app show "Clear" when WeatherKit reported a high chance but a low probability-weighted amount —
-    /// the "says nothing's happening when it's going to rain" bug. Adding the chance gate only *adds*
-    /// detections (never removes), and 0.5 keeps marginal <50% forecasts from crying wolf. This makes
-    /// the in-app status agree with the backend, which already gates on precipitation chance.
-    private static let likelyRainProbability = 0.5
-
-    private func findPrecipitationPeriods(from dataPoints: [ChartDataPoint]) -> [PrecipitationPeriod] {
-        var periods: [PrecipitationPeriod] = []
-        var periodStart: Date?
-        var periodType: PrecipitationType = .none
-        var peakIntensity: PrecipitationIntensity = .none
-
-        for point in dataPoints {
-            let isWet = point.intensity != .none || point.probability >= Self.likelyRainProbability
-            if isWet {
-                // If it's likely to rain but the predicted amount rounds to "none", call it light.
-                let intensity = point.intensity == .none ? .light : point.intensity
-                if periodStart == nil {
-                    periodStart = point.date
-                    periodType = point.type == .none ? .rain : point.type
-                    peakIntensity = intensity
-                } else {
-                    if intensity > peakIntensity {
-                        peakIntensity = intensity
-                    }
-                    if point.type != .none && point.type != periodType {
-                        // Type changed — keep the dominant type
-                    }
-                }
-            } else if let start = periodStart {
-                periods.append(PrecipitationPeriod(
-                    start: start,
-                    end: point.date,
-                    type: periodType,
-                    peakIntensity: peakIntensity
-                ))
-                periodStart = nil
-                peakIntensity = .none
-            }
-        }
-
-        // Close any open period
-        if let start = periodStart, let lastDate = dataPoints.last?.date {
-            periods.append(PrecipitationPeriod(
-                start: start,
-                end: lastDate,
-                type: periodType,
-                peakIntensity: peakIntensity
-            ))
-        }
-
-        return periods
     }
 
     private func currentWeatherCondition(
