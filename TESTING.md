@@ -1,8 +1,313 @@
-# Gonna Rain? — Notification Testing Guide (temporary)
+# Gonna Rain? — Test Plan
 
-_Written 2026-07-24 for Release 2. Delete when done._
+This is the project's comprehensive test plan, covering strategy, unit/integration/regression
+coverage, manual and release procedures. It supersedes the informal scope of the original
+`TESTING.md` (written 2026-07-24 as a one-off production-debugging runbook); that content is
+preserved verbatim below as [Appendix A](#appendix-a-production-ops--notification-testing-runbook)
+because it is still the correct procedure for its narrow purpose (inspecting/pruning production
+KV, firing a real push, reading the abuse-gate symptom table) — it is not a test plan and this
+document does not duplicate it.
 
-## ⚠️ Read this first — the `--remote` gotcha
+Build/run/CI mechanics (scheme name, `xcodebuild` invocations, simulator traps, backend budget
+arithmetic) live in [`AGENTS.md`](AGENTS.md) and are linked rather than repeated here.
+
+## 1. Test strategy and the pyramid
+
+Two independently-tested components share one repo: the **backend Worker** (`backend/`, stateless
+HTTP + a 10-minute cron, tested with Vitest against in-memory KV/DO mocks) and the **iOS app**
+(`WillItRain/`, tested with XCTest, hosted so it can assert on the real build product). There is no
+shared test runner and no end-to-end harness that drives both together — the two sides are
+integrated only by the DEVICE_TOKEN/HTTP contract, which is currently verified manually
+([Appendix A](#appendix-a-production-ops--notification-testing-runbook), section C) rather than by
+an automated contract test. See section 3 for what that leaves unguarded.
+
+```
+        ▲  Manual/exploratory (section 6): release-eve device pass, Live Activity states
+       ╱ ╲ E2E (section 5): none automated — App Store Connect TestFlight is the closest thing
+      ╱   ╲
+     ╱     ╲ Integration/contract (section 3): abuse.test.ts drives the real fetch handler +
+    ╱       ╲ real Durable Object classes over mocked KV; iOS has none against a live backend
+   ╱─────────╲
+  ╱  Unit      ╲ backend: abuse.ts, grid.ts (partial); iOS: PrecipitationIntensity,
+ ╱   (§2)       ╲ CLLocationManager continuation, Info.plist (BuildProductTests)
+```
+
+The backend pyramid is inverted relative to a typical service: there is effectively one large,
+high-value integration suite (`abuse.test.ts`, 59 tests exercising `index.ts`'s real `fetch`
+handler end-to-end) and very little narrow unit coverage of the pure helper modules underneath
+it. The iOS pyramid is the opposite problem — three small, genuinely unit-level suites and no
+integration coverage of the services that talk to WeatherKit, APNs tokens, or the backend.
+
+## 2. Unit tests
+
+### What exists
+
+| Area | File | Runner | Covers |
+|---|---|---|---|
+| Backend abuse gate | `backend/test/abuse.test.ts` | Vitest | Rate limiting, grid-cell/device caps, TTL/rewrite-cooldown logic, cron push-budget math, re-registration semantics, content-type validation — see the `describe()` list in section 4 |
+| Backend test harnesses | `backend/test/kvMock.ts`, `backend/test/doMock.ts` | — | In-memory KV (with expiry + stale-read simulation) and a Durable Object namespace mock that runs the *real* `CoverageRegistry`/`RegistrationLimiter` classes, not stubs |
+| iOS forecast model | `WillItRain/WillItRainTests/RainForecastTests.swift` | XCTest | `PrecipitationIntensity.from(millimetersPerHour:)` thresholds and `Comparable` ordering |
+| iOS location service | `WillItRain/WillItRainTests/LocationServiceTests.swift` | XCTest | `LocationService.currentLocation()` against a stubbed `CLLocationManager`, including the stuck-continuation regression (see section 4) |
+| iOS build product | `WillItRain/WillItRainTests/BuildProductTests.swift` | XCTest | Generated `Info.plist` keys: portrait lock, bundle ID, display name, Live Activity entitlement flags, background task ID, location usage strings, version keys present |
+
+### What is missing
+
+- **Backend:** `weatherkit.ts` (WeatherKit REST parsing), `apns.ts` (`sendRainAlert`/`sendRainEndAlert` payload shaping and APNs response handling), and the `scheduled()` cron handler in
+  `index.ts` have no unit tests — `abuse.test.ts`'s "cron fan-out budget" `describe` blocks test the
+  *budget arithmetic* (`createPushBudget`, imported from `abuse.ts`), not the cron entry point
+  actually calling WeatherKit or APNs. `validate.ts` (payload validation) is exercised only
+  indirectly through `/register` HTTP calls, not with direct unit cases per validator.
+- **iOS:** `WeatherService.swift` (WeatherKit fetch, `findPrecipitationPeriods`, precipitation-type
+  mapping), `NotificationService.swift`, `PushRegistrationService.swift` (token storage,
+  `registerLocation`, Live Activity token register/unregister), and `LiveActivityService.swift`
+  have no unit tests. `RainForecastTests.swift` covers only `PrecipitationIntensity`, not
+  `PrecipitationPeriod.detect(in:)` or the chart-data-point pipeline that feeds it. No view-level
+  (`ViewInspector`-style) tests exist for `ContentView`, `SettingsView`, `RainChartView`, or the
+  widgets.
+
+### Naming and location conventions
+
+- Backend: one `*.test.ts` per concern under `backend/test/`, named for the thing under test
+  (`abuse.test.ts`) rather than the source file 1:1 — a new `weatherkit.test.ts` /
+  `apns.test.ts` per module is the natural split for the gap above. `describe()` blocks are named
+  as plain-English scenarios ("the 250-registrations-in-0.47s flood"), not method names — keep
+  this style, it is what makes the regression catalog in section 4 legible.
+- iOS: one `XCTestCase` subclass per source file under test, named `<Subject>Tests.swift` in
+  `WillItRain/WillItRainTests/`, hosted in the app target (required for `BuildProductTests` to see
+  the real `Bundle.main`, and for `@testable import WillItRain` elsewhere).
+
+### How to run
+
+- Backend: `cd backend && npm test` (Vitest) or `npm run typecheck` for the TS gate. Both are
+  npm-dependency-free at runtime (see [`AGENTS.md`](AGENTS.md)).
+- iOS: `xcodebuild build-for-testing … && xcodebuild test-without-building …` per the headless
+  invocation already documented in [`AGENTS.md`](AGENTS.md) ("Local headless verification") — do
+  not repeat those flags here, that section is the source of truth.
+
+## 3. Integration and contract tests
+
+| Boundary | Real or mocked today | Notes |
+|---|---|---|
+| Worker HTTP handler (`index.ts`) ↔ KV | Real handler, mocked KV (`kvMock.ts`) | `abuse.test.ts` calls `worker.fetch(...)` directly — this is a real integration test of routing + validation + the abuse gate, just against an in-memory KV |
+| Worker ↔ Durable Objects | Real handler, real DO classes, mocked DO runtime (`doMock.ts`) | Deliberately models single-instance-per-name and serialized delivery so the 250-concurrent-registration flood test exercises genuine interleaving |
+| Worker ↔ WeatherKit REST | **Untested** | No fixture/contract test pins the WeatherKit response shape the Worker's cron parses; a schema change upstream would only surface in production `wrangler tail` logs |
+| Worker ↔ APNs | **Untested** at the unit/integration level; verified manually | [Appendix A section C](#appendix-a-production-ops--notification-testing-runbook) is the only check that a push payload actually reaches APNs and buzzes a phone — it requires `ADMIN_TOKEN` and a live device, so it cannot run in CI |
+| iOS app ↔ Worker (`/register`, `/register-activity`, `/unregister*`) | **Untested** | No iOS test mocks `PushRegistrationService`'s `URLSession` calls; no backend test simulates the exact payload shapes `PushRegistrationService.swift` sends. A shape drift on either side (e.g. a renamed JSON field) is caught by neither suite |
+| iOS app ↔ WeatherKit | **Untested** | `WeatherService.swift` calls `WeatherKit.WeatherService.shared` directly with no protocol seam to inject a fake, unlike `LocationService`'s `CLLocationManager` stub pattern |
+| iOS app ↔ APNs device token | Untested | Token capture (`storeToken`) and the resulting `/register` call are unverified together |
+
+The backend's approach — run the real production code against a realistic in-memory
+double of the *stateful* dependency (KV, DO) rather than mocking the code under test — is the
+right pattern and should be extended to `weatherkit.ts` and `apns.ts` (inject a fake `fetch`,
+assert on the request built and the response parsed) rather than reached for network mocking
+libraries. The iOS side has no equivalent seam for `WeatherService` or `PushRegistrationService`
+yet; `LocationService`'s subclassed-`CLLocationManager` stub (`LocationServiceTests.swift`) is the
+existing precedent to follow when adding one.
+
+## 4. Regression catalog
+
+Built from `git log --oneline` fix commits and PRs. "Guarding test" names the test that would fail
+if the bug came back; `UNGUARDED` means no such test exists today.
+
+| Fix commit | Bug | Guarding test |
+|---|---|---|
+| `423acc9` fix(backend): bound registration abuse with DO caps and Free-plan budgets | Unauthenticated `/register` allowed unlimited grid-cell/device growth, spending the WeatherKit and APNs subrequest budget on abuse rather than real users | `abuse.test.ts` → `describe('the 250-registrations-in-0.47s flood')`, `describe('grid-cell cap')`, `describe('per-client rate limit')` |
+| `0248bec` Move abuse gate to Durable Objects; rederive caps for Free plan | A KV-counter-based gate cannot see a sub-second burst (60s read floor) | `abuse.test.ts` via `doMock.ts`'s serialized-delivery model — the flood test would pass falsely against a naive KV counter |
+| `78bdac1` Fix location continuation race | `LocationService.currentLocation()` could leave its `CheckedContinuation` unresumed forever under a specific delegate-callback ordering | `LocationServiceTests.swift` — the file's own header notes the test polls rather than awaits specifically so this hang fails instead of hanging CI |
+| `8d7fd8f` Never defer cell moves, always unmute on re-register | A device moving to a new grid cell was silently held back by the same-cell settings-cooldown, leaving it unalerted after a real move | `abuse.test.ts` → `describe('re-registration')` |
+| `55eec51` / `2393831` / `13856e4` (no-mistakes review series) Skip redundant writes, budget cron reaps, queue dead-token reaps | Free-plan KV daily write/delete allowances could be exhausted by redundant rewrites or unbounded reap loops | `abuse.test.ts` → `describe('registration records expire')`, `describe('the cron fan-out budget')` |
+| `9eb05b2` fix(WillItRain): lock app to portrait and bump to 1.1.1 (6) | Regression risk: `GENERATE_INFOPLIST_FILE` merging could silently drop the orientation lock on a build-setting change | `BuildProductTests.testAppIsLockedToPortrait` |
+| `a4f6392` Fix Apple Weather attribution to use apple.logo per guideline 5.2.5 | Non-compliant attribution risked App Store rejection under WeatherKit guideline 5.2.5 | **UNGUARDED** — no test asserts the attribution view renders `apple.logo`; only a manual screenshot (`screenshots/notifications/notification-copy-*.png`, per [Appendix A](#appendix-a-production-ops--notification-testing-runbook)) exists |
+| `4d4fd90` fix Live Activity countdown overflow | Countdown arithmetic could overflow/underflow near the end of a rain window | **UNGUARDED** — no unit test on `RainActivityAttributes.ContentState` countdown math |
+| `a75f28d` fix rain-status detection + server-side rain-end push | On-device rain-status detection and the server's rain-end push could disagree | **UNGUARDED** for the server side (no `apns.ts` test, per section 3); partially covered on-device via `RainForecastTests.swift`'s intensity tests, but not the specific detection bug |
+| `d0f0452` Fix chart x-axis timestamps to show full h:mm format | Chart labels dropped the hour or minute component under certain timestamps | **UNGUARDED** — `RainChartView` has no tests |
+| `14611e1` Fix chart touch offset, show rain duration, fix precip type mapping | Touch-position-to-data-point mapping and precip-type mapping were both wrong | **UNGUARDED** — no `WeatherService` precip-type-mapping test (the gap noted in section 2) |
+| `01bbbf6` Fix background refresh by configuring Info.plist correctly | `BGTaskSchedulerPermittedIdentifiers` missing/wrong broke background refresh silently | `BuildProductTests.testBackgroundRefreshTaskRegistered` |
+| `28d14a2` Fix push registration timing: wait for APNs token before registering | A race could register a device before its APNs token was captured | **UNGUARDED** — no `PushRegistrationService` test (per section 3) |
+
+**Rule for future fixes:** every commit whose message starts `fix:`/`fix(...)` or is tagged
+`hotfix` must add or extend a test in the same PR that fails on the pre-fix code, named for the
+scenario (not the internal method), and recorded as a new row in this table. A fix that cannot be
+covered by an automated test (e.g. it requires live APNs/WeatherKit) must instead add or update a
+step in [section 6](#6-manual-and-exploratory-test-plan) and say so in the PR description — never
+land a fix with no row here and no manual step.
+
+## 5. End-to-end and UI tests
+
+There is no automated E2E suite (no XCUITest target, no Playwright/Puppeteer-driven web
+surface — the Worker has no UI). The closest thing to E2E today is manual: TestFlight builds plus
+the [Appendix A](#appendix-a-production-ops--notification-testing-runbook) production push flow
+(`/test-rain`, `/test-cron`) against a real device.
+
+If UI automation is added, it needs:
+
+- **Simulator:** iPhone 17 Pro (the CI/local convention already fixed by [`AGENTS.md`](AGENTS.md)). No other simulator has been validated against the Dynamic Island/Live Activity capture traps documented in `WillItRain/Design/AppIcon/capture-icon-shots.sh`.
+- **Physical device (recommended, not required by CI):** Live Activity APNs delivery, background refresh, and Dynamic Island behavior are only fully representative on hardware; the simulator cannot receive real push notifications at all.
+- **No browser targets** — the backend is a headless Worker API with no served UI.
+
+This is listed as a backlog item in section 11, not implemented here, per the docs-only scope of
+this PR.
+
+## 6. Manual and exploratory test plan
+
+Run before every TestFlight/App Store submission. Each scenario names its expected result; a
+failure blocks the release.
+
+| # | Scenario | Steps | Expected result |
+|---|---|---|---|
+| M1 | Portrait lock | Rotate device/simulator to landscape while app is foregrounded | UI does not rotate (guards `9eb05b2`) |
+| M2 | Cold-launch registration | Fresh install, grant location, background app immediately | `/register` fires with the real device token — confirm via [Appendix A section B](#appendix-a-production-ops--notification-testing-runbook) |
+| M3 | Foreground re-registration | Bring app to foreground after being backgrounded >7 days worth of simulated time (or just confirm the call fires) | A re-registration call is made on `willEnterForeground` (per [`AGENTS.md`](AGENTS.md)'s TTL-renewal note) |
+| M4 | Location-move re-registration | Move (or simulate location change) >10 km from the registered point | New registration lands in the new grid cell; old cell's alert stops (per `LocationService` re-registration rule in `AGENTS.md`) |
+| M5 | Real push delivery | Run [Appendix A section C](#appendix-a-production-ops--notification-testing-runbook)'s `/test-rain` curl against your own registered token | Phone receives the push; payload matches `NotificationService.swift`'s expected format |
+| M6 | Live Activity states A/B/C | Launch with `-liveActivityScenario <A\|B\|C>` (see `LiveActivityDebugScenarios.swift`) | Each renders per its design mock (`docs/design/live-activity/v3-final.png`); no clipped/overflowing countdown text (guards `4d4fd90`) |
+| M7 | Dynamic Island expanded capture | Long-press the Live Activity; screenshot **while the press is held** | Expanded presentation renders correctly — see the trap documented in `capture-icon-shots.sh` and `AGENTS.md`'s "Driving the iOS Simulator" section (collapses the instant the press releases) |
+| M8 | First-unlock Live Activity consent sheet | Trigger the first Live Activity after a fresh unlock | "Allow Live Activities from …?" sheet appears and is dismissable without breaking the card underneath |
+| M9 | Weekly forecast view | Open the weekly forecast from the main screen | Renders 7 days, no missing/duplicate days, matches VISION.md's framing of "the weekly view exists to frame the hour" |
+| M10 | Attribution persistence | View every screen/state that shows weather data | Apple Weather attribution (`apple.logo`) is visible and legible in all states, per guideline 5.2.5 (guards `a4f6392` — currently the only guard for that fix, see section 4) |
+| M11 | Notification copy review | Trigger a rain-start and a rain-end notification | Copy matches the reviewed strings in `screenshots/notifications/notification-copy-*.png` |
+| M12 | Accessibility pass | See section 9 | — |
+| M13 | Widget rendering | Add small and medium widgets to the Home Screen | Both render current forecast without truncation or placeholder data |
+| M14 | Abuse-gate symptom spot-check | Deliberately trigger one 503 (`coverage_at_capacity` or `cell_at_capacity`) against a non-production or disposable registration | Response matches the symptom table in [Appendix A section G](#appendix-a-production-ops--notification-testing-runbook); confirms the gate is live in the deployed environment, not just in `abuse.test.ts` |
+
+## 7. Performance and load
+
+| Budget | Value | Enforced by | Measured by |
+|---|---|---|---|
+| External subrequests per cron invocation (Free plan hard cap: 50) | 15 WeatherKit fetches + `PUSH_BUDGET_PER_INVOCATION` (34) APNs pushes ≤ 50 | `backend/src/abuse.ts` constants (`MAX_GRID_CELLS`, `PUSH_BUDGET_PER_INVOCATION`) | `abuse.test.ts` → `describe('the cron fan-out budget')`, `describe('a cron tick that wants more pushes than the plan allows')` — asserts the arithmetic, not a live invocation |
+| Grid-cell capacity | `MAX_GRID_CELLS` = 15 | `abuse.ts` | `abuse.test.ts` → `describe('grid-cell cap')` |
+| Devices per cell | `MAX_DEVICES_PER_CELL` = 20 | `abuse.ts` | Same suite |
+| Per-client registration rate | `RATE_LIMIT_MAX_REQUESTS` (20) per `RATE_LIMIT_WINDOW_SECONDS` (600) | `abuse.ts` via Durable Object | `abuse.test.ts` → `describe('per-client rate limit')`, and the 250-in-0.47s flood test |
+| Internal (KV/DO) subrequests per invocation | `INTERNAL_SUBREQUEST_CEILING` = 1,000, modeled by `INTERNAL_SUBREQUESTS_PER_TICK_FIXED` + per-device/per-push/per-reap constants | `abuse.ts` | Same suite; see [`AGENTS.md`](AGENTS.md) for the full derivation and why it must be re-run before touching the cron schedule or grid precision |
+| Daily KV allowances (Free plan: 100k reads, 1k writes/deletes/lists) | Sized by `MAX_TTL_MIGRATIONS_PER_TICK` (5), `MAX_DEVICE_REAPS_PER_TICK` (2), `DEVICE_RECORD_REFRESH_SECONDS` (7d), `DEVICE_REWRITE_COOLDOWN_SECONDS` (5m) | `abuse.ts` | `abuse.test.ts` → `describe('registration records expire')`; no test currently sums a simulated day's worth of ticks against the 1,000-write/delete ceilings directly (see backlog, section 11) |
+| WeatherKit quota | Cross-check only — a full service at these caps uses ~13% of quota | — | Not test-enforced; monitor via Apple's WeatherKit usage dashboard if this ever becomes the binding constraint |
+
+There is no load test against a live deployment (`wrangler dev` or production) — all of the above
+is verified as arithmetic/unit assertions against mocks, which is appropriate for a Free-plan
+Worker where an actual load test would itself burn the scarce subrequest budget it's trying to
+protect.
+
+## 8. Security and privacy checks
+
+| Concern | Status | Where |
+|---|---|---|
+| `/register`, `/register-activity` are unauthenticated by construction (Worker URL ships in the app binary; APNs tokens aren't server-verifiable) | Accepted, bounded by the abuse gate rather than auth | [`AGENTS.md`](AGENTS.md) "Backend Worker"; `abuse.test.ts` covers the gate |
+| `/test-rain`, `/test-cron` (real-push, real-WeatherKit-quota debug endpoints) | Gated by `X-Admin-Token` against the `ADMIN_TOKEN` Worker secret | [Appendix A section C](#appendix-a-production-ops--notification-testing-runbook); no automated test currently asserts the 401-without-header case — candidate for `abuse.test.ts` |
+| Secrets at rest | `APNS_ENV`, `ADMIN_TOKEN` are Wrangler secrets, not env vars or committed config; never written to this file (Appendix A explicitly says "never in this file") | `wrangler secret put` per Appendix A sections C, E |
+| Device data at rest | KV stores lat/lon/token/settings with a 45-day TTL (`DEVICE_RECORD_TTL_SECONDS`); no PII beyond coordinates and an opaque device token | `backend/src/types.ts` `DeviceRegistration`; TTL behavior covered by `abuse.test.ts` → `describe('registration records expire')` |
+| Input validation | `validate.ts` checks token format (64–128 hex), content-type | `abuse.test.ts` → `describe('content type')`; no dedicated `validate.test.ts` (gap, section 2) |
+| Abuse limits (flood, per-client, per-cell) | Covered — see sections 4, 7 | `abuse.test.ts` |
+| iOS location data | Only sent to this project's own Worker over HTTPS; no third-party analytics/tracking SDK present in `Package.swift`/project deps (confirm on any dependency addition) | Verify manually if dependencies change — not currently automated |
+| App Transport Security | Default ATS (no exceptions found in Info.plist build settings) | Spot-check `INFOPLIST_KEY_*` in the pbxproj on release |
+
+## 9. Accessibility
+
+No automated accessibility tests exist (no `XCUIApplication` accessibility audit, no
+`XCTAssert` against Dynamic Type/VoiceOver). Manual checks for the release checklist:
+
+| Check | How |
+|---|---|
+| Dynamic Type | Set the simulator/device to the largest accessibility text size; confirm `RainStatusView`, `WeeklyForecastView`, and the Live Activity card (`RainLiveActivity.swift`) do not truncate or overlap |
+| VoiceOver | Enable VoiceOver, swipe through `ContentView` and `SettingsView`; every control must have a label announced |
+| Contrast | Check the drift-scatter icon and in-app color palette in both light and dark mode, especially the Live Activity's cyan rain-segment track against the lock-screen background (per the "wintry palette" work in git history, e.g. `47d0cf1`) |
+| Reduce Motion | If `Animations/` contains any looping/parallax effect, confirm it respects `UIAccessibility.isReduceMotionEnabled` |
+
+This is a real gap relative to sections 2–4: there is no regression guard for any of these, so an
+accessibility regression is caught only if a human runs this table before release.
+
+## 10. Release checklist
+
+| Gate | CI-enforced today? | Where |
+|---|---|---|
+| Backend typecheck (`npm run typecheck`) | ✅ CI | `.github/workflows/ci.yml` backend job |
+| Backend tests (`npm test`, 59 tests) | ✅ CI | Same |
+| iOS unsigned simulator build | ✅ CI | `.github/workflows/ci.yml` iOS job |
+| iOS unit tests (headless, iPhone 17 Pro) | ✅ CI | Same |
+| `xcodebuild ... build-for-testing` / `test-without-building` locally before pushing | Manual (recommended) | [`AGENTS.md`](AGENTS.md) "Build & test" |
+| `npx wrangler deploy --dry-run` | Manual (recommended), not in CI | [`AGENTS.md`](AGENTS.md) "Backend Worker" |
+| Manual scenarios M1–M14 (section 6) | ❌ Manual only | This document |
+| Accessibility pass (section 9) | ❌ Manual only | This document |
+| App Store submission checklist (below) | ❌ Manual only | This document |
+| Regression catalog reviewed for new UNGUARDED rows on this release's fixes (section 4) | ❌ Manual only | This document |
+
+### App Store submission checklist
+
+- [ ] `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` bumped in the pbxproj (currently 1.1.1 / 6)
+      and matches the intended release notes.
+- [ ] `BuildProductTests` green on the actual archive configuration, not just Debug/simulator
+      (Info.plist merging can differ by configuration).
+- [ ] WeatherKit attribution present and correct in every weather-showing state (M10) — guideline
+      5.2.5 was a prior rejection risk (`a4f6392`).
+- [ ] Live Activity / Dynamic Island entitlements present (`NSSupportsLiveActivities`,
+      `NSSupportsLiveActivitiesFrequentUpdates`) — guarded by `BuildProductTests`.
+- [ ] Location usage strings (`NSLocationWhenInUseUsageDescription`,
+      `NSLocationAlwaysAndWhenInUseUsageDescription`) present and accurately describe the
+      lock-screen-alert use case — guarded by `BuildProductTests`, but wording accuracy needs a
+      human read.
+- [ ] Background refresh task ID registered — guarded by `BuildProductTests`.
+- [ ] Portrait lock intact — guarded by `BuildProductTests`.
+- [ ] App icon catalogue regenerated from `AppIcon.svg` via `render_appicon.py` if the icon
+      changed, and `verify_mark.py` passes (per [`AGENTS.md`](AGENTS.md) "App icon").
+- [ ] Backend deployed and `/test-rain`, `/test-cron` confirmed working against the release
+      build's registered tokens ([Appendix A section C](#appendix-a-production-ops--notification-testing-runbook)).
+- [ ] Junk/placeholder KV registrations pruned if they're occupying grid-cell capacity
+      ([Appendix A section F](#appendix-a-production-ops--notification-testing-runbook)).
+- [ ] Screenshots/App Store listing copy reflect the current notification wording
+      (`screenshots/notifications/notification-copy-*.png`).
+- [ ] Accessibility pass (section 9) completed for this release.
+- [ ] Known-gaps list in [Appendix A](#appendix-a-production-ops--notification-testing-runbook)
+      reviewed — confirm nothing there became release-blocking.
+
+## 11. Gaps and prioritized backlog
+
+Ordered by risk × how cheap the fix is; effort is rough.
+
+| Priority | Gap | Risk if unaddressed | Effort |
+|---|---|---|---|
+| P0 | No unit tests for `apns.ts` (payload shaping, APNs error-code handling: 410/BadDeviceToken paths) | A regression in dead-token cleanup or payload shape ships undetected until production logs show it — this is exactly the class of bug section 4 already lists as UNGUARDED twice | S–M: inject a fake `fetch`, assert request/response handling per status code |
+| P0 | No unit tests for `weatherkit.ts` | An upstream WeatherKit schema change silently breaks forecasts; no fixture pins the expected shape | S: fixture-based parse test |
+| P1 | No `PushRegistrationService`/`WeatherService` tests on iOS (no protocol seam for `WeatherKit.WeatherService.shared` or `URLSession`) | Same class of silent breakage as above, client-side; also leaves `28d14a2`'s timing fix and `14611e1`'s precip-type mapping fix unguarded | M: introduce a protocol seam (same pattern as `LocationServiceTests.swift`'s `CLLocationManager` subclass) |
+| P1 | No test for `PrecipitationPeriod.detect(in:)` or the chart-data-point pipeline | Chart/period-detection regressions (two of which already happened: `d0f0452`, `14611e1`) have no guard | S–M |
+| P2 | No 401-without-`X-Admin-Token` test for `/test-rain`/`/test-cron` | A future refactor could accidentally leave the debug endpoints open, burning WeatherKit/APNs quota | S: add to `abuse.test.ts` |
+| P2 | No `validate.test.ts` isolating each validator | Validation bugs are only caught through full-HTTP integration tests, making failures harder to localize | S |
+| P2 | No test simulating a full day's cron ticks against the 1,000 daily KV write/delete ceilings | A schedule or cap change could pass the per-invocation test yet still blow the daily budget (the exact multi-bucket risk `AGENTS.md` calls out) | M |
+| P3 | No accessibility or Dynamic Type automation | Regressions caught only by the manual pass (section 9) | M–L: `XCUIApplication` accessibility audit as a start |
+| P3 | No E2E/XCUITest automation of the manual scenarios in section 6 | Every release depends on a human running all 14 scenarios by hand | L: would need simulator/device time explicitly out of scope for this PR's no-GUI constraint |
+| P3 | No automated contract test for the iOS↔Worker JSON payload shape | A field rename on either side is caught only by manual testing or production failure | M: a schema shared or asserted on both sides |
+
+## 12. Running everything headlessly, in one place
+
+```bash
+# Backend — typecheck + unit/integration tests
+cd backend && npm ci && npm run typecheck && npm test
+
+# Backend — deploy dry-run (no actual deploy)
+cd backend && npx wrangler deploy --dry-run
+
+# iOS — build for testing, then run tests headlessly on iPhone 17 Pro
+# (full invocation and simulator-boot caveats: see AGENTS.md "Build & test")
+xcodebuild build-for-testing \
+  -project WillItRain/WillItRain.xcodeproj -scheme WillItRain \
+  -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO
+xcodebuild test-without-building \
+  -project WillItRain/WillItRain.xcodeproj -scheme WillItRain \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+xcrun simctl shutdown all
+```
+
+CI runs the backend and iOS jobs above automatically on every push/PR to `main`
+(`.github/workflows/ci.yml`); everything else in sections 5, 6, 9, and the App Store checklist in
+section 10 is manual today, per the backlog in section 11.
+
+---
+
+## Appendix A: Production Ops & Notification Testing Runbook
+
+_Written 2026-07-24 for Release 2. This is the original `TESTING.md` in full, preserved as
+operational reference (see the note at the top of this document for why it is kept rather than
+replaced)._
+
+### ⚠️ Read this first — the `--remote` gotcha
 
 `wrangler kv key list --namespace-id <id>` **reads your LOCAL sim state, not
 production**, so it returns `[]` even when production is full. **Always add
@@ -13,7 +318,7 @@ registered in production.** Nothing is broken.
 
 ---
 
-## Key facts
+### Key facts
 
 - **Worker:** `https://will-it-rain.albertwxu.workers.dev`, cron every 10 min.
 - **KV namespace `DEVICES`:** `142615e17bc84dc7adbd9e64d0b29410`.
@@ -24,7 +329,7 @@ registered in production.** Nothing is broken.
 
 ---
 
-## A. See registered devices (production)
+### A. See registered devices (production)
 
 ```bash
 cd backend
@@ -44,7 +349,7 @@ npx wrangler kv key get --remote "device:<paste-token>" --namespace-id $NS
 npx wrangler kv key get --remote "activity:<paste-token>" --namespace-id $NS
 ```
 
-## B. Confirm YOUR device is registered
+### B. Confirm YOUR device is registered
 
 There are several device tokens (old reinstalls each make a new one). To find
 *your current* one:
@@ -56,7 +361,7 @@ There are several device tokens (old reinstalls each make a new one). To find
    npx wrangler kv key get --remote "device:<that-hex>" --namespace-id $NS
    ```
 
-## C. Fire a real end-to-end push to your phone
+### C. Fire a real end-to-end push to your phone
 
 **Both test endpoints now require the `X-Admin-Token` header.** They send real
 pushes and spend real WeatherKit quota, and the Worker URL is extractable from
@@ -84,7 +389,7 @@ curl -X POST https://will-it-rain.albertwxu.workers.dev/test-cron \
   -d '{"token":"<your-token>","lat":37.7749,"lon":-122.4194}'
 ```
 
-### Dead token cleanup (automatic since 2026-07-27)
+#### Dead token cleanup (automatic since 2026-07-27)
 
 The cron no longer keeps pushing to tokens APNs has rejected:
 
@@ -102,7 +407,7 @@ The cron no longer keeps pushing to tokens APNs has rejected:
 - A rejected **Live Activity** push clears only that device's `activity:` key,
   leaving the device registered for ordinary rain alerts.
 
-## D. Watch the Worker live
+### D. Watch the Worker live
 
 ```bash
 cd backend
@@ -111,7 +416,7 @@ npx wrangler tail
 #   [Cron]/[Register] logs and any APNs errors in real time.
 ```
 
-## E. (Optional) set APNS_ENV explicitly
+### E. (Optional) set APNS_ENV explicitly
 
 ```bash
 cd backend
@@ -121,12 +426,12 @@ npx wrangler deploy
 
 ---
 
-## Where the copy lives
+### Where the copy lives
 - **Server push:** `backend/src/apns.ts` — `sendRainAlert`, `sendRainEndAlert`.
 - **On-device:** `WillItRain/WillItRain/Services/NotificationService.swift`.
 - Current wording preview: `screenshots/notifications/notification-copy-*.png`.
 
-## F. Prune junk registrations (run when convenient)
+### F. Prune junk registrations (run when convenient)
 
 Production KV has 5 placeholder tokens (`realtest`, `test123`, `test456`,
 `test789`, `testABC`) and 2 simulator tokens (160-hex — APNs always rejects
@@ -152,7 +457,7 @@ npx wrangler kv key delete --remote --namespace-id $NS "device:realtest"
 
 `/unregister` remains the right tool for a real 64-hex device token.
 
-## G. Registration limits (the abuse gate)
+### G. Registration limits (the abuse gate)
 
 `/register` and `/register-activity` are unauthenticated, so they are bounded
 rather than trusted. The limits all live in `backend/src/abuse.ts`; the counters
@@ -204,7 +509,7 @@ have one. The section-F placeholder and simulator tokens are included in that, s
 they will carry a TTL and expire 45 days later — delete them from KV (section F)
 if you want the slots and the error-log noise back sooner.
 
-## Known gaps (Release 2 follow-ups)
+### Known gaps (Release 2 follow-ups)
 - Server push says "in your area" (no city name) — backend stores only lat/lon.
   Add `locationName` to the `/register` payload to name the city.
 - Server can't tell rain vs snow (WeatherKit `forecastNextHour` has no type) —
