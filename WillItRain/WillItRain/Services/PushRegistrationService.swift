@@ -1,3 +1,4 @@
+import CoreLocation
 import Foundation
 
 final class PushRegistrationService {
@@ -19,6 +20,19 @@ final class PushRegistrationService {
     /// of its own first — a CoreLocation fix, say — can check this and skip it.
     var hasStoredToken: Bool {
         UserDefaults.standard.string(forKey: "pushDeviceToken") != nil
+    }
+
+    /// Register or update this device's location and alert settings — the form
+    /// every caller has in hand. Adding a field to the payload means changing this
+    /// one place, not each caller.
+    func registerLocation(_ location: CLLocation, settings: NotificationSettings) async {
+        await registerLocation(
+            lat: location.coordinate.latitude,
+            lon: location.coordinate.longitude,
+            leadTimeMinutes: settings.leadTime,
+            rainStartEnabled: settings.rainStartEnabled,
+            rainEndEnabled: settings.rainEndEnabled
+        )
     }
 
     /// Register or update location with the backend

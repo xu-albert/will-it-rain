@@ -1,4 +1,4 @@
-// A small in-memory stand-in for Workers KV, enough for the abuse-gate tests.
+// A small in-memory stand-in for Workers KV, enough for the backend tests.
 //
 // It models two behaviours the real thing has and a naive Map does not:
 //
