@@ -48,12 +48,43 @@ enum PrecipitationIntensity: String, Comparable {
 }
 
 struct ChartDataPoint: Identifiable {
+    /// How long a minute reading covers.
+    static let minuteSpan: TimeInterval = 60
+    /// How long an hourly reading covers.
+    static let hourSpan: TimeInterval = 3600
+
     let id = UUID()
     let date: Date
     let probability: Double // 0–1
     let intensity: PrecipitationIntensity
     let type: PrecipitationType
     let precipitationAmount: Double // mm/hr
+    /// How long this reading stands for, starting at `date`: a minute for a
+    /// minute-forecast reading, an hour for an hourly one. The merged series
+    /// mixes both, and this is what lets the chart tell them apart and what
+    /// makes "the hourly point that contains now" a well-defined thing.
+    let span: TimeInterval
+
+    init(
+        date: Date,
+        probability: Double,
+        intensity: PrecipitationIntensity,
+        type: PrecipitationType,
+        precipitationAmount: Double,
+        span: TimeInterval = ChartDataPoint.minuteSpan
+    ) {
+        self.date = date
+        self.probability = probability
+        self.intensity = intensity
+        self.type = type
+        self.precipitationAmount = precipitationAmount
+        self.span = span
+    }
+
+    /// Whether `instant` falls inside the stretch this reading covers.
+    func covers(_ instant: Date) -> Bool {
+        instant >= date && instant < date.addingTimeInterval(span)
+    }
 }
 
 struct PrecipitationPeriod: Identifiable {
@@ -192,6 +223,11 @@ struct RainForecast {
     let currentType: PrecipitationType
     let locationName: String
     let fetchedAt: Date
+    /// False where WeatherKit has no minute-by-minute forecast (it is regional).
+    /// The data points then start at the hourly reading that contains `fetchedAt`
+    /// instead of at the current minute, so the next hour is covered coarsely
+    /// rather than not at all; see `ForecastMerge`. The UI says so.
+    var hasMinuteForecast: Bool = true
 
     // Every time-dependent reading below takes the instant it is evaluated at, so
     // the same forecast can be asked what it means "now" and what it will mean in

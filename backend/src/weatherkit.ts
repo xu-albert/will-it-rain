@@ -37,7 +37,15 @@ async function generateJWT(env: Env): Promise<string> {
 
 export async function fetchForecast(lat: number, lon: number, env: Env): Promise<WeatherKitForecast> {
   const token = await generateJWT(env);
-  const url = `https://weatherkit.apple.com/api/v1/weather/en-US/${lat}/${lon}?dataSets=forecastNextHour`;
+  // forecastHourly is the fallback for regions with no forecastNextHour
+  // (nextHour.ts). Only the hours that can contain the next 60 minutes are
+  // asked for: the dataset starts on the current hour by default, and cutting
+  // it off two hours out keeps the response near its old size. Still one
+  // external subrequest.
+  const hourlyEnd = new Date(Date.now() + 2 * 3_600_000).toISOString();
+  const url =
+    `https://weatherkit.apple.com/api/v1/weather/en-US/${lat}/${lon}` +
+    `?dataSets=forecastNextHour,forecastHourly&hourlyEnd=${encodeURIComponent(hourlyEnd)}`;
 
   const resp = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },

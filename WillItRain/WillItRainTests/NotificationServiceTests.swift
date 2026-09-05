@@ -74,6 +74,35 @@ final class NotificationServiceTests: XCTestCase {
         )
     }
 
+    /// A forecast built the way `WeatherService` builds one where WeatherKit has
+    /// no minute forecast: hourly readings only, on the hour, from the hour that
+    /// contains `t0`. `t0` is 13:20 into its hour, so hour 1 begins 46:40 later.
+    private func hourlyOnlyForecast(wetHours: Set<Int>) -> RainForecast {
+        let hour0 = t0.addingTimeInterval(-800)
+        let hourly = (0..<12).map { h in
+            ChartDataPoint(
+                date: hour0.addingTimeInterval(TimeInterval(h) * 3600),
+                probability: wetHours.contains(h) ? 0.7 : 0.1,
+                intensity: wetHours.contains(h) ? .light : .none,
+                type: wetHours.contains(h) ? .rain : .none,
+                precipitationAmount: wetHours.contains(h) ? 1.0 : 0,
+                span: ChartDataPoint.hourSpan
+            )
+        }
+        let merged = ForecastMerge.merge(minute: nil, hourly: hourly, now: t0)
+        let periods = PrecipitationPeriod.detect(in: merged.dataPoints)
+        return RainForecast(
+            dataPoints: merged.dataPoints,
+            precipitationPeriods: periods,
+            dailySummaries: [],
+            currentCondition: .clear,
+            currentType: periods.first { $0.contains(t0) }?.type ?? .none,
+            locationName: "Testville",
+            fetchedAt: t0,
+            hasMinuteForecast: merged.hasMinuteForecast
+        )
+    }
+
     private func evaluate(_ forecast: RainForecast, at now: Date) {
         service.evaluateAndSchedule(forecast: forecast, settings: settings, now: now)
     }
@@ -172,6 +201,47 @@ final class NotificationServiceTests: XCTestCase {
 
         XCTAssertEqual(delivered, [])
         XCTAssertNil(settings.pendingPrecipStart)
+    }
+
+    // MARK: - Hourly-only data (no minute forecast in this region)
+
+    func testHourlyOnlyRainNextHourGoesThroughTheLeadTimeGate() {
+        // Rain in the coming hour, 46 minutes off. Outside a 20-minute lead
+        // time it is not even pending; once inside, the usual two passes fire it.
+        settings.leadTime = 20
+        let f = hourlyOnlyForecast(wetHours: [1])
+        XCTAssertFalse(f.hasMinuteForecast)
+
+        evaluate(f, at: t0)
+        XCTAssertEqual(delivered, [])
+        XCTAssertNil(settings.pendingPrecipStart)
+
+        evaluate(f, at: minutes(30))
+        XCTAssertEqual(delivered, [])
+        XCTAssertEqual(settings.pendingPrecipStart, t0.addingTimeInterval(2800))
+
+        evaluate(f, at: minutes(35))
+        XCTAssertEqual(identifiers, ["precip-start"])
+        XCTAssertEqual(delivered.first?.title, "Rain in ~11 min")
+    }
+
+    func testHourlyOnlyRainThisHourIsRainingNowAndItsEndIsAnnounced() {
+        // The hourly reading containing now is wet: that is rain now, and its
+        // end is the next hourly reading, 46 minutes off — inside the 30-minute
+        // end window once 20 minutes have passed.
+        let f = hourlyOnlyForecast(wetHours: [0])
+        XCTAssertTrue(f.isPrecipitating(at: t0))
+        XCTAssertEqual(f.currentType, .rain)
+
+        evaluate(f, at: t0)
+        XCTAssertNil(settings.lastRainEndTime, "Raining, so no dry spell has begun")
+        XCTAssertNil(settings.pendingPrecipEnd)
+
+        evaluate(f, at: minutes(20))
+        XCTAssertEqual(settings.pendingPrecipEnd, t0.addingTimeInterval(2800))
+        evaluate(f, at: minutes(25))
+        XCTAssertEqual(identifiers, ["precip-end"])
+        XCTAssertEqual(delivered.first?.title, "Rain ending soon")
     }
 
     // MARK: - Rain ending

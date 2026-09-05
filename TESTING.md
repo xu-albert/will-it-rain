@@ -57,8 +57,9 @@ integration coverage of the services that talk to WeatherKit, APNs tokens, or th
   *budget arithmetic* (`createPushBudget`, imported from `abuse.ts`), not the cron entry point
   actually calling WeatherKit or APNs. `validate.ts` (payload validation) is exercised only
   indirectly through `/register` HTTP calls, not with direct unit cases per validator.
-- **iOS:** `WeatherService.swift` (WeatherKit fetch, `findPrecipitationPeriods`, precipitation-type
-  mapping), `NotificationService.swift`, `PushRegistrationService.swift` (token storage,
+- **iOS:** `WeatherService.swift` (WeatherKit fetch, precipitation-type mapping — the minute/hourly
+  merge itself is the pure `ForecastMerge.merge(minute:hourly:now:)`, covered by
+  `ForecastMergeTests.swift`), `NotificationService.swift`, `PushRegistrationService.swift` (token storage,
   `registerLocation`, Live Activity token register/unregister), and `LiveActivityService.swift`
   have no unit tests. `RainForecastTests.swift` covers only `PrecipitationIntensity`, not
   `PrecipitationPeriod.detect(in:)` or the chart-data-point pipeline that feeds it. No view-level
@@ -124,6 +125,7 @@ if the bug came back; `UNGUARDED` means no such test exists today.
 | `14611e1` Fix chart touch offset, show rain duration, fix precip type mapping | Touch-position-to-data-point mapping and precip-type mapping were both wrong | **UNGUARDED** — no `WeatherService` precip-type-mapping test (the gap noted in section 2) |
 | `01bbbf6` Fix background refresh by configuring Info.plist correctly | `BGTaskSchedulerPermittedIdentifiers` missing/wrong broke background refresh silently | `BuildProductTests.testBackgroundRefreshTaskRegistered` |
 | `28d14a2` Fix push registration timing: wait for APNs token before registering | A race could register a device before its APNs token was captured | **UNGUARDED** — no `PushRegistrationService` test (per section 3) |
+| fix: hourly fallback where WeatherKit has no minute forecast, and keep the hourly reading containing now + 1h (edge-case report finding 10) | The minute/hourly merge cut at a hard now + 1h: with no minute forecast the series began an hour out and the hole never closed (never "raining", no rain-start alert possible at any lead time, and the cron returned early on the same boundary); with minute data the hourly reading for the hour the minute data ends in was dropped (at 10:05, 11:00 fell and 12:00 was next) | `ForecastMergeTests.swift` (`testTheHourlyReadingContainingNowPlusOneHourIsKept`, `testWithoutMinuteDataTheSeriesStartsAtTheHourContainingNow`, `testWithoutMinuteDataRainNextHourIsInsideTheLongestLeadTime`), `NotificationServiceTests.swift` → `testHourlyOnlyRainNextHourGoesThroughTheLeadTimeGate`; backend `next-hour.test.ts` and `cron-alerts.test.ts` → `reach devices where WeatherKit has no minute forecast` |
 
 **Rule for future fixes:** every commit whose message starts `fix:`/`fix(...)` or is tagged
 `hotfix` must add or extend a test in the same PR that fails on the pre-fix code, named for the

@@ -71,11 +71,27 @@ export interface CoverageReply {
   devices: number;
 }
 
+export interface WeatherKitMinute {
+  startTime: string;
+  precipitationChance: number;
+  precipitationIntensity: number;
+}
+
 export interface WeatherKitForecast {
+  /** Minute-by-minute for about the next hour. Regional: absent outside coverage. */
   forecastNextHour?: {
-    minutes: Array<{
-      startTime: string;
+    minutes: WeatherKitMinute[];
+  };
+  /**
+   * Hourly readings, starting on the current hour. Only the first few are
+   * requested (see weatherkit.ts); they stand in for forecastNextHour where
+   * WeatherKit has no minute forecast (see nextHour.ts).
+   */
+  forecastHourly?: {
+    hours: Array<{
+      forecastStart: string;
       precipitationChance: number;
+      /** mm/h, the same unit as a minute's. */
       precipitationIntensity: number;
     }>;
   };

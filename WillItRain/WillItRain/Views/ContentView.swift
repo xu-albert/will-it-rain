@@ -188,6 +188,14 @@ struct ContentView: View {
             Spacer()
 
             // Charts
+            if !forecast.hasMinuteForecast {
+                Text("Minute-by-minute forecast isn't available here; showing hourly")
+                    .font(.system(size: 12))
+                    .foregroundColor(.white.opacity(0.7))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 8)
+            }
             RainChartView(dataPoints: forecast.dataPoints, chartHours: 12)
                 .padding(.bottom, 12)
 

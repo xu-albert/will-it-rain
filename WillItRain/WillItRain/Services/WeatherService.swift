@@ -14,41 +14,37 @@ final class WeatherService {
         )
 
         let now = Date()
-        var dataPoints: [ChartDataPoint] = []
 
-        // Minute-by-minute for next hour
-        if let minuteForecast = weather.0 {
-            for minute in minuteForecast.forecast {
-                let type = precipitationType(from: minute.precipitation)
+        // Minute-by-minute for the next hour, where WeatherKit has it (regional).
+        let minutePoints: [ChartDataPoint]? = weather.0.map { minuteForecast in
+            minuteForecast.forecast.map { minute in
                 let mmPerHr = minute.precipitationIntensity.value
-                let intensity = PrecipitationIntensity.from(millimetersPerHour: mmPerHr)
-                dataPoints.append(ChartDataPoint(
+                return ChartDataPoint(
                     date: minute.date,
                     probability: minute.precipitationChance,
-                    intensity: intensity,
-                    type: type,
-                    precipitationAmount: mmPerHr
-                ))
+                    intensity: PrecipitationIntensity.from(millimetersPerHour: mmPerHr),
+                    type: precipitationType(from: minute.precipitation),
+                    precipitationAmount: mmPerHr,
+                    span: ChartDataPoint.minuteSpan
+                )
             }
         }
 
-        // Hourly for remaining hours
-        let hourlyForecast = weather.1
-        let oneHourFromNow = now.addingTimeInterval(3600)
-        for hour in hourlyForecast.forecast {
-            guard hour.date >= oneHourFromNow else { continue }
-            let type = precipitationType(from: hour.precipitation)
-            let intensity = PrecipitationIntensity.from(millimetersPerHour: hour.precipitationAmount.converted(to: .millimeters).value)
-            dataPoints.append(ChartDataPoint(
+        // Hourly, each reading standing for the hour it starts.
+        let hourlyPoints = weather.1.forecast.map { hour in
+            let mmPerHr = hour.precipitationAmount.converted(to: .millimeters).value
+            return ChartDataPoint(
                 date: hour.date,
                 probability: hour.precipitationChance,
-                intensity: intensity,
-                type: type,
-                precipitationAmount: hour.precipitationAmount.converted(to: .millimeters).value
-            ))
+                intensity: PrecipitationIntensity.from(millimetersPerHour: mmPerHr),
+                type: precipitationType(from: hour.precipitation),
+                precipitationAmount: mmPerHr,
+                span: ChartDataPoint.hourSpan
+            )
         }
 
-        dataPoints.sort { $0.date < $1.date }
+        let merged = ForecastMerge.merge(minute: minutePoints, hourly: hourlyPoints, now: now)
+        let dataPoints = merged.dataPoints
 
         let periods = PrecipitationPeriod.detect(in: dataPoints)
         let condition = currentWeatherCondition(current: weather.2, periods: periods)
@@ -70,7 +66,8 @@ final class WeatherService {
             currentCondition: condition,
             currentType: periods.first { $0.contains(now) }?.type ?? .none,
             locationName: locationName,
-            fetchedAt: now
+            fetchedAt: now,
+            hasMinuteForecast: merged.hasMinuteForecast
         )
     }
 

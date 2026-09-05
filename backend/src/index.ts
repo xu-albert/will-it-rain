@@ -8,6 +8,7 @@ import {
 } from './types';
 import { LegacyRecord, readActivityTokens, readCoverage, gridCenter, toGridKey } from './grid';
 import { fetchForecast } from './weatherkit';
+import { nextHourMinutes } from './nextHour';
 import {
   APNsError,
   sendRainAlert,
@@ -281,10 +282,13 @@ export default {
       const { lat, lon } = gridCenter(grid.gridKey);
       try {
         const forecast = await fetchForecast(lat, lon, env);
-        const minutes = forecast.forecastNextHour?.minutes;
+        const now = Date.now();
+        // Minute data where WeatherKit has it, the hourly forecast where it does
+        // not — without the fallback every device outside minute coverage was
+        // silently unalertable.
+        const minutes = nextHourMinutes(forecast, now);
         if (!minutes || minutes.length === 0) return;
 
-        const now = Date.now();
         const isWet = (m: { precipitationChance: number; precipitationIntensity: number }) =>
           m.precipitationChance > 0.3 && m.precipitationIntensity > 0;
         const rainingNow = isWet(minutes[0]);
@@ -728,7 +732,8 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
 
   try {
     const forecast = await fetchForecast(body.lat, body.lon, env);
-    const minutes = forecast.forecastNextHour?.minutes;
+    const now = Date.now();
+    const minutes = nextHourMinutes(forecast, now);
 
     if (!minutes || minutes.length === 0) {
       return new Response(JSON.stringify({ ok: true, result: 'no_forecast_data' }), {
@@ -736,7 +741,6 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
       });
     }
 
-    const now = Date.now();
     const rainStart = minutes.find(
       (m) => m.precipitationChance > 0.3 && m.precipitationIntensity > 0
     );
