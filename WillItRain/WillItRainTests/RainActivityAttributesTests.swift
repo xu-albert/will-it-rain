@@ -90,4 +90,17 @@ final class RainActivityAttributesTests: XCTestCase {
         XCTAssertEqual(bx.segments, b.segments)
         XCTAssertEqual(bx.subRest, b.subRest)
     }
+
+    /// `scripts/test-live-activity.sh` launches the card screen with the codes
+    /// upper-cased and comma-joined, exactly as the scenario enum spells them.
+    /// The parser accepts that shape and nothing else.
+    func testCardPreviewParsesCommaJoinedCodesExactly() {
+        let parsed = LiveActivityCardPreview.fromLaunchArgs(["-liveActivityCards", "A,BS,BX"])
+        XCTAssertEqual(parsed?.scenarios, [.a, .bWintry, .bLegacy])
+
+        XCTAssertNil(LiveActivityCardPreview.fromLaunchArgs(["-liveActivityCards", "a,bs"]))
+        XCTAssertNil(LiveActivityCardPreview.fromLaunchArgs(["-liveActivityCards", "A BS"]))
+        XCTAssertNil(LiveActivityCardPreview.fromLaunchArgs(["-liveActivityCards"]))
+        XCTAssertNil(LiveActivityCardPreview.fromLaunchArgs([]))
+    }
 }

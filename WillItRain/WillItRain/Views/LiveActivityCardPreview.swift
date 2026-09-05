@@ -54,8 +54,8 @@ extension LiveActivityCardPreview {
             return nil
         }
         let codes = args[idx + 1]
-            .split(whereSeparator: { $0 == "," || $0 == " " })
-            .compactMap { LiveActivityService.DebugScenario(rawValue: String($0).uppercased()) }
+            .split(separator: ",")
+            .compactMap { LiveActivityService.DebugScenario(rawValue: String($0)) }
         guard !codes.isEmpty else {
             print("[LiveActivity][Debug] -liveActivityCards matched no known scenarios: \(args[idx + 1])")
             return nil
