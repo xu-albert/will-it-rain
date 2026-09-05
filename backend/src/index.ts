@@ -62,8 +62,11 @@ const ACTIVITY_WINDOW_MINUTES = 90;
 const BAD_TOKEN_STRIKES = 5;
 
 // WeatherKit condition strings that should render with the wintry treatment.
-// Anything with ice in it groups together; everything else is rain.
-const WINTRY_CONDITIONS = new Set(['snow', 'sleet', 'hail', 'mixed', 'flurries', 'wintrymix']);
+// The WeatherKit REST API documents forecastNextHour.summary[].condition as
+// its PrecipitationType enum: clear, precipitation, rain, snow, sleet, hail,
+// mixed — lowercase bare nouns, confirmed live. This is an exact match on the
+// four with ice in them; everything else, documented or not, is rain.
+const WINTRY_CONDITIONS = new Set(['snow', 'sleet', 'hail', 'mixed']);
 
 // Server-side copy, kept in step with `precip`. Without this the widget would
 // draw a snowflake next to the word "rain".
@@ -96,7 +99,7 @@ export function precipFromForecast(forecast: WeatherKitForecast): Precip {
   if (!summary?.length) return 'rain';
 
   for (const period of summary) {
-    const condition = period.condition?.toLowerCase().replace(/[\s_-]/g, '');
+    const { condition } = period;
     if (!condition || condition === 'clear') continue;
     return WINTRY_CONDITIONS.has(condition) ? 'wintry' : 'rain';
   }

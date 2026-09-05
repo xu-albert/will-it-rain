@@ -175,11 +175,11 @@ describe('precipFromForecast', () => {
     expect(precipFromForecast(withSummary([{ condition: 'rain' }, { condition: 'snow' }]))).toBe('rain');
   });
 
-  it('groups everything with ice in it as wintry, whatever the casing or spacing', () => {
-    for (const c of ['snow', 'sleet', 'hail', 'mixed', 'flurries', 'Snow', 'wintry mix', 'wintry_mix', 'Wintry-Mix']) {
+  it('exact-matches the documented wintry conditions and treats everything else as rain', () => {
+    for (const c of ['snow', 'sleet', 'hail', 'mixed']) {
       expect(precipFromForecast(withSummary([{ condition: c }])), c).toBe('wintry');
     }
-    for (const c of ['rain', 'Rain', 'drizzle', 'heavyRain']) {
+    for (const c of ['rain', 'precipitation', 'Snow']) {
       expect(precipFromForecast(withSummary([{ condition: c }])), c).toBe('rain');
     }
   });

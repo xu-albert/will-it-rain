@@ -144,9 +144,10 @@ Two things this did **not** settle:
 
 *A wintry value has not been observed in the wild* — it was July. Perisher AU is
 covered and in season, so it is the target for a southern-hemisphere follow-up.
-`precipFromForecast` lowercases and strips spaces, hyphens and underscores
-before matching, so `"Snow"`, `"wintry mix"` and `"wintry_mix"` all resolve even
-if Apple's casing differs from `"rain"`.
+`precipFromForecast` exact-matches the documented lowercase values `snow`,
+`sleet`, `hail` and `mixed`; anything else resolves to `rain`, and `/test-cron`
+echoes the raw `summary` next to the derived `precip` so an unexpected spelling
+shows up in the probe rather than hiding behind a confident `rain`.
 
 *Apple's summary uses a higher confidence bar than our own detection.* Belfast
 showed `minutes` precipitation at chance 0.31 while `summary` still said

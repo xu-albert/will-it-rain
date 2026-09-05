@@ -37,9 +37,9 @@
 #
 # STILL UNPROVEN: a wintry value has not been observed in the wild (probed in
 # July; Perisher AU is covered and in season, so it is the best target come
-# southern-hemisphere snow). `precipFromForecast` lowercases and strips spaces,
-# hyphens and underscores before matching, so "Snow", "wintry mix" and
-# "wintry_mix" all resolve correctly if Apple's casing differs from "rain".
+# southern-hemisphere snow). `precipFromForecast` exact-matches the documented
+# lowercase values snow, sleet, hail and mixed; anything else resolves to rain,
+# which is why this probe echoes the raw `summary` next to the derived `precip`.
 # ---------------------------------------------------------------------------
 
 set -uo pipefail
