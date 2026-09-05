@@ -93,13 +93,16 @@ function copyFor(precip: Precip) {
 // app. It never throws.
 //
 // `at` is the start of the minute the push describes — the first wet minute on
-// the rain-start path — and resolves to the period covering it, so "snow
-// starting in 40 min" is wintry even though it is clear now. Without `at` the
-// answer is what is falling now, the first period: that is the rain-end path,
-// and it must not read a later period, because Apple's summary applies a
-// higher confidence bar than the per-minute test (the spec's Belfast case), so
-// light rain now with snow later in the hour would otherwise push "Snowing
-// now". A summary with no start times falls back to the first non-clear period.
+// the rain-start path — and resolves to the first non-clear period from the
+// one covering it onward, so "snow starting in 40 min" is wintry even though
+// it is clear now. Reading past a clear covering period matters because
+// Apple's summary applies a higher confidence bar than the per-minute test
+// (the spec's Belfast case): on a gradual onset the first wet minute lands a
+// little before the summary's snow period begins. Without `at` the answer is
+// what is falling now, the first period: that is the rain-end path, and it
+// must not read a later period, or light rain now with snow later in the hour
+// would push "Snowing now". A summary with no start times is read from the
+// beginning.
 //
 // Confirmed against live responses on 2026-07-27 (see the spec in
 // docs/superpowers/specs/): the field is real, values are lowercase bare nouns,
@@ -116,17 +119,15 @@ export function precipFromForecast(forecast: WeatherKitForecast, at?: string): P
 function periodFor(summary: SummaryPeriod[], at: string | undefined): SummaryPeriod | undefined {
   if (at === undefined) return summary[0];
 
-  const starts = summary.map((period) => Date.parse(period.startTime ?? ''));
-  if (starts.some(Number.isNaN)) {
-    return summary.find((period) => period.condition && period.condition !== 'clear');
-  }
-
   const target = Date.parse(at);
-  let covering = summary[0];
-  starts.forEach((start, i) => {
-    if (start <= target) covering = summary[i];
-  });
-  return covering;
+  const starts = summary.map((period) => Date.parse(period.startTime ?? ''));
+  let covering = 0;
+  if (!starts.some(Number.isNaN)) {
+    starts.forEach((start, i) => {
+      if (start <= target) covering = i;
+    });
+  }
+  return summary.slice(covering).find((period) => period.condition && period.condition !== 'clear');
 }
 
 function json(body: unknown, status = 200, extraHeaders?: Record<string, string>): Response {

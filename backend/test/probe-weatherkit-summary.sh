@@ -32,9 +32,10 @@
 #     Both degrade to 'rain' without throwing, which is the intent.
 #
 # So: the field is REAL, values are lowercase bare nouns, and periods are in
-# chronological order. `precipFromForecast` reads the period covering the first
-# wet minute, which is what makes "snow starting in 40 min" resolve to wintry
-# rather than clear; with no wet minute it reads what is falling now.
+# chronological order. `precipFromForecast` reads the first non-clear period
+# from the one covering the first wet minute onward, which is what makes "snow
+# starting in 40 min" resolve to wintry rather than clear; with no wet minute
+# it reads what is falling now.
 #
 # STILL UNPROVEN: a wintry value has not been observed in the wild (probed in
 # July; Perisher AU is covered and in season, so it is the best target come
