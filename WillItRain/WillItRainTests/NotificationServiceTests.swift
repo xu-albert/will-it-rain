@@ -74,33 +74,62 @@ final class NotificationServiceTests: XCTestCase {
         )
     }
 
-    /// A forecast built the way `WeatherService` builds one where WeatherKit has
-    /// no minute forecast: hourly readings only, on the hour, from the hour that
-    /// contains `t0`. `t0` is 13:20 into its hour, so hour 1 begins 46:40 later.
-    private func hourlyOnlyForecast(wetHours: Set<Int>) -> RainForecast {
-        let hour0 = t0.addingTimeInterval(-800)
-        let hourly = (0..<12).map { h in
+    /// The top of the hour containing `t0`, which is 13:20 into it.
+    private var hour0: Date { t0.addingTimeInterval(-800) }
+
+    /// Twelve hourly readings on the hour from `hour0`, the wet ones by index.
+    private func hourlyReadings(wetHours: Set<Int>) -> [ChartDataPoint] {
+        (0..<12).map { h in
             ChartDataPoint(
                 date: hour0.addingTimeInterval(TimeInterval(h) * 3600),
                 probability: wetHours.contains(h) ? 0.7 : 0.1,
                 intensity: wetHours.contains(h) ? .light : .none,
                 type: wetHours.contains(h) ? .rain : .none,
                 precipitationAmount: wetHours.contains(h) ? 1.0 : 0,
-                span: ChartDataPoint.hourSpan
+                resolution: .hour
             )
         }
-        let merged = ForecastMerge.merge(minute: nil, hourly: hourly, now: t0)
+    }
+
+    /// Sixty minute readings from `now`, the wet ones by index.
+    private func minuteReadings(from now: Date, wetMinutes: Set<Int>) -> [ChartDataPoint] {
+        (0..<60).map { m in
+            ChartDataPoint(
+                date: now.addingTimeInterval(TimeInterval(m) * 60),
+                probability: wetMinutes.contains(m) ? 0.8 : 0.05,
+                intensity: wetMinutes.contains(m) ? .moderate : .none,
+                type: wetMinutes.contains(m) ? .rain : .none,
+                precipitationAmount: wetMinutes.contains(m) ? 3.0 : 0
+            )
+        }
+    }
+
+    /// A forecast built the way `WeatherService` builds one at `now`.
+    private func merged(minute: [ChartDataPoint]?, wetHours: Set<Int>, at now: Date) -> RainForecast {
+        let merged = ForecastMerge.merge(minute: minute, hourly: hourlyReadings(wetHours: wetHours), now: now)
         let periods = PrecipitationPeriod.detect(in: merged.dataPoints)
         return RainForecast(
             dataPoints: merged.dataPoints,
             precipitationPeriods: periods,
             dailySummaries: [],
             currentCondition: .clear,
-            currentType: periods.first { $0.contains(t0) }?.type ?? .none,
+            currentType: periods.first { $0.contains(now) }?.type ?? .none,
             locationName: "Testville",
-            fetchedAt: t0,
+            fetchedAt: now,
             hasMinuteForecast: merged.hasMinuteForecast
         )
+    }
+
+    /// Where WeatherKit has no minute forecast: hourly readings only, from the
+    /// hour that contains `t0`, so hour 1 begins 46:40 later.
+    private func hourlyOnlyForecast(wetHours: Set<Int>) -> RainForecast {
+        merged(minute: nil, wetHours: wetHours, at: t0)
+    }
+
+    /// Inside minute coverage, polled at `now`: a nowcast from `now`, then the
+    /// hourly readings from where it ends.
+    private func nowcastForecast(at now: Date, wetMinutes: Set<Int> = [], wetHours: Set<Int> = []) -> RainForecast {
+        merged(minute: minuteReadings(from: now, wetMinutes: wetMinutes), wetHours: wetHours, at: now)
     }
 
     private func evaluate(_ forecast: RainForecast, at now: Date) {
@@ -242,6 +271,41 @@ final class NotificationServiceTests: XCTestCase {
         evaluate(f, at: minutes(25))
         XCTAssertEqual(identifiers, ["precip-end"])
         XCTAssertEqual(delivered.first?.title, "Rain ending soon")
+    }
+
+    // MARK: - Minute coverage: only rain the nowcast has seen arms the gate
+
+    func testAWetHourTheNowcastHasNotReachedIsNotAlertedOnPollAfterPoll() {
+        // The hourly feed calls the coming hour wet; the nowcast, dry to its end
+        // on every poll, never sees the rain. The merged onset sits where the
+        // nowcast ends and moves with the clock, so taken as an event it was a
+        // fresh one every ten minutes — at a 60-minute lead time, an alert for
+        // each. The hero line keeps saying "Rains in 1h"; the gate stays quiet.
+        settings.leadTime = 60
+        for k in stride(from: 5, through: 55, by: 5) {
+            let now = hour0.addingTimeInterval(TimeInterval(k * 60))
+            let f = nowcastForecast(at: now, wetHours: [1])
+            XCTAssertEqual(f.heroStatus(for: .cloudy, at: now).title, "Rains in 1h", "Poll at :\(k)")
+
+            evaluate(f, at: now)
+            XCTAssertEqual(delivered, [], "Poll at :\(k)")
+            XCTAssertNil(settings.pendingPrecipStart, "Poll at :\(k)")
+        }
+    }
+
+    func testRainTheNowcastDoesSeeGoesThroughTheGateAsUsual() {
+        // The same wet hour, but the nowcast now shows the rain from :50. That
+        // onset is one it saw, so the ordinary two passes fire the alert.
+        settings.leadTime = 60
+        let first = hour0.addingTimeInterval(30 * 60)
+        evaluate(nowcastForecast(at: first, wetMinutes: Set(20..<60), wetHours: [1]), at: first)
+        XCTAssertEqual(delivered, [])
+        XCTAssertEqual(settings.pendingPrecipStart, hour0.addingTimeInterval(50 * 60))
+
+        let second = hour0.addingTimeInterval(35 * 60)
+        evaluate(nowcastForecast(at: second, wetMinutes: Set(15..<60), wetHours: [1]), at: second)
+        XCTAssertEqual(identifiers, ["precip-start"])
+        XCTAssertEqual(delivered.first?.title, "Rain in ~15 min")
     }
 
     // MARK: - Rain ending

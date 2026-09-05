@@ -25,7 +25,7 @@ final class WeatherService {
                     intensity: PrecipitationIntensity.from(millimetersPerHour: mmPerHr),
                     type: precipitationType(from: minute.precipitation),
                     precipitationAmount: mmPerHr,
-                    span: ChartDataPoint.minuteSpan
+                    resolution: .minute
                 )
             }
         }
@@ -39,7 +39,7 @@ final class WeatherService {
                 intensity: PrecipitationIntensity.from(millimetersPerHour: mmPerHr),
                 type: precipitationType(from: hour.precipitation),
                 precipitationAmount: mmPerHr,
-                span: ChartDataPoint.hourSpan
+                resolution: .hour
             )
         }
 

@@ -48,10 +48,19 @@ enum PrecipitationIntensity: String, Comparable {
 }
 
 struct ChartDataPoint: Identifiable {
-    /// How long a minute reading covers.
-    static let minuteSpan: TimeInterval = 60
-    /// How long an hourly reading covers.
-    static let hourSpan: TimeInterval = 3600
+    /// Which WeatherKit forecast a reading comes from, and how long a whole
+    /// reading of it stands for.
+    enum Resolution {
+        case minute
+        case hour
+
+        var span: TimeInterval {
+            switch self {
+            case .minute: return 60
+            case .hour: return 3600
+            }
+        }
+    }
 
     let id = UUID()
     let date: Date
@@ -59,12 +68,15 @@ struct ChartDataPoint: Identifiable {
     let intensity: PrecipitationIntensity
     let type: PrecipitationType
     let precipitationAmount: Double // mm/hr
-    /// How long this reading stands for, starting at `date`: a minute for a
-    /// minute-forecast reading, an hour for an hourly one, or what is left of
-    /// its hour for the hourly reading that takes over where the minute data
-    /// ends (see `ForecastMerge`). The merged series mixes both, and this is
-    /// what lets the chart tell them apart and what makes "the hourly point
-    /// that contains now" a well-defined thing.
+    /// A minute-forecast reading or an hourly one. The merged series mixes
+    /// both; this is what tells the chart's two sections apart and what lets
+    /// `PrecipitationPeriod.detect` tell an onset the nowcast saw from one
+    /// beyond its reach.
+    let resolution: Resolution
+    /// How long this reading stands for, starting at `date`: its resolution's
+    /// span, or what is left of its hour for the hourly reading that takes over
+    /// where the minute data ends (see `ForecastMerge`). This is what makes
+    /// "the hourly point that contains now" a well-defined thing.
     let span: TimeInterval
 
     init(
@@ -73,14 +85,16 @@ struct ChartDataPoint: Identifiable {
         intensity: PrecipitationIntensity,
         type: PrecipitationType,
         precipitationAmount: Double,
-        span: TimeInterval = ChartDataPoint.minuteSpan
+        resolution: Resolution = .minute,
+        span: TimeInterval? = nil
     ) {
         self.date = date
         self.probability = probability
         self.intensity = intensity
         self.type = type
         self.precipitationAmount = precipitationAmount
-        self.span = span
+        self.resolution = resolution
+        self.span = span ?? resolution.span
     }
 }
 
@@ -90,6 +104,15 @@ struct PrecipitationPeriod: Identifiable {
     let end: Date
     let type: PrecipitationType
     let peakIntensity: PrecipitationIntensity
+    /// Whether the minute-by-minute nowcast has seen this period begin. False
+    /// only for a period that starts on hourly data past the end of a nowcast:
+    /// the merge dates that onset at the nowcast's horizon, which moves with
+    /// every poll, so it is no event to alert on — a wet hour the nowcast never
+    /// confirmed would be announced afresh each time the horizon moved. The hero
+    /// line and the charts still show it; the alert gate and the Live Activity
+    /// read `RainForecast.confirmedPeriods`. Where there is no nowcast, hourly
+    /// data is all there is and every period is confirmed.
+    var isConfirmed: Bool = true
 
     func contains(_ date: Date) -> Bool {
         date >= start && date <= end
@@ -116,8 +139,11 @@ struct PrecipitationPeriod: Identifiable {
         var periodStart: Date?
         var periodType: PrecipitationType = .none
         var peakIntensity: PrecipitationIntensity = .none
+        var periodIsConfirmed = true
+        var nowcastSeen = false
 
         for point in dataPoints {
+            if point.resolution == .minute { nowcastSeen = true }
             let isWet = point.intensity != .none || point.probability >= likelyRainProbability
             if isWet {
                 let intensity = point.intensity == .none ? .light : point.intensity
@@ -125,6 +151,7 @@ struct PrecipitationPeriod: Identifiable {
                     periodStart = point.date
                     periodType = point.type == .none ? .rain : point.type
                     peakIntensity = intensity
+                    periodIsConfirmed = !(nowcastSeen && point.resolution == .hour)
                 } else if intensity > peakIntensity {
                     peakIntensity = intensity
                 }
@@ -133,7 +160,8 @@ struct PrecipitationPeriod: Identifiable {
                     start: start,
                     end: point.date,
                     type: periodType,
-                    peakIntensity: peakIntensity
+                    peakIntensity: peakIntensity,
+                    isConfirmed: periodIsConfirmed
                 ))
                 periodStart = nil
                 peakIntensity = .none
@@ -146,7 +174,8 @@ struct PrecipitationPeriod: Identifiable {
                 start: start,
                 end: lastDate,
                 type: periodType,
-                peakIntensity: peakIntensity
+                peakIntensity: peakIntensity,
+                isConfirmed: periodIsConfirmed
             ))
         }
 
@@ -247,6 +276,15 @@ struct RainForecast {
 
     func nextPrecipitationPeriod(at now: Date) -> PrecipitationPeriod? {
         precipitationPeriods.first { $0.start > now }
+    }
+
+    /// The periods the alert gate and the Live Activity act on; see
+    /// `PrecipitationPeriod.isConfirmed` for the ones left to the hero line
+    /// and the charts.
+    var confirmedPeriods: [PrecipitationPeriod] { precipitationPeriods.filter(\.isConfirmed) }
+
+    func nextConfirmedPrecipitationPeriod(at now: Date) -> PrecipitationPeriod? {
+        confirmedPeriods.first { $0.start > now }
     }
 
     var heroStatus: (title: String, subtitle: String) {

@@ -43,7 +43,7 @@ final class NotificationService {
         }
 
         // --- Rain starting (two-pass confirmation) ---
-        if settings.rainStartEnabled, let next = forecast.nextPrecipitationPeriod(at: now) {
+        if settings.rainStartEnabled, let next = forecast.nextConfirmedPrecipitationPeriod(at: now) {
             let timeUntil = next.start.timeIntervalSince(now)
             let leadTimeSeconds = Double(settings.leadTime * 60)
 
@@ -115,7 +115,7 @@ final class NotificationService {
            !forecast.isPrecipitating(at: now),
            let lastEnd = settings.lastRainEndTime,
            now.timeIntervalSince(lastEnd) <= 10 * 60,
-           let next = forecast.nextPrecipitationPeriod(at: now),
+           let next = forecast.nextConfirmedPrecipitationPeriod(at: now),
            next.start.timeIntervalSince(now) <= 60 * 60,
            !settings.isSameEvent(settings.lastNotifiedPrecipStart, next.start) {
             let mins = max(1, Int(next.start.timeIntervalSince(now) / 60))

@@ -18,8 +18,11 @@ import Foundation
 /// With it, every minute reading is kept and the hourly readings take over where
 /// they end: the one whose hour contains that instant is clipped to begin there,
 /// so it neither repeats what the minute data already said nor sits among minute
-/// readings, where a wet hour would end at the very next minute reading. Pure so
-/// it can be tested at an explicit instant, without WeatherKit.
+/// readings, where a wet hour would end at the very next minute reading. A
+/// period that begins on that clipped reading starts at the nowcast's horizon,
+/// not at anything the nowcast saw; `PrecipitationPeriod.detect` marks it
+/// unconfirmed and the alert gate leaves it alone. Pure so it can be tested at
+/// an explicit instant, without WeatherKit.
 enum ForecastMerge {
     struct Result {
         let dataPoints: [ChartDataPoint]
@@ -53,6 +56,7 @@ enum ForecastMerge {
                 intensity: first.intensity,
                 type: first.type,
                 precipitationAmount: first.precipitationAmount,
+                resolution: .hour,
                 span: first.date.addingTimeInterval(first.span).timeIntervalSince(minuteEnd)
             )
         }

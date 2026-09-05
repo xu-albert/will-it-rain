@@ -24,7 +24,7 @@ final class ForecastMergeTests: XCTestCase {
                 intensity: wet.contains(h) ? .light : .none,
                 type: wet.contains(h) ? .rain : .none,
                 precipitationAmount: wet.contains(h) ? 1.0 : 0,
-                span: ChartDataPoint.hourSpan
+                resolution: .hour
             )
         }
     }
@@ -65,7 +65,7 @@ final class ForecastMergeTests: XCTestCase {
         let result = ForecastMerge.merge(minute: minutes(from: now), hourly: hourly(), now: now)
 
         XCTAssertTrue(result.hasMinuteForecast)
-        let hourlyKept = result.dataPoints.filter { $0.span > ChartDataPoint.minuteSpan }
+        let hourlyKept = result.dataPoints.filter { $0.resolution == .hour }
         XCTAssertEqual(hourlyKept.first?.date, minute(5, from: hour(1)), "The 11:00 reading contains 11:05 and stays, from where the minute data ends")
         XCTAssertEqual(hourlyKept.first?.span, 55 * 60, "What is left of its hour")
         XCTAssertEqual(hourlyKept.count, 11)
@@ -79,7 +79,7 @@ final class ForecastMergeTests: XCTestCase {
         XCTAssertEqual(Array(dates.prefix(60)), (0..<60).map { minute($0, from: now) }, "10:05 through 11:04")
         XCTAssertEqual(dates[60], minute(5, from: hour(1)))
         XCTAssertEqual(dates[61], hour(2))
-        XCTAssertEqual(result.dataPoints[61].span, ChartDataPoint.hourSpan)
+        XCTAssertEqual(result.dataPoints[61].span, ChartDataPoint.Resolution.hour.span)
         XCTAssertEqual(dates, dates.sorted())
     }
 
@@ -87,10 +87,10 @@ final class ForecastMergeTests: XCTestCase {
         let now = hour0
         let result = ForecastMerge.merge(minute: minutes(from: now), hourly: hourly(), now: now)
 
-        XCTAssertEqual(result.dataPoints.filter { $0.span == ChartDataPoint.minuteSpan }.count, 60)
-        let firstHourly = result.dataPoints.first { $0.span > ChartDataPoint.minuteSpan }
+        XCTAssertEqual(result.dataPoints.filter { $0.resolution == .minute }.count, 60)
+        let firstHourly = result.dataPoints.first { $0.resolution == .hour }
         XCTAssertEqual(firstHourly?.date, hour(1))
-        XCTAssertEqual(firstHourly?.span, ChartDataPoint.hourSpan, "Nothing to clip when the minute data ends on the hour")
+        XCTAssertEqual(firstHourly?.span, ChartDataPoint.Resolution.hour.span, "Nothing to clip when the minute data ends on the hour")
     }
 
     func testLateInTheHourNoMinuteReadingIsLostToTheHourlyReading() {
@@ -104,12 +104,14 @@ final class ForecastMergeTests: XCTestCase {
 
         XCTAssertEqual(result.dataPoints.filter { $0.date < minute(60, from: now) }.count, 60)
         XCTAssertEqual(result.dataPoints[60].date, minute(59, from: hour(1)), "The 11:00 reading, from where the minute data ends")
+        XCTAssertEqual(result.dataPoints[60].resolution, .hour, "A one-minute sliver of the hour is still an hourly reading")
         XCTAssertEqual(result.dataPoints[61].date, hour(2))
 
         let status = f.heroStatus(for: .cloudy, at: now)
         XCTAssertEqual(status.title, "Rains in 11 min")
         XCTAssertEqual(status.subtitle, "Will last 20 min")
         XCTAssertEqual(f.nextPollInterval(leadTimeMinutes: 20, at: now), 5 * 60)
+        XCTAssertEqual(f.nextConfirmedPrecipitationPeriod(at: now)?.start, minute(11, from: now), "Seen by the nowcast, so the gate may act on it")
     }
 
     func testAShowerInTheHourAfterTheMinuteDataIsVisible() {
@@ -134,6 +136,32 @@ final class ForecastMergeTests: XCTestCase {
         XCTAssertEqual(f.precipitationPeriods.count, 1)
         XCTAssertEqual(f.precipitationPeriods.first?.start, minute(45, from: hour0))
         XCTAssertEqual(f.precipitationPeriods.first?.end, hour(2))
+        XCTAssertEqual(f.confirmedPeriods.count, 1, "It began in the minute data, so the nowcast has seen it")
+    }
+
+    // MARK: - Which periods the alert gate may act on
+
+    func testAPeriodBeginningWhereTheNowcastEndsIsUnconfirmed() {
+        // Dry minute data to 11:04 and a wet 11:00 hour: the onset the merge
+        // produces is the nowcast's horizon, which moves with every poll. The
+        // hero line shows it; the alert gate and the Live Activity do not see it.
+        let now = minute(5, from: hour0)
+        let result = ForecastMerge.merge(minute: minutes(from: now), hourly: hourly(wet: [1]), now: now)
+        let f = forecast(from: result, at: now)
+
+        XCTAssertEqual(f.precipitationPeriods.map(\.isConfirmed), [false])
+        XCTAssertNotNil(f.nextPrecipitationPeriod(at: now))
+        XCTAssertNil(f.nextConfirmedPrecipitationPeriod(at: now))
+        XCTAssertTrue(f.confirmedPeriods.isEmpty)
+    }
+
+    func testAWetHourBeyondTheNowcastIsUnconfirmedEvenWhenItBeginsOnTheHour() {
+        let now = minute(5, from: hour0)
+        let result = ForecastMerge.merge(minute: minutes(from: now), hourly: hourly(wet: [2]), now: now)
+        let f = forecast(from: result, at: now)
+
+        XCTAssertEqual(f.precipitationPeriods.first?.start, hour(2))
+        XCTAssertTrue(f.confirmedPeriods.isEmpty)
     }
 
     func testWithoutAnyHourlyReadingTheMinuteDataStands() {
@@ -159,7 +187,7 @@ final class ForecastMergeTests: XCTestCase {
         XCTAssertFalse(result.hasMinuteForecast)
         XCTAssertEqual(result.dataPoints.first?.date, hour(0), "The 10:00 reading contains 10:05")
         XCTAssertEqual(result.dataPoints.count, 12)
-        XCTAssertTrue(result.dataPoints.allSatisfy { $0.span == ChartDataPoint.hourSpan })
+        XCTAssertTrue(result.dataPoints.allSatisfy { $0.resolution == .hour && $0.span == ChartDataPoint.Resolution.hour.span })
     }
 
     func testWithoutMinuteDataRainInTheCurrentHourIsRainingNow() {
@@ -182,6 +210,7 @@ final class ForecastMergeTests: XCTestCase {
 
         XCTAssertFalse(f.isPrecipitating(at: now))
         XCTAssertEqual(f.nextPrecipitationPeriod(at: now)?.start.timeIntervalSince(now), 55 * 60)
+        XCTAssertEqual(f.nextConfirmedPrecipitationPeriod(at: now)?.start, hour(1), "With no nowcast, hourly data is what the gate acts on")
     }
 
     func testWithoutMinuteDataAFeedThatStartsLaterIsKeptWhole() {

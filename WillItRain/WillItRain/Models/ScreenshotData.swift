@@ -48,7 +48,7 @@ enum ScreenshotScenario: String, CaseIterable {
             let prob = h <= 1 ? 0.8 : Double.random(in: 0.05...0.25)
             let intensity: PrecipitationIntensity = h <= 1 ? .light : .none
             let amount = h <= 1 ? 1.5 : 0.0
-            return ChartDataPoint(date: date, probability: prob, intensity: intensity, type: .rain, precipitationAmount: amount, span: ChartDataPoint.hourSpan)
+            return ChartDataPoint(date: date, probability: prob, intensity: intensity, type: .rain, precipitationAmount: amount, resolution: .hour)
         }
 
         let periods = [
@@ -77,7 +77,7 @@ enum ScreenshotScenario: String, CaseIterable {
             let prob = h <= 6 ? Double.random(in: 0.5...0.85) : Double.random(in: 0.1...0.3)
             let intensity: PrecipitationIntensity = h <= 4 ? .moderate : (h <= 6 ? .light : .none)
             let amount = h <= 6 ? Double.random(in: 0.5...2.5) : 0.0
-            return ChartDataPoint(date: date, probability: prob, intensity: intensity, type: .snow, precipitationAmount: amount, span: ChartDataPoint.hourSpan)
+            return ChartDataPoint(date: date, probability: prob, intensity: intensity, type: .snow, precipitationAmount: amount, resolution: .hour)
         }
 
         let periods = [
@@ -100,7 +100,7 @@ enum ScreenshotScenario: String, CaseIterable {
 
         let hourlyPoints = (1...12).map { h -> ChartDataPoint in
             let date = now.addingTimeInterval(Double(h) * 3600)
-            return ChartDataPoint(date: date, probability: Double.random(in: 0.0...0.08), intensity: .none, type: .none, precipitationAmount: 0, span: ChartDataPoint.hourSpan)
+            return ChartDataPoint(date: date, probability: Double.random(in: 0.0...0.08), intensity: .none, type: .none, precipitationAmount: 0, resolution: .hour)
         }
 
         let daily = makeDailySummaries(baseTemp: 18, chances: [0.02, 0.05, 0.03, 0.08, 0.04, 0.10, 0.06], types: [.none, .none, .none, .none, .none, .none, .none])
@@ -127,7 +127,7 @@ enum ScreenshotScenario: String, CaseIterable {
             let prob = h <= 4 ? Double.random(in: 0.6...0.9) : Double.random(in: 0.15...0.35)
             let intensity: PrecipitationIntensity = h <= 2 ? .heavy : (h <= 4 ? .moderate : .none)
             let amount = h <= 4 ? Double.random(in: 1.0...5.0) : 0.0
-            return ChartDataPoint(date: date, probability: prob, intensity: intensity, type: .rain, precipitationAmount: amount, span: ChartDataPoint.hourSpan)
+            return ChartDataPoint(date: date, probability: prob, intensity: intensity, type: .rain, precipitationAmount: amount, resolution: .hour)
         }
 
         let periods = [

@@ -175,20 +175,10 @@ describe('rain-start alerts', () => {
   it('reach devices where WeatherKit has no minute forecast, from the hourly one', async () => {
     // Outside forecastNextHour coverage the tick used to return before any
     // alert. Hourly readings: the current hour dry, the next wet — so rain
-    // begins at the top of the next hour, inside a 60-minute lead time and
-    // outside a 20-minute one.
-    const harness = makeHarness({ signingKey });
-    const now = Date.now();
-    await plant(
-      harness,
-      [
-        { n: 1, leadTimeMinutes: 60 },
-        { n: 2, leadTimeMinutes: 20 },
-      ],
-      now
-    );
-
-    const { alerts, now: t } = await tick(harness, (t) => {
+    // begins at the top of the next hour. The clock is pinned so that the
+    // minutes to that hour are a chosen number, not whatever the wall clock
+    // happens to read.
+    const hourly = (t: number) => {
       const hour0 = t - (t % 3_600_000);
       return {
         forecastHourly: {
@@ -199,16 +189,31 @@ describe('rain-start alerts', () => {
           })),
         },
       };
-    });
+    };
+    const devices = [
+      { n: 1, leadTimeMinutes: 60 },
+      { n: 2, leadTimeMinutes: 20 },
+    ];
 
-    // The first synthesized minute at or after the top of the hour is the rain.
-    const minutesToNextHour = Math.ceil((3_600_000 - (t % 3_600_000)) / 60_000);
-    if (minutesToNextHour > 20) {
-      expect(alerted(alerts)).toEqual([fakeToken(1)]);
-      expect(alerts[0].title).toBe(`Rain in ~${minutesToNextHour} min`);
-    } else {
-      // Ran within 20 minutes of the hour: both lead times now reach the rain.
-      expect(alerted(alerts)).toEqual([fakeToken(1), fakeToken(2)].sort());
+    vi.useFakeTimers();
+    try {
+      // Five past: 55 minutes to the rain, inside the 60-minute lead time only.
+      vi.setSystemTime(new Date('2026-01-01T10:05:00.000Z'));
+      const early = makeHarness({ signingKey });
+      await plant(early, devices, Date.now());
+      const atFivePast = await tick(early, hourly);
+      expect(alerted(atFivePast.alerts)).toEqual([fakeToken(1)]);
+      expect(atFivePast.alerts[0].title).toBe('Rain in ~55 min');
+
+      // Quarter to: 15 minutes, inside both.
+      vi.setSystemTime(new Date('2026-01-01T10:45:00.000Z'));
+      const late = makeHarness({ signingKey });
+      await plant(late, devices, Date.now());
+      const atQuarterTo = await tick(late, hourly);
+      expect(alerted(atQuarterTo.alerts)).toEqual([fakeToken(1), fakeToken(2)].sort());
+      expect(atQuarterTo.alerts.every((a) => a.title === 'Rain in ~15 min')).toBe(true);
+    } finally {
+      vi.useRealTimers();
     }
   });
 
