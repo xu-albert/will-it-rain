@@ -9,17 +9,17 @@ struct RainChartView: View {
     /// WeatherKit has no minute forecast, so that section simply does not show.
     private var nextHourPoints: [ChartDataPoint] {
         let cutoff = Date().addingTimeInterval(3600)
-        return dataPoints.filter { $0.span < ChartDataPoint.hourSpan && $0.date <= cutoff }
+        return dataPoints.filter { $0.span <= ChartDataPoint.minuteSpan && $0.date <= cutoff }
     }
 
-    /// The hourly readings whose hour is not yet over: with minute data that
-    /// begins at the hour containing now + 1h (which the minute section already
-    /// reaches into), without it at the hour containing now.
+    /// The hourly readings whose hour is not yet over: with minute data they
+    /// take over where the minute section ends, without it at the hour
+    /// containing now.
     private var hourlyPoints: [ChartDataPoint] {
         let now = Date()
         let cutoff = now.addingTimeInterval(TimeInterval(chartHours * 3600))
         let candidates = dataPoints.filter {
-            $0.span >= ChartDataPoint.hourSpan
+            $0.span > ChartDataPoint.minuteSpan
                 && $0.date.addingTimeInterval($0.span) > now
                 && $0.date <= cutoff
         }

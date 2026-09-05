@@ -13,14 +13,18 @@ import Foundation
 /// with the clock, the hole never closed: nothing was ever "now", so the app was
 /// never raining and no rain-start alert could fire for any lead time it offers.
 ///
-/// Here an hourly reading stands for the whole hour it starts, so the reading
-/// that *contains* an instant is kept for it. Pure so it can be tested at an
-/// explicit instant, without WeatherKit.
+/// Here an hourly reading stands for the whole hour it starts. Without minute
+/// data the series is the hourly readings from the one that contains `now`.
+/// With it, every minute reading is kept and the hourly readings take over where
+/// they end: the one whose hour contains that instant is clipped to begin there,
+/// so it neither repeats what the minute data already said nor sits among minute
+/// readings, where a wet hour would end at the very next minute reading. Pure so
+/// it can be tested at an explicit instant, without WeatherKit.
 enum ForecastMerge {
     struct Result {
         let dataPoints: [ChartDataPoint]
-        /// False when `minute` was nil: the series is hourly readings from the
-        /// one containing `now`.
+        /// False when there were no minute readings: the series is hourly
+        /// readings from the one containing `now`.
         let hasMinuteForecast: Bool
     }
 
@@ -30,8 +34,9 @@ enum ForecastMerge {
     ///   - now: the instant the forecast is being built for.
     static func merge(minute: [ChartDataPoint]?, hourly: [ChartDataPoint], now: Date) -> Result {
         let hourly = hourly.sorted { $0.date < $1.date }
+        let minute = (minute ?? []).sorted { $0.date < $1.date }
 
-        guard let minute else {
+        guard let lastMinute = minute.last else {
             // No minute forecast: hourly from the reading that contains now. If
             // the feed starts after now (it starts on the current hour, so this
             // is defensive), keep everything rather than nothing.
@@ -39,18 +44,18 @@ enum ForecastMerge {
             return Result(dataPoints: Array(hourly[start...]), hasMinuteForecast: false)
         }
 
-        // Minute readings, then hourly from the reading that contains now + 1h.
-        // Minute readings past that hourly reading's start are dropped rather
-        // than interleaved: an hourly reading among minute ones would end the
-        // hour's period at the very next minute reading — "rains in 55 min,
-        // will last 1 min" — instead of at the next hourly one.
-        let oneHourOn = now.addingTimeInterval(ChartDataPoint.hourSpan)
-        let cutIndex = hourly.lastIndex { $0.date <= oneHourOn } ?? hourly.firstIndex { $0.date > oneHourOn }
-        guard let cutIndex else {
-            return Result(dataPoints: minute.sorted { $0.date < $1.date }, hasMinuteForecast: true)
+        let minuteEnd = lastMinute.date.addingTimeInterval(lastMinute.span)
+        var rest = Array(hourly.drop(while: { $0.date.addingTimeInterval($0.span) <= minuteEnd }))
+        if let first = rest.first, first.date < minuteEnd {
+            rest[0] = ChartDataPoint(
+                date: minuteEnd,
+                probability: first.probability,
+                intensity: first.intensity,
+                type: first.type,
+                precipitationAmount: first.precipitationAmount,
+                span: first.date.addingTimeInterval(first.span).timeIntervalSince(minuteEnd)
+            )
         }
-        let cut = hourly[cutIndex].date
-        let kept = minute.filter { $0.date < cut }.sorted { $0.date < $1.date }
-        return Result(dataPoints: kept + hourly[cutIndex...], hasMinuteForecast: true)
+        return Result(dataPoints: minute + rest, hasMinuteForecast: true)
     }
 }

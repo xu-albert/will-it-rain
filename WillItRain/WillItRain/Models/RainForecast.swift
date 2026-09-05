@@ -60,9 +60,11 @@ struct ChartDataPoint: Identifiable {
     let type: PrecipitationType
     let precipitationAmount: Double // mm/hr
     /// How long this reading stands for, starting at `date`: a minute for a
-    /// minute-forecast reading, an hour for an hourly one. The merged series
-    /// mixes both, and this is what lets the chart tell them apart and what
-    /// makes "the hourly point that contains now" a well-defined thing.
+    /// minute-forecast reading, an hour for an hourly one, or what is left of
+    /// its hour for the hourly reading that takes over where the minute data
+    /// ends (see `ForecastMerge`). The merged series mixes both, and this is
+    /// what lets the chart tell them apart and what makes "the hourly point
+    /// that contains now" a well-defined thing.
     let span: TimeInterval
 
     init(
@@ -79,11 +81,6 @@ struct ChartDataPoint: Identifiable {
         self.type = type
         self.precipitationAmount = precipitationAmount
         self.span = span
-    }
-
-    /// Whether `instant` falls inside the stretch this reading covers.
-    func covers(_ instant: Date) -> Bool {
-        instant >= date && instant < date.addingTimeInterval(span)
     }
 }
 
