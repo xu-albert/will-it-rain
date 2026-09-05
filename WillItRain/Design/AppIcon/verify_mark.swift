@@ -1,7 +1,7 @@
 // Renders the SwiftUI `AppIconMark` (the shape the Live Activity's identity
 // badge draws) off-screen, so it can be diffed against the same geometry
 // rasterised from AppIcon.svg. Proves the transcription in
-// WillItRainWidgets/AppIconMark.swift still matches the icon's vector source
+// Shared/AppIconMark.swift still matches the icon's vector source
 // without needing a simulator.
 //
 // Driven by verify_mark.py, which compiles this together with AppIconMark.swift

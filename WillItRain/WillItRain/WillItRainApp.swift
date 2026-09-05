@@ -13,7 +13,18 @@ struct WillItRainApp: App {
 
     var body: some Scene {
         WindowGroup {
+            #if DEBUG
+            // -liveActivityCards A,B,C renders the lock-screen card instead of
+            // the app, so the harness can screenshot a presentation that is
+            // otherwise only reachable by locking the device.
+            if let preview = LiveActivityCardPreview.fromLaunchArgs(CommandLine.arguments) {
+                preview
+            } else {
+                ContentView()
+            }
+            #else
             ContentView()
+            #endif
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .background {

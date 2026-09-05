@@ -77,7 +77,9 @@ final class WeatherService {
         case .snow: return .snow
         case .hail: return .hail
         case .sleet: return .sleet
+        case .mixed: return .mixed
         case .none: return .none
+        // Unknown future cases fall back to rain — the right default for a rain app.
         default: return .rain
         }
     }

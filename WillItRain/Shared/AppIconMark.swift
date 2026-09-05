@@ -2,6 +2,10 @@ import SwiftUI
 
 /// The "Gonna Rain?" app icon mark, in vector form.
 ///
+/// Lives in `Shared/` rather than the widget folder because the lock-screen
+/// card that wears it (`LiveActivityCardViews.swift`) is compiled into the app
+/// too, for the DEBUG `-liveActivityCards` capture screen.
+///
 /// Geometry is transcribed literally from `WillItRain/Design/AppIcon/AppIcon.svg`
 /// (the adopted `drift-scatter` design) so the Live Activity's identity badge
 /// shows the same silhouette the home screen does: the shaped-underside cloud
