@@ -10,7 +10,7 @@ export interface Env {
   WEATHERKIT_SERVICE_ID: string;
   APNS_TOPIC: string;
   APNS_ENV: string; // "sandbox" or "production"
-  ADMIN_TOKEN?: string; // secret gating /test-rain and /test-cron
+  ADMIN_TOKEN?: string; // secret gating /test-rain, /test-cron and /test-activity
 }
 
 export interface DeviceRegistration {

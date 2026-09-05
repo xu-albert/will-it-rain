@@ -5,6 +5,8 @@ import {
   DeviceRegistration,
   GridCell,
   LiveActivityContentState,
+  Precip,
+  WeatherKitForecast,
 } from './types';
 import { LegacyRecord, readActivityTokens, readCoverage, gridCenter, toGridKey } from './grid';
 import { fetchForecast } from './weatherkit';
@@ -59,6 +61,48 @@ const ACTIVITY_WINDOW_MINUTES = 90;
 // See recordPushFailure for why this isn't 1.
 const BAD_TOKEN_STRIKES = 5;
 
+// WeatherKit condition strings that should render with the wintry treatment.
+// Anything with ice in it groups together; everything else is rain.
+const WINTRY_CONDITIONS = new Set(['snow', 'sleet', 'hail', 'mixed', 'flurries', 'wintrymix']);
+
+// Server-side copy, kept in step with `precip`. Without this the widget would
+// draw a snowflake next to the word "rain".
+function copyFor(precip: Precip) {
+  const wintry = precip === 'wintry';
+  return {
+    incoming: wintry ? 'Snow incoming' : 'Rain incoming',
+    expected: wintry ? 'Snow expected' : 'Rain expected',
+    fallingNow: wintry ? 'Snowing now' : 'Raining now',
+    fallingVerb: wintry ? 'Snowing · ' : 'Raining · ',
+    ended: wintry ? 'Snow ended' : 'Rain ended',
+    hasStopped: wintry ? 'Snow has stopped' : 'Rain has stopped',
+  };
+}
+
+// Reads the precipitation type out of forecastNextHour's summary rollup.
+//
+// The per-minute entries carry only chance and intensity, so the summary is the
+// sole source of type in this dataset. Every field is treated as possibly
+// absent: if Apple changes the schema, or the summary contains only "clear",
+// this returns 'rain' — both the old behaviour and the right default for a rain
+// app. It never throws.
+//
+// Confirmed against live responses on 2026-07-27 (see the spec in
+// docs/superpowers/specs/): the field is real, values are lowercase bare nouns,
+// periods run in chronological order. Leading "clear" periods are skipped so
+// "snow starting in 40 min" resolves to wintry rather than to the clear now.
+export function precipFromForecast(forecast: WeatherKitForecast): Precip {
+  const summary = forecast.forecastNextHour?.summary;
+  if (!summary?.length) return 'rain';
+
+  for (const period of summary) {
+    const condition = period.condition?.toLowerCase().replace(/[\s_-]/g, '');
+    if (!condition || condition === 'clear') continue;
+    return WINTRY_CONDITIONS.has(condition) ? 'wintry' : 'rain';
+  }
+  return 'rain';
+}
+
 function json(body: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -76,8 +120,8 @@ async function readJson<T>(request: Request): Promise<T | null> {
   }
 }
 
-// /test-rain and /test-cron send real pushes and burn real WeatherKit quota, so
-// they require a shared secret. Fails closed: if ADMIN_TOKEN was never set, the
+// /test-rain, /test-cron and /test-activity send real pushes and burn real
+// WeatherKit quota, so they require a shared secret. Fails closed: if ADMIN_TOKEN was never set, the
 // endpoints are unusable rather than open.
 function isAuthorizedAdmin(request: Request, env: Env): boolean {
   const provided = request.headers.get('X-Admin-Token');
@@ -175,6 +219,11 @@ export default {
     if (request.method === 'POST' && url.pathname === '/test-rain') {
       if (!isAuthorizedAdmin(request, env)) return json({ error: 'Unauthorized' }, 401);
       return handleTestRain(request, env);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/test-activity') {
+      if (!isAuthorizedAdmin(request, env)) return json({ error: 'Unauthorized' }, 401);
+      return handleTestActivity(request, env);
     }
 
     if (request.method === 'POST' && url.pathname === '/test-cron') {
@@ -300,6 +349,16 @@ export default {
 
         if (!rainStart && !rainEnd) return;
 
+        const precip = precipFromForecast(forecast);
+        const copy = copyFor(precip);
+        // Logged so the summary schema can be checked against real responses
+        // rather than trusted from Apple's docs — a wintry value has never yet
+        // been seen in the wild (spec, "Server changes are load-bearing").
+        console.log(
+          `[Cron] Grid ${grid.gridKey} precip=${precip} summary=` +
+            JSON.stringify(forecast.forecastNextHour?.summary?.map((s) => s.condition) ?? null)
+        );
+
         // At most one push per device per event type, deduped for 30 min via KV.
         const notifyOnce = async (
           device: DeviceRegistration,
@@ -339,10 +398,10 @@ export default {
                 try {
                   const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
                   const contentState: LiveActivityContentState = {
-                    statusText: 'Rain incoming',
+                    statusText: copy.incoming,
                     countdownTarget: encodeActivityDate(new Date(now + minutesUntilRain * 60000)),
                     heroText: null,
-                    subBold: 'Rain expected',
+                    subBold: copy.expected,
                     subRest: ' · next hour',
                     boldFirst: true,
                     rightText: '',
@@ -354,6 +413,7 @@ export default {
                     // clock time would render in UTC. The app's own refreshes set it.
                     flagText: null,
                     flagPosition: null,
+                    precip,
                   };
                   await sendLiveActivityUpdate(activityToken, contentState, env);
                   console.log(`[Activity] Sent rain-start update, grid ${grid.gridKey}`);
@@ -380,11 +440,11 @@ export default {
                 if (minutesUntilEnd > 0) {
                   const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
                   const contentState: LiveActivityContentState = {
-                    statusText: 'Raining now',
+                    statusText: copy.fallingNow,
                     countdownTarget: encodeActivityDate(new Date(now + minutesUntilEnd * 60000)),
                     heroText: null,
                     subBold: `stops in about ${minutesUntilEnd} min`,
-                    subRest: 'Raining · ',
+                    subRest: copy.fallingVerb,
                     boldFirst: false,
                     rightText: '',
                     segments,
@@ -393,14 +453,15 @@ export default {
                     endLabel: '+90 min',
                     flagText: null,
                     flagPosition: null,
+                    precip,
                   };
                   await sendLiveActivityUpdate(activityToken, contentState, env);
                 } else {
                   const contentState: LiveActivityContentState = {
-                    statusText: 'Rain ended',
+                    statusText: copy.ended,
                     countdownTarget: null,
                     heroText: 'Clear',
-                    subBold: 'Rain has stopped',
+                    subBold: copy.hasStopped,
                     subRest: '',
                     boldFirst: true,
                     rightText: '',
@@ -410,6 +471,7 @@ export default {
                     endLabel: '+90 min',
                     flagText: null,
                     flagPosition: null,
+                    precip,
                   };
                   await sendLiveActivityUpdate(activityToken, contentState, env, 'end');
                   await clearActivityToken(device.token, env);
@@ -719,8 +781,102 @@ async function handleTestRain(request: Request, env: Env): Promise<Response> {
   }
 }
 
+// Pushes a content-state at a device's Live Activity, on demand.
+//
+// This is the only way to exercise the server -> Live Activity path without
+// waiting for real weather: the cron pushes activity updates, but only for a
+// device that has an activity token AND sits in a grid that is currently
+// precipitating. Until this existed the path had never run against a real
+// activity token even once.
+//
+// It matters most for `precip`. `content-state` is a full replacement, so the
+// server's payload — not the app's — decides whether a card reads as snow or
+// rain from the next tick onward. A body without `precip` reproduces a Worker
+// that predates the field and must leave the card ticking in rain colours
+// rather than freezing it.
+//
+// Admin-gated, so it sits outside the cron's push budget on purpose: it is one
+// push per operator request, not a fan-out, and it must not be able to starve a
+// tick of budget it never touches.
+async function handleTestActivity(request: Request, env: Env): Promise<Response> {
+  const body = await readJson<{
+    token?: unknown; precip?: unknown; event?: unknown; minutesUntil?: unknown;
+  }>(request);
+  if (!body) return json({ error: 'Malformed JSON body' }, 400);
+
+  if (!isValidDeviceToken(body.token)) {
+    return json({ error: 'Invalid or missing token' }, 400);
+  }
+
+  const registration = await env.DEVICES.get(`device:${body.token}`);
+  if (registration === null) return json({ error: 'Device not registered' }, 404);
+
+  // The activity token lives under its own `activity:` key (see types.ts for
+  // why it is not a field on the device record), and only in a `get`'s body —
+  // the metadata copy exists for the cron's one-list read, not for this.
+  const stored = await env.DEVICES.get(activityKey(body.token));
+  const activityToken = stored === null ? null : storedActivityToken(stored);
+  if (!activityToken) {
+    return json({
+      error: 'Device has no activity token — no Live Activity is running, or the '
+        + 'app never reported its push token',
+    }, 409);
+  }
+
+  // Absence is meaningful here (the legacy-payload case), so only an actual
+  // 'wintry' or 'rain' sets the field; anything else leaves it out.
+  const precip: Precip | undefined =
+    body.precip === 'wintry' ? 'wintry' : body.precip === 'rain' ? 'rain' : undefined;
+  const event = body.event === 'end' ? 'end' : 'update';
+  const minutesUntil =
+    typeof body.minutesUntil === 'number' && Number.isFinite(body.minutesUntil)
+      ? Math.round(body.minutesUntil)
+      : 25;
+  const copy = copyFor(precip ?? 'rain');
+
+  // `precip` is required on LiveActivityContentState precisely so no production
+  // path can forget it — a payload without it silently reverts a snowing card
+  // to rain. This test needs to send exactly that payload on purpose, so it
+  // relaxes the field here and nowhere else.
+  const contentState: Omit<LiveActivityContentState, 'precip'> & { precip?: Precip } = {
+    statusText: copy.incoming,
+    countdownTarget: encodeActivityDate(new Date(Date.now() + minutesUntil * 60000)),
+    heroText: null,
+    subBold: copy.expected,
+    subRest: ' · test push',
+    boldFirst: true,
+    rightText: 'Test',
+    segments: [{ start: 0.2, end: 0.6 }],
+    windowMinutes: ACTIVITY_WINDOW_MINUTES,
+    midLabel: '+45 min',
+    endLabel: '+90 min',
+    flagText: null,
+    flagPosition: null,
+  };
+  if (precip) contentState.precip = precip;
+
+  try {
+    await sendLiveActivityUpdate(activityToken, contentState, env, event);
+    return json({ ok: true, event, precip: precip ?? null, minutesUntil });
+  } catch (err) {
+    await discardDeadActivityToken(body.token, err, env);
+    return json({ error: String(err) }, 500);
+  }
+}
+
+// Runs the cron's detection logic for one coordinate and reports what it saw.
+//
+// `dryRun: true` skips the push, which makes this usable as a plain forecast
+// probe against any coordinate — no device has to exist there and nobody's
+// phone buzzes. That is the only way to answer "does WeatherKit actually
+// populate forecastNextHour.summary[].condition, and with what values?", since
+// the cron's own summary log only fires for a grid that already has a
+// registered device AND active precipitation. backend/test/probe-weatherkit-summary.sh
+// drives it.
 async function handleTestCron(request: Request, env: Env): Promise<Response> {
-  const body = await readJson<{ token?: unknown; lat?: unknown; lon?: unknown }>(request);
+  const body = await readJson<{
+    token?: unknown; lat?: unknown; lon?: unknown; dryRun?: unknown;
+  }>(request);
   if (!body) return json({ error: 'Malformed JSON body' }, 400);
 
   if (!isValidDeviceToken(body.token)) {
@@ -729,16 +885,21 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
   if (!isValidLatitude(body.lat) || !isValidLongitude(body.lon)) {
     return json({ error: 'Invalid or missing lat/lon' }, 400);
   }
+  const dryRun = body.dryRun === true;
 
   try {
     const forecast = await fetchForecast(body.lat, body.lon, env);
     const now = Date.now();
     const minutes = nextHourMinutes(forecast, now);
 
+    // The raw conditions, not just the derived value: if Apple renames a case
+    // or ships one WINTRY_CONDITIONS does not know about, `precip` alone would
+    // read as a confident "rain" and hide it.
+    const summary = forecast.forecastNextHour?.summary?.map((s) => s.condition) ?? null;
+    const diagnostics = { precip: precipFromForecast(forecast), summary, dryRun };
+
     if (!minutes || minutes.length === 0) {
-      return new Response(JSON.stringify({ ok: true, result: 'no_forecast_data' }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return json({ ok: true, result: 'no_forecast_data', ...diagnostics });
     }
 
     const rainStart = minutes.find(
@@ -746,29 +907,25 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
     );
 
     if (!rainStart) {
-      return new Response(JSON.stringify({ ok: true, result: 'no_rain', minutesChecked: minutes.length }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return json({ ok: true, result: 'no_rain', minutesChecked: minutes.length, ...diagnostics });
     }
 
     const rainStartTime = new Date(rainStart.startTime).getTime();
     const minutesUntilRain = Math.round((rainStartTime - now) / 60000);
 
-    await sendRainAlert(body.token, minutesUntilRain, env);
-    return new Response(JSON.stringify({
+    if (!dryRun) {
+      await sendRainAlert(body.token, minutesUntilRain, env);
+    }
+    return json({
       ok: true,
       result: 'rain_detected',
       minutesUntilRain,
       precipitationChance: rainStart.precipitationChance,
       precipitationIntensity: rainStart.precipitationIntensity,
-    }), {
-      headers: { 'Content-Type': 'application/json' },
+      ...diagnostics,
     });
   } catch (err) {
-    return new Response(JSON.stringify({ error: String(err) }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return json({ error: String(err) }, 500);
   }
 }
 
