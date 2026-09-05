@@ -137,8 +137,12 @@ sending a push):
 | Bergen NO | `summary: []` → `precip: rain`, no throw |
 
 So the field is real, values are lowercase bare nouns, and periods run in
-chronological order — which is what makes `precipFromForecast`'s "skip leading
-`clear` periods" loop resolve "snow starting in 40 min" to wintry.
+chronological order — which is what lets `precipFromForecast` resolve the
+period covering the pushed event: the first wet minute on the rain-start path,
+so "snow starting in 40 min" is wintry even though it is clear now, and
+`summary[0]` — what is falling now — on the rain-end path, so light rain now
+with snow later in the hour is not pushed as "Snowing now". A summary without
+`startTime` falls back to the first non-`clear` period.
 
 Two things this did **not** settle:
 

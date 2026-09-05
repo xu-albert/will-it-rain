@@ -170,9 +170,31 @@ describe('precipFromForecast', () => {
     expect(precipFromForecast(withSummary([{}]))).toBe('rain');
   });
 
-  it('reads the first non-clear period, so snow after a clear spell is still snow', () => {
-    expect(precipFromForecast(withSummary([{ condition: 'clear' }, { condition: 'snow' }]))).toBe('wintry');
+  it('reads what is falling now, the first period, when given no event time', () => {
+    expect(precipFromForecast(withSummary([{ condition: 'clear' }, { condition: 'snow' }]))).toBe('rain');
+    expect(precipFromForecast(withSummary([{ condition: 'snow' }, { condition: 'clear' }]))).toBe('wintry');
     expect(precipFromForecast(withSummary([{ condition: 'rain' }, { condition: 'snow' }]))).toBe('rain');
+  });
+
+  it('resolves an event time to the period covering it', () => {
+    const t0 = Date.parse('2026-01-10T08:00:00Z');
+    const at = (minutes: number) => new Date(t0 + minutes * 60_000).toISOString();
+    const summary = [
+      { startTime: at(0), condition: 'clear' },
+      { startTime: at(40), condition: 'snow' },
+      { startTime: at(55), condition: 'rain' },
+    ];
+    expect(precipFromForecast(withSummary(summary), at(10))).toBe('rain');
+    expect(precipFromForecast(withSummary(summary), at(40))).toBe('wintry');
+    expect(precipFromForecast(withSummary(summary), at(50))).toBe('wintry');
+    expect(precipFromForecast(withSummary(summary), at(58))).toBe('rain');
+  });
+
+  it('falls back to the first non-clear period when the summary carries no start times', () => {
+    const at = new Date().toISOString();
+    expect(precipFromForecast(withSummary([{ condition: 'clear' }, { condition: 'snow' }]), at)).toBe('wintry');
+    expect(precipFromForecast(withSummary([{ condition: 'rain' }, { condition: 'snow' }]), at)).toBe('rain');
+    expect(precipFromForecast(withSummary([{ condition: 'clear' }]), at)).toBe('rain');
   });
 
   it('exact-matches the documented wintry conditions and treats everything else as rain', () => {
@@ -206,9 +228,14 @@ describe('the cron pushes precip on every Live Activity update', () => {
     const harness = makeHarness({ signingKey });
     await plantWithActivity(harness, 1, Date.now());
 
-    const { activityPushes } = await tick(
-      harness,
-      rainAt(20, [{ condition: 'clear' }, { condition: 'snow' }])
+    // Clear now, snow from the minute the rain-start push is about.
+    const { activityPushes } = await tick(harness, (t) =>
+      forecast(t, (i) => i >= 20, {
+        summary: [
+          { startTime: new Date(t).toISOString(), condition: 'clear' },
+          { startTime: new Date(t + 20 * 60_000).toISOString(), condition: 'snow' },
+        ],
+      })
     );
 
     expect(activityPushes).toHaveLength(1);
@@ -216,6 +243,50 @@ describe('the cron pushes precip on every Live Activity update', () => {
       statusText: 'Snow incoming',
       subBold: 'Snow expected',
       precip: 'wintry',
+    });
+  });
+
+  it('labels the rain-start push by the period the rain starts in, not an earlier one', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now());
+
+    // A flurry too light for the per-minute test sits between now and the
+    // rain the push is about; the push must say rain.
+    const { activityPushes } = await tick(harness, (t) =>
+      forecast(t, (i) => i >= 20, {
+        summary: [
+          { startTime: new Date(t).toISOString(), condition: 'clear' },
+          { startTime: new Date(t + 5 * 60_000).toISOString(), condition: 'snow' },
+          { startTime: new Date(t + 15 * 60_000).toISOString(), condition: 'rain' },
+        ],
+      })
+    );
+
+    expect(activityPushes).toHaveLength(1);
+    expect(activityPushes[0].contentState).toMatchObject({
+      statusText: 'Rain incoming',
+      subBold: 'Rain expected',
+      precip: 'rain',
+    });
+  });
+
+  it('labels the falling-now push by what is falling now, not by snow later in the hour', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now());
+
+    // Light rain now, below the summary's confidence bar so it rolls up as
+    // clear, with snow arriving later in the hour. The card is about the rain.
+    const { activityPushes } = await tick(
+      harness,
+      rainingUntil(40, [{ condition: 'clear' }, { condition: 'snow' }])
+    );
+
+    expect(activityPushes).toHaveLength(1);
+    expect(activityPushes[0].event).toBe('update');
+    expect(activityPushes[0].contentState).toMatchObject({
+      statusText: 'Raining now',
+      subRest: 'Raining · ',
+      precip: 'rain',
     });
   });
 

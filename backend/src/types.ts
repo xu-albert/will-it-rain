@@ -100,13 +100,15 @@ export interface WeatherKitForecast {
     // forecastNextHour dataset — and it costs no extra quota, since the Worker
     // already requests that dataset. Optional throughout: treated as absent
     // rather than trusted, so a schema change degrades to rain, never throws.
-    summary?: Array<{
-      startTime?: string;
-      condition?: string;
-      precipitationChance?: number;
-      precipitationIntensity?: number;
-    }>;
+    summary?: SummaryPeriod[];
   };
+}
+
+export interface SummaryPeriod {
+  startTime?: string;
+  condition?: string;
+  precipitationChance?: number;
+  precipitationIntensity?: number;
 }
 
 // Mirrors the iOS widget extension's `ContentState` (Codable, Hashable) exactly —

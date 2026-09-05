@@ -6,6 +6,7 @@ import {
   GridCell,
   LiveActivityContentState,
   Precip,
+  SummaryPeriod,
   WeatherKitForecast,
 } from './types';
 import { LegacyRecord, readActivityTokens, readCoverage, gridCenter, toGridKey } from './grid';
@@ -82,7 +83,8 @@ function copyFor(precip: Precip) {
   };
 }
 
-// Reads the precipitation type out of forecastNextHour's summary rollup.
+// Reads the precipitation type out of forecastNextHour's summary rollup for
+// the moment a push is about.
 //
 // The per-minute entries carry only chance and intensity, so the summary is the
 // sole source of type in this dataset. Every field is treated as possibly
@@ -90,20 +92,41 @@ function copyFor(precip: Precip) {
 // this returns 'rain' — both the old behaviour and the right default for a rain
 // app. It never throws.
 //
+// `at` is the start of the minute the push describes — the first wet minute on
+// the rain-start path — and resolves to the period covering it, so "snow
+// starting in 40 min" is wintry even though it is clear now. Without `at` the
+// answer is what is falling now, the first period: that is the rain-end path,
+// and it must not read a later period, because Apple's summary applies a
+// higher confidence bar than the per-minute test (the spec's Belfast case), so
+// light rain now with snow later in the hour would otherwise push "Snowing
+// now". A summary with no start times falls back to the first non-clear period.
+//
 // Confirmed against live responses on 2026-07-27 (see the spec in
 // docs/superpowers/specs/): the field is real, values are lowercase bare nouns,
-// periods run in chronological order. Leading "clear" periods are skipped so
-// "snow starting in 40 min" resolves to wintry rather than to the clear now.
-export function precipFromForecast(forecast: WeatherKitForecast): Precip {
+// periods run in chronological order.
+export function precipFromForecast(forecast: WeatherKitForecast, at?: string): Precip {
   const summary = forecast.forecastNextHour?.summary;
   if (!summary?.length) return 'rain';
 
-  for (const period of summary) {
-    const { condition } = period;
-    if (!condition || condition === 'clear') continue;
-    return WINTRY_CONDITIONS.has(condition) ? 'wintry' : 'rain';
+  const condition = periodFor(summary, at)?.condition;
+  if (!condition) return 'rain';
+  return WINTRY_CONDITIONS.has(condition) ? 'wintry' : 'rain';
+}
+
+function periodFor(summary: SummaryPeriod[], at: string | undefined): SummaryPeriod | undefined {
+  if (at === undefined) return summary[0];
+
+  const starts = summary.map((period) => Date.parse(period.startTime ?? ''));
+  if (starts.some(Number.isNaN)) {
+    return summary.find((period) => period.condition && period.condition !== 'clear');
   }
-  return 'rain';
+
+  const target = Date.parse(at);
+  let covering = summary[0];
+  starts.forEach((start, i) => {
+    if (start <= target) covering = summary[i];
+  });
+  return covering;
 }
 
 function json(body: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
@@ -352,7 +375,7 @@ export default {
 
         if (!rainStart && !rainEnd) return;
 
-        const precip = precipFromForecast(forecast);
+        const precip = precipFromForecast(forecast, rainStart?.startTime);
         const copy = copyFor(precip);
         // Logged so the summary schema can be checked against real responses
         // rather than trusted from Apple's docs — a wintry value has never yet
@@ -898,20 +921,19 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
     const forecast = await fetchForecast(body.lat, body.lon, env);
     const now = Date.now();
     const minutes = nextHourMinutes(forecast, now);
+    const rainStart = minutes?.find(
+      (m) => m.precipitationChance > 0.3 && m.precipitationIntensity > 0
+    );
 
     // The raw conditions, not just the derived value: if Apple renames a case
     // or ships one WINTRY_CONDITIONS does not know about, `precip` alone would
     // read as a confident "rain" and hide it.
     const summary = forecast.forecastNextHour?.summary?.map((s) => s.condition) ?? null;
-    const diagnostics = { precip: precipFromForecast(forecast), summary, dryRun };
+    const diagnostics = { precip: precipFromForecast(forecast, rainStart?.startTime), summary, dryRun };
 
     if (!minutes || minutes.length === 0) {
       return json({ ok: true, result: 'no_forecast_data', ...diagnostics });
     }
-
-    const rainStart = minutes.find(
-      (m) => m.precipitationChance > 0.3 && m.precipitationIntensity > 0
-    );
 
     if (!rainStart) {
       return json({ ok: true, result: 'no_rain', minutesChecked: minutes.length, ...diagnostics });
