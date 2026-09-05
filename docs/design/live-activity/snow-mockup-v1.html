@@ -1,0 +1,216 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0b0f16;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+    padding: 40px;
+    color: #fff;
+  }
+  h1 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+  .sub { font-size: 13px; color: rgba(255,255,255,.45); margin-bottom: 32px; }
+
+  .grid { display: flex; flex-wrap: wrap; gap: 34px 40px; max-width: 1200px; }
+  .cell { width: 360px; }
+  .label { font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: rgba(255,255,255,.55); margin-bottom: 3px; }
+  .note  { font-size: 11.5px; color: rgba(255,255,255,.38); margin-bottom: 11px; line-height: 1.45; height: 32px; }
+
+  /* ---- the card: mirrors LockScreenActivityView exactly ---- */
+  .card {
+    width: 360px;
+    padding: 14px 16px 16px 16px;
+    border-radius: 22px;
+    background: linear-gradient(135deg, #28394F 0%, #15233D 100%);
+  }
+
+  /* header row — HStack(spacing: 7) */
+  .hdr { display: flex; align-items: center; gap: 7px; }
+  .badge {
+    width: 20px; height: 20px; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .appname { font-size: 12px; font-weight: 600; color: rgba(255,255,255,.72); }
+  .spacer { flex: 1; }
+  .status { display: flex; align-items: center; gap: 5px; }
+  .statusdot { width: 6px; height: 6px; border-radius: 50%; }
+  .statustext { font-size: 11px; font-weight: 600; color: rgba(255,255,255,.55); }
+
+  /* hero row — padding(.top, 11) */
+  .hero { display: flex; align-items: flex-end; gap: 12px; margin-top: 11px; }
+  .heroleft { display: flex; flex-direction: column; gap: 5px; }
+  .count { display: flex; align-items: baseline; gap: 3px; }
+  .count .num { font-size: 31px; font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: -.5px; }
+  .count .unit { font-size: 16px; font-weight: 700; color: rgba(255,255,255,.72); }
+  .ctx { font-size: 13px; }
+  .ctx b { font-weight: 600; color: #fff; }
+  .ctx span { font-weight: 500; color: rgba(255,255,255,.72); }
+  .right { font-size: 12px; font-weight: 600; color: rgba(255,255,255,.55); text-align: right; margin-left: auto; }
+
+  /* slim track — padding(.top, 18) */
+  .track { margin-top: 18px; padding: 0 4px; }
+  .rail-wrap { position: relative; height: 20px; padding-top: 4px; }
+  .rail {
+    position: absolute; left: 0; right: 0; top: 6px;
+    height: 4px; border-radius: 2px; background: rgba(255,255,255,.15);
+  }
+  .seg { position: absolute; top: 6px; height: 4px; border-radius: 2px; }
+  .hourdot { position: absolute; width: 3px; height: 3px; border-radius: 50%; top: 6.5px; }
+  .nowdot {
+    position: absolute; left: 0; top: 3px;
+    width: 10px; height: 10px; border-radius: 50%; background: #fff;
+    box-shadow: 0 0 0 3px rgba(255,255,255,.22), 0 1px 1.5px rgba(0,0,0,.45);
+  }
+  .flag { position: absolute; top: -5px; font-size: 9.5px; font-weight: 600; }
+  .labels {
+    display: flex; justify-content: space-between; margin-top: 5px;
+    font-size: 9.5px; font-weight: 500; font-variant-numeric: tabular-nums;
+    color: rgba(255,255,255,.4);
+  }
+
+  /* granular variant: dotted segment instead of a solid capsule */
+  .seg.granular { border-radius: 0; background: none !important; }
+</style>
+</head>
+<body>
+
+<h1>Live Activity — wintry treatment</h1>
+<div class="sub">Lock screen card at true size (360&times;, real type scale from RainLiveActivity.swift). Card 1 is what ships today.</div>
+
+<div class="grid" id="grid"></div>
+
+<script>
+// Rain palette, verbatim from RainLiveActivity.swift
+const RAIN = { a:'#54C3F5', b:'#38ADE7', flag:'#9DDCFF' };
+
+const VARIANTS = [
+  { key:'rain',   name:'0 · Rain today (reference)',
+    note:'Ships now. Snow renders exactly like this — only the words change.',
+    a:RAIN.a, b:RAIN.b, flag:RAIN.flag, glyph:'drop', copy:'rain' },
+
+  { key:'ice',    name:'A · Ice',
+    note:'Snowflake + a pale ice-blue track. Closest to the approved v3 feel.',
+    a:'#A8DFFF', b:'#7FC7F0', flag:'#CDEBFF', glyph:'flake', copy:'snow' },
+
+  { key:'frost',  name:'B · Frost',
+    note:'Near-white silver. Reads coldest; least colour of the four.',
+    a:'#E8F4FC', b:'#BCD8EA', flag:'#E8F4FC', glyph:'flake', copy:'snow' },
+
+  { key:'peri',   name:'C · Periwinkle',
+    note:'Cooler violet-blue. Most separable from rain at a glance.',
+    a:'#C2CDFF', b:'#909FF0', flag:'#D6DEFF', glyph:'flake', copy:'snow' },
+
+  { key:'gran',   name:'D · Granular',
+    note:'Ice palette, but the track becomes discrete flecks — snow reads as texture, not just hue.',
+    a:'#A8DFFF', b:'#7FC7F0', flag:'#CDEBFF', glyph:'flake', copy:'snow', granular:true },
+];
+
+// segments (0..1) — same forecast shape in every card so only the treatment differs
+const SEGMENTS = [[0.10, 0.46], [0.62, 0.85]];
+const HOURS = [0.667];
+
+function glyphSVG(kind, color, size) {
+  if (kind === 'drop') {
+    return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="${color}">
+      <path d="M12 2.5c-.3 0-.6.15-.78.4C9.6 5.2 5.5 11 5.5 14.6a6.5 6.5 0 0 0 13 0c0-3.6-4.1-9.4-5.72-11.7a.95.95 0 0 0-.78-.4z"/></svg>`;
+  }
+  // snowflake: 3 axes + chevron barbs, approximating SF Symbols "snowflake".
+  // Stroke scales with size — at badge size a hairline turns to mush.
+  const sw = size <= 14 ? 2.4 : 1.8;
+  const s = `stroke="${color}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" fill="none"`;
+  let arms = '';
+  for (let i = 0; i < 3; i++) {
+    const rot = i * 60;
+    arms += `<g transform="rotate(${rot} 12 12)">
+      <line x1="12" y1="3.2" x2="12" y2="20.8" ${s}/>
+      <polyline points="9.4,6.0 12,8.5 14.6,6.0" ${s}/>
+      <polyline points="9.4,18.0 12,15.5 14.6,18.0" ${s}/>
+    </g>`;
+  }
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24">${arms}</svg>`;
+}
+
+function segmentHTML(v) {
+  let out = '';
+  for (const [s, e] of SEGMENTS) {
+    const left = (s * 100).toFixed(2), w = ((e - s) * 100).toFixed(2);
+    if (v.granular) {
+      // discrete flecks across the stretch
+      const px = 328 * (e - s);
+      const step = 7, n = Math.max(2, Math.floor(px / step));
+      let dots = '';
+      for (let i = 0; i < n; i++) {
+        const x = (i * step + 1).toFixed(1);
+        const op = 0.55 + 0.45 * Math.abs(Math.sin(i * 1.3));
+        dots += `<span style="position:absolute;left:${x}px;top:0;width:3.5px;height:4px;border-radius:1.75px;
+                 background:${v.a};opacity:${op.toFixed(2)};box-shadow:0 0 4px ${v.a}88;"></span>`;
+      }
+      out += `<div class="seg granular" style="left:${left}%;width:${w}%;">${dots}</div>`;
+    } else {
+      out += `<div class="seg" style="left:${left}%;width:${w}%;
+              background:linear-gradient(90deg,${v.a},${v.b});
+              box-shadow:0 0 4.5px ${v.a}8c;"></div>`;
+    }
+  }
+  return out;
+}
+
+function card(v) {
+  const isSnow = v.copy === 'snow';
+  const statusText = isSnow ? 'Snow incoming' : 'Rain incoming';
+  const ctxBold    = isSnow ? 'Light snow' : 'Light rain';
+  const ctxRest    = ' · lasts about 40 min';
+  const rightText  = isSnow ? 'Chicago' : 'Chicago';
+
+  const hourDots = HOURS.map(f => {
+    const wet = SEGMENTS.some(([s,e]) => f >= s && f <= e);
+    const col = wet ? v.a : 'rgba(255,255,255,.4)';
+    const glow = wet ? `box-shadow:0 0 3.5px ${v.a};` : '';
+    return `<span class="hourdot" style="left:calc(${(f*100).toFixed(1)}% - 1.5px);background:${col};${glow}"></span>`;
+  }).join('');
+
+  return `
+  <div class="cell">
+    <div class="label">${v.name}</div>
+    <div class="note">${v.note}</div>
+    <div class="card">
+      <div class="hdr">
+        <div class="badge" style="background:linear-gradient(90deg,${v.a},${v.b});">
+          ${glyphSVG(v.glyph, v.glyph === 'drop' ? '#fff' : '#12233b', 12)}
+        </div>
+        <div class="appname">Gonna Rain?</div>
+        <div class="spacer"></div>
+        <div class="status">
+          <span class="statusdot" style="background:${v.a};box-shadow:0 0 3.5px ${v.a};"></span>
+          <span class="statustext">${statusText}</span>
+        </div>
+      </div>
+
+      <div class="hero">
+        <div class="heroleft">
+          <div class="count"><span class="num">24</span><span class="unit">min</span></div>
+          <div class="ctx"><b>${ctxBold}</b><span>${ctxRest}</span></div>
+        </div>
+        <div class="right">${rightText}</div>
+      </div>
+
+      <div class="track">
+        <div class="rail-wrap">
+          <div class="flag" style="left:26%;color:${v.flag};">4:33</div>
+          <div class="rail"></div>
+          ${segmentHTML(v)}
+          ${hourDots}
+          <div class="nowdot"></div>
+        </div>
+        <div class="labels"><span>Now</span><span>+45 min</span><span>+90 min</span></div>
+      </div>
+    </div>
+  </div>`;
+}
+
+document.getElementById('grid').innerHTML = VARIANTS.map(card).join('');
+</script>
+</body>
+</html>
