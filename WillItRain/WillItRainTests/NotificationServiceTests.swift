@@ -293,6 +293,25 @@ final class NotificationServiceTests: XCTestCase {
         }
     }
 
+    func testAWetHourFurtherOutStaysConfirmedUntilTheNowcastBordersItAndIsNeverAlertedOnUnseen() {
+        // The wet hour is two hours off. Until 11:00 it begins on a whole reading
+        // and is confirmed, but it is never inside the 60-minute lead time. From
+        // 11:00 the nowcast borders it, its onset becomes the moving horizon and
+        // it is unconfirmed. Either way the gate never fires for rain the nowcast
+        // has not shown.
+        settings.leadTime = 60
+        for k in stride(from: 5, through: 115, by: 5) {
+            let now = hour0.addingTimeInterval(TimeInterval(k * 60))
+            let f = nowcastForecast(at: now, wetHours: [2])
+            XCTAssertEqual(f.precipitationPeriods.count, 1, "Poll at +\(k) min")
+            XCTAssertEqual(f.confirmedPeriods.count, k < 60 ? 1 : 0, "Poll at +\(k) min")
+
+            evaluate(f, at: now)
+            XCTAssertEqual(delivered, [], "Poll at +\(k) min")
+            XCTAssertNil(settings.pendingPrecipStart, "Poll at +\(k) min")
+        }
+    }
+
     func testRainTheNowcastDoesSeeGoesThroughTheGateAsUsual() {
         // The same wet hour, but the nowcast now shows the rain from :50. That
         // onset is one it saw, so the ordinary two passes fire the alert.

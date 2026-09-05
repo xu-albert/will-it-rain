@@ -155,13 +155,39 @@ final class ForecastMergeTests: XCTestCase {
         XCTAssertTrue(f.confirmedPeriods.isEmpty)
     }
 
-    func testAWetHourBeyondTheNowcastIsUnconfirmedEvenWhenItBeginsOnTheHour() {
+    func testAtTheTopOfTheHourTheHourAfterTheNowcastIsStillUnconfirmed() {
+        // Fetched at 10:00 the minute data ends exactly at 11:00, so the 11:00
+        // reading follows it whole — but it is still the reading at the
+        // horizon, and the next poll will clip it: no event to alert on yet.
+        let now = hour0
+        let result = ForecastMerge.merge(minute: minutes(from: now), hourly: hourly(wet: [1]), now: now)
+        let f = forecast(from: result, at: now)
+
+        XCTAssertEqual(f.precipitationPeriods.first?.start, hour(1))
+        XCTAssertEqual(f.precipitationPeriods.map(\.isConfirmed), [false])
+    }
+
+    func testAWetHourFurtherOutBeginsOnAWholeReadingAndStaysConfirmed() {
+        // Only the reading right after the nowcast has the moving onset. The
+        // 12:00 hour begins on a whole reading with a stable date, so it stays
+        // an event the Live Activity may draw, as it was before the merge changed.
         let now = minute(5, from: hour0)
         let result = ForecastMerge.merge(minute: minutes(from: now), hourly: hourly(wet: [2]), now: now)
         let f = forecast(from: result, at: now)
 
-        XCTAssertEqual(f.precipitationPeriods.first?.start, hour(2))
-        XCTAssertTrue(f.confirmedPeriods.isEmpty)
+        XCTAssertEqual(f.precipitationPeriods.map(\.start), [hour(2)])
+        XCTAssertEqual(f.confirmedPeriods.map(\.start), [hour(2)])
+    }
+
+    func testANowcastShowerAndAWetHourFurtherOutAreTwoConfirmedPeriods() {
+        // Rain 10:05–10:29 in the minute data and a wet 13:00 hour: two bursts,
+        // both placed by their own data, both for the Live Activity's track.
+        let now = minute(5, from: hour0)
+        let result = ForecastMerge.merge(minute: minutes(from: now, wet: Set(0..<25)), hourly: hourly(wet: [3]), now: now)
+        let f = forecast(from: result, at: now)
+
+        XCTAssertEqual(f.confirmedPeriods.map(\.start), [now, hour(3)])
+        XCTAssertEqual(f.confirmedPeriods.map(\.end), [minute(25, from: now), hour(4)])
     }
 
     func testWithoutAnyHourlyReadingTheMinuteDataStands() {
