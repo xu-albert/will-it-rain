@@ -400,6 +400,22 @@ describe('/test-activity', () => {
     expect(result.status).toBe(200);
     expect(captured.activityPushes[0].event).toBe('end');
     expect(captured.activityPushes[0].aps).toHaveProperty('dismissal-date');
+    // The token goes with the activity, as on the cron's end path; the device
+    // record stays so ordinary alerts continue.
+    expect(harness.kv.raw(`activity:${fakeToken(1)}`)).toBeUndefined();
+    expect(harness.kv.raw(`device:${fakeToken(1)}`)).toBeDefined();
+  });
+
+  it('keeps the activity token after a plain update', async () => {
+    const harness = makeHarness({ signingKey });
+    harness.env.ADMIN_TOKEN = ADMIN;
+    await plantWithActivity(harness, 1, Date.now());
+
+    await capturing(rainAt(20), () =>
+      worker.fetch(adminRequest('/test-activity', { token: fakeToken(1), precip: 'rain' }), harness.env)
+    );
+
+    expect(harness.kv.raw(`activity:${fakeToken(1)}`)).toBeDefined();
   });
 });
 

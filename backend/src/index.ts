@@ -860,6 +860,10 @@ async function handleTestActivity(request: Request, env: Env): Promise<Response>
 
   try {
     await sendLiveActivityUpdate(activityToken, contentState, env, event);
+    // Same as the cron's own end path: the activity is over, so drop its token
+    // now rather than letting the next precipitating tick spend a push on a
+    // token APNs will reject before discardDeadActivityToken reaps it.
+    if (event === 'end') await clearActivityToken(body.token, env);
     return json({ ok: true, event, precip: precip ?? null, minutesUntil });
   } catch (err) {
     await discardDeadActivityToken(body.token, err, env);
