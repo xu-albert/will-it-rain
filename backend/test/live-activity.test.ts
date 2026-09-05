@@ -540,6 +540,30 @@ describe('/test-cron dryRun', () => {
     expect(captured.activityPushes).toHaveLength(0);
   });
 
+  it('reports what the cron would push while it is raining: what is falling now, not snow later', async () => {
+    const harness = makeHarness({ signingKey });
+    harness.env.ADMIN_TOKEN = ADMIN;
+
+    const { result } = await capturing(
+      (t) =>
+        forecast(t, (i) => i < 40, {
+          summary: [
+            { startTime: new Date(t).toISOString(), condition: 'clear' },
+            { startTime: new Date(t + 30 * 60_000).toISOString(), condition: 'snow' },
+          ],
+        }),
+      () => worker.fetch(adminRequest('/test-cron', { ...body, dryRun: true }), harness.env)
+    );
+
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({
+      result: 'rain_detected',
+      minutesUntilRain: 0,
+      precip: 'rain',
+      summary: ['clear', 'snow'],
+    });
+  });
+
   it('reports a null summary when WeatherKit sends none, and still does not throw', async () => {
     const harness = makeHarness({ signingKey });
     harness.env.ADMIN_TOKEN = ADMIN;

@@ -62,6 +62,10 @@ const ACTIVITY_WINDOW_MINUTES = 90;
 // See recordPushFailure for why this isn't 1.
 const BAD_TOKEN_STRIKES = 5;
 
+// The per-minute precipitation test behind rain-start and rain-end detection.
+const isWet = (m: { precipitationChance: number; precipitationIntensity: number }) =>
+  m.precipitationChance > 0.3 && m.precipitationIntensity > 0;
+
 // WeatherKit condition strings that should render with the wintry treatment.
 // The WeatherKit REST API documents forecastNextHour.summary[].condition as
 // its PrecipitationType enum: clear, precipitation, rain, snow, sleet, hail,
@@ -365,8 +369,6 @@ export default {
         const minutes = nextHourMinutes(forecast, now);
         if (!minutes || minutes.length === 0) return;
 
-        const isWet = (m: { precipitationChance: number; precipitationIntensity: number }) =>
-          m.precipitationChance > 0.3 && m.precipitationIntensity > 0;
         const rainingNow = isWet(minutes[0]);
 
         // Rain START: first wet minute ahead — only relevant if it isn't already raining.
@@ -922,15 +924,18 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
     const forecast = await fetchForecast(body.lat, body.lon, env);
     const now = Date.now();
     const minutes = nextHourMinutes(forecast, now);
-    const rainStart = minutes?.find(
-      (m) => m.precipitationChance > 0.3 && m.precipitationIntensity > 0
-    );
+    const rainStart = minutes?.find(isWet);
+    const rainingNow = !!minutes?.length && isWet(minutes[0]);
 
     // The raw conditions, not just the derived value: if Apple renames a case
     // or ships one WINTRY_CONDITIONS does not know about, `precip` alone would
     // read as a confident "rain" and hide it.
     const summary = forecast.forecastNextHour?.summary?.map((s) => s.condition) ?? null;
-    const diagnostics = { precip: precipFromForecast(forecast, rainStart?.startTime), summary, dryRun };
+    const diagnostics = {
+      precip: precipFromForecast(forecast, rainingNow ? undefined : rainStart?.startTime),
+      summary,
+      dryRun,
+    };
 
     if (!minutes || minutes.length === 0) {
       return json({ ok: true, result: 'no_forecast_data', ...diagnostics });
