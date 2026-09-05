@@ -334,6 +334,11 @@ Ordered by risk × how cheap the fix is; effort is rough.
 
 ## 12. Running everything headlessly, in one place
 
+`./scripts/test-headless.sh` runs all of the below in order (`backend` or `ios` as its argument
+runs one half); it is also the `commands.test` of `.no-mistakes.yaml`, so the no-mistakes test
+step runs this rather than an exploratory agent. It picks a shut-down iPhone 17 Pro by UDID,
+boots it, waits, tests, and shuts it down again. The individual commands, for reference:
+
 ```bash
 ./scripts/test-headless.sh            # backend + iOS
 ./scripts/test-headless.sh backend    # npm ci, typecheck, vitest, wrangler deploy --dry-run
