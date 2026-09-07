@@ -177,6 +177,7 @@ failure blocks the release.
 | M12 | Accessibility pass | See section 9 | — |
 | M13 | Widget rendering | Add small and medium widgets to the Home Screen | Both render current forecast without truncation or placeholder data |
 | M14 | Abuse-gate symptom spot-check | Deliberately trigger one 503 (`coverage_at_capacity` or `cell_at_capacity`) against a non-production or disposable registration | Response matches the symptom table in [Appendix A section G](#appendix-a-production-ops--notification-testing-runbook); confirms the gate is live in the deployed environment, not just in `abuse.test.ts` |
+| M15 | Hourly-only forecast state | Set a custom simulator location (Features > Location > Custom Location…) in a country without next-hour precipitation on Apple's iOS feature-availability page, then background and foreground the app so it re-fetches | The line "Minute-by-minute forecast isn't available here; showing hourly" appears above the charts, there is no "Next Hour" chart section, the hourly chart starts at the hour containing now rather than an hour out, and the hero line reads off the hourly data (`ForecastMergeTests` guards the model — see the hourly-fallback row in section 4 — but nothing renders this state) |
 
 ## 7. Performance and load
 
@@ -233,7 +234,7 @@ accessibility regression is caught only if a human runs this table before releas
 | iOS unit tests (headless, iPhone 17 Pro) | ✅ CI | Same |
 | `xcodebuild ... build-for-testing` / `test-without-building` locally before pushing | Manual (recommended) | [`AGENTS.md`](AGENTS.md) "Build & test" |
 | `npx wrangler deploy --dry-run` | Manual (recommended), not in CI | [`AGENTS.md`](AGENTS.md) "Backend Worker" |
-| Manual scenarios M1–M14 (section 6) | ❌ Manual only | This document |
+| Manual scenarios M1–M15 (section 6) | ❌ Manual only | This document |
 | Accessibility pass (section 9) | ❌ Manual only | This document |
 | App Store submission checklist (below) | ❌ Manual only | This document |
 | Regression catalog reviewed for new UNGUARDED rows on this release's fixes (section 4) | ❌ Manual only | This document |
@@ -279,7 +280,7 @@ Ordered by risk × how cheap the fix is; effort is rough.
 | P2 | No `validate.test.ts` isolating each validator | Validation bugs are only caught through full-HTTP integration tests, making failures harder to localize | S |
 | P2 | No test simulating a full day's cron ticks against the 1,000 daily KV write/delete ceilings | A schedule or cap change could pass the per-invocation test yet still blow the daily budget (the exact multi-bucket risk `AGENTS.md` calls out) | M |
 | P3 | No accessibility or Dynamic Type automation | Regressions caught only by the manual pass (section 9) | M–L: `XCUIApplication` accessibility audit as a start |
-| P3 | No E2E/XCUITest automation of the manual scenarios in section 6 | Every release depends on a human running all 14 scenarios by hand | L: would need simulator/device time explicitly out of scope for this PR's no-GUI constraint |
+| P3 | No E2E/XCUITest automation of the manual scenarios in section 6 | Every release depends on a human running all 15 scenarios by hand | L: would need simulator/device time explicitly out of scope for this PR's no-GUI constraint |
 | P3 | No automated contract test for the iOS↔Worker JSON payload shape | A field rename on either side is caught only by manual testing or production failure | M: a schema shared or asserted on both sides |
 
 ## 12. Running everything headlessly, in one place
