@@ -167,6 +167,31 @@ final class ForecastMergeTests: XCTestCase {
         XCTAssertEqual(f.precipitationPeriods.map(\.isConfirmed), [false])
     }
 
+    func testALagSliverBetweenTheNowcastAndTheNextHourDoesNotConfirmIt() {
+        // Fetched at 11:02 with the minute feed stamped from 10:59, the few
+        // minutes' lag the real feed shows. The data ends at 11:59, so the
+        // 11:00 reading survives as a one-minute sliver and the wet 12:00
+        // reading follows that sliver, not the nowcast itself. It is still the
+        // hour the nowcast has not reached — at 11:07 the sliver is gone and
+        // the 12:00 reading is the clipped one — so confirming it here raised
+        // a Live Activity and a pending alert for one poll and dropped both.
+        let fetched = minute(2, from: hour(1))
+        let lagged = minutes(from: minute(-3, from: fetched))
+        let result = ForecastMerge.merge(minute: lagged, hourly: hourly(wet: [2]), now: fetched)
+        let f = forecast(from: result, at: fetched)
+
+        XCTAssertEqual(result.dataPoints[60].date, minute(59, from: hour(1)))
+        XCTAssertEqual(result.dataPoints[60].span, 60, "A sliver of the 11:00 hour")
+        XCTAssertEqual(f.precipitationPeriods.map(\.start), [hour(2)])
+        XCTAssertEqual(f.heroStatus(for: .cloudy, at: fetched).title, "Rains in 58 min")
+        XCTAssertEqual(f.precipitationPeriods.map(\.isConfirmed), [false])
+        XCTAssertTrue(f.confirmedPeriods.isEmpty)
+
+        let later = minute(7, from: hour(1))
+        let laterResult = ForecastMerge.merge(minute: minutes(from: minute(-3, from: later)), hourly: hourly(wet: [2]), now: later)
+        XCTAssertEqual(PrecipitationPeriod.detect(in: laterResult.dataPoints).map(\.isConfirmed), [false], "The same verdict once the sliver is gone")
+    }
+
     func testAWetHourFurtherOutBeginsOnAWholeReadingAndStaysConfirmed() {
         // Only the reading right after the nowcast has the moving onset. The
         // 12:00 hour begins on a whole reading with a stable date, so it stays

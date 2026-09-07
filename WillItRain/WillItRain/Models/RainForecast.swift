@@ -106,14 +106,23 @@ struct PrecipitationPeriod: Identifiable {
     let peakIntensity: PrecipitationIntensity
     /// Whether this period's onset is one the data has actually placed. False
     /// only for a period that begins on the hourly reading right after a
-    /// minute-by-minute nowcast: the merge dates that onset at the nowcast's
-    /// horizon, which moves with every poll, so it is no event to alert on — a
-    /// wet hour the nowcast never reached would be announced afresh each time
-    /// the horizon moved. The hero line and the charts still show it; the alert
-    /// gate and the Live Activity read `RainForecast.confirmedPeriods`. A wet
-    /// hour further out begins on a whole hourly reading with a stable date and
-    /// stays confirmed, as does every period where there is no nowcast at all.
+    /// minute-by-minute nowcast (looking through a sliver of the hour the
+    /// nowcast's lag left uncovered, see `nowcastLagTolerance`): the merge
+    /// dates that onset at the nowcast's horizon, which moves with every poll,
+    /// so it is no event to alert on — a wet hour the nowcast never reached
+    /// would be announced afresh each time the horizon moved. The hero line and
+    /// the charts still show it; the alert gate and the Live Activity read
+    /// `RainForecast.confirmedPeriods`. A wet hour further out begins on a
+    /// whole hourly reading with a stable date and stays confirmed, as does
+    /// every period where there is no nowcast at all.
     var isConfirmed: Bool = true
+
+    /// How far behind the fetch the nowcast's first reading may be stamped.
+    /// The hourly reading clipped to follow the nowcast can then be a sliver
+    /// shorter than this: the tail of the hour the lag left uncovered, not an
+    /// hour the nowcast has yet to reach. `detect` looks through such a sliver
+    /// when judging whether a period begins right after the nowcast.
+    static let nowcastLagTolerance: TimeInterval = 5 * 60
 
     func contains(_ date: Date) -> Bool {
         date >= start && date <= end
@@ -141,9 +150,8 @@ struct PrecipitationPeriod: Identifiable {
         var periodType: PrecipitationType = .none
         var peakIntensity: PrecipitationIntensity = .none
         var periodIsConfirmed = true
-        var previous: ChartDataPoint?
 
-        for point in dataPoints {
+        for (index, point) in dataPoints.enumerated() {
             let isWet = point.intensity != .none || point.probability >= likelyRainProbability
             if isWet {
                 let intensity = point.intensity == .none ? .light : point.intensity
@@ -151,7 +159,7 @@ struct PrecipitationPeriod: Identifiable {
                     periodStart = point.date
                     periodType = point.type == .none ? .rain : point.type
                     peakIntensity = intensity
-                    periodIsConfirmed = !(point.resolution == .hour && previous?.resolution == .minute)
+                    periodIsConfirmed = !(point.resolution == .hour && followsTheNowcast(dataPoints, at: index))
                 } else if intensity > peakIntensity {
                     peakIntensity = intensity
                 }
@@ -166,7 +174,6 @@ struct PrecipitationPeriod: Identifiable {
                 periodStart = nil
                 peakIntensity = .none
             }
-            previous = point
         }
 
         // Close any open period
@@ -181,6 +188,14 @@ struct PrecipitationPeriod: Identifiable {
         }
 
         return periods
+    }
+
+    /// Whether the reading before `index` is a minute reading, looking through
+    /// one hourly sliver shorter than `nowcastLagTolerance`.
+    private static func followsTheNowcast(_ dataPoints: [ChartDataPoint], at index: Int) -> Bool {
+        var i = index - 1
+        if i >= 0, dataPoints[i].resolution == .hour, dataPoints[i].span < nowcastLagTolerance { i -= 1 }
+        return i >= 0 && dataPoints[i].resolution == .minute
     }
 }
 
