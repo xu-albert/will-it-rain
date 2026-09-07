@@ -19,7 +19,7 @@ final class LiveActivityService {
 
         let now = Date()
         let horizon = now.addingTimeInterval(TimeInterval(horizonMinutes * 60))
-        let periods = forecast.precipitationPeriods
+        let periods = forecast.confirmedPeriods
             .filter { $0.end > now && $0.start < horizon }
             .sorted { $0.start < $1.start }
         let current = periods.first { $0.contains(now) }

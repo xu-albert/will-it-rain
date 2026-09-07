@@ -1,0 +1,5 @@
+# no-mistakes repo config. Without a test command the test step dispatches an
+# exploratory agent, which on a change spanning the Worker and the iOS app
+# ran past its 30-minute limit (2026-09-04). This runs what CI runs.
+commands:
+  test: ./scripts/test-headless.sh

@@ -1,4 +1,5 @@
 import { Env, WeatherKitForecast } from './types';
+import { SYNTHESIZED_LOOKBACK_MINUTES } from './nextHour';
 
 // Generate JWT for WeatherKit REST API authentication
 async function generateJWT(env: Env): Promise<string> {
@@ -37,7 +38,20 @@ async function generateJWT(env: Env): Promise<string> {
 
 export async function fetchForecast(lat: number, lon: number, env: Env): Promise<WeatherKitForecast> {
   const token = await generateJWT(env);
-  const url = `https://weatherkit.apple.com/api/v1/weather/en-US/${lat}/${lon}?dataSets=forecastNextHour`;
+  // forecastHourly is the fallback for regions with no forecastNextHour
+  // (nextHour.ts). Only the hours that can contain its synthesized minutes are
+  // asked for: from the hour containing the series' lookback start — by default
+  // the dataset begins on the current hour, which would leave the lookback
+  // uncovered right after an hour boundary — to two hours out, which keeps the
+  // response near its old size. Still one external subrequest.
+  const now = Date.now();
+  const lookbackStart = now - SYNTHESIZED_LOOKBACK_MINUTES * 60_000;
+  const hourlyStart = new Date(lookbackStart - (lookbackStart % 3_600_000)).toISOString();
+  const hourlyEnd = new Date(now + 2 * 3_600_000).toISOString();
+  const url =
+    `https://weatherkit.apple.com/api/v1/weather/en-US/${lat}/${lon}` +
+    `?dataSets=forecastNextHour,forecastHourly` +
+    `&hourlyStart=${encodeURIComponent(hourlyStart)}&hourlyEnd=${encodeURIComponent(hourlyEnd)}`;
 
   const resp = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },

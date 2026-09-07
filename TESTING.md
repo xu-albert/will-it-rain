@@ -28,14 +28,15 @@ an automated contract test. See section 3 for what that leaves unguarded.
      ╱     ╲ Integration/contract (section 3): abuse.test.ts drives the real fetch handler +
     ╱       ╲ real Durable Object classes over mocked KV; iOS has none against a live backend
    ╱─────────╲
-  ╱  Unit      ╲ backend: abuse.ts, grid.ts (partial); iOS: PrecipitationIntensity,
- ╱   (§2)       ╲ CLLocationManager continuation, Info.plist (BuildProductTests)
+  ╱  Unit      ╲ backend: abuse.ts, grid.ts (partial), nextHour.ts; iOS: ForecastMerge + period
+ ╱   (§2)       ╲ detection, the alert gate, RainForecast readings, CLLocationManager, Info.plist
 ```
 
 The backend pyramid is inverted relative to a typical service: there is effectively one large,
 high-value integration suite (`abuse.test.ts`, 59 tests exercising `index.ts`'s real `fetch`
-handler end-to-end) and very little narrow unit coverage of the pure helper modules underneath
-it. The iOS pyramid is the opposite problem — three small, genuinely unit-level suites and no
+handler end-to-end, plus `cron-alerts.test.ts` through `scheduled()`) and very little narrow unit
+coverage of the pure helper modules underneath it (`next-hour.test.ts` is the exception). The iOS
+pyramid is the opposite problem — five small, genuinely unit-level suites and no
 integration coverage of the services that talk to WeatherKit, APNs tokens, or the backend.
 
 ## 2. Unit tests
@@ -46,24 +47,30 @@ integration coverage of the services that talk to WeatherKit, APNs tokens, or th
 |---|---|---|---|
 | Backend abuse gate | `backend/test/abuse.test.ts` | Vitest | Rate limiting, grid-cell/device caps, TTL/rewrite-cooldown logic, cron push-budget math, re-registration semantics, content-type validation — see the `describe()` list in section 4 |
 | Backend test harnesses | `backend/test/kvMock.ts`, `backend/test/doMock.ts` | — | In-memory KV (with expiry + stale-read simulation) and a Durable Object namespace mock that runs the *real* `CoverageRegistry`/`RegistrationLimiter` classes, not stubs |
-| iOS forecast model | `WillItRain/WillItRainTests/RainForecastTests.swift` | XCTest | `PrecipitationIntensity.from(millimetersPerHour:)` thresholds and `Comparable` ordering |
+| Backend cron alerts | `backend/test/cron-alerts.test.ts` | Vitest | The real `scheduled()` handler with WeatherKit and APNs stubbed: which device is alerted at which minute (lead-time gate, 30-minute repeat suppression, per-device opt-outs, rain-end window), the hourly fallback where there is no minute forecast, and the terminal Live Activity update at the tick after a wet hour ends |
+| Backend next-hour series | `backend/test/next-hour.test.ts` | Vitest | `nextHourMinutes`: a real `forecastNextHour` passes through untouched; otherwise the minute series synthesized from `forecastHourly`, starting one cron interval before now and bounded by the readings on hand |
+| iOS forecast model | `WillItRain/WillItRainTests/RainForecastTests.swift` | XCTest | `PrecipitationIntensity.from(millimetersPerHour:)` thresholds and `Comparable` ordering, `PrecipitationPeriod.contains`, type icons, and `RainForecast`'s time-dependent readings (current/next period, hero status copy, poll interval) at a given instant |
+| iOS forecast merge | `WillItRain/WillItRainTests/ForecastMergeTests.swift` | XCTest | `ForecastMerge.merge(minute:hourly:now:)` at fixed instants and `PrecipitationPeriod.detect(in:)` on the merged series: which hourly reading is kept and how it is clipped, `hasMinuteForecast`, and which periods are `isConfirmed` (see section 4) |
+| iOS alert gate | `WillItRain/WillItRainTests/NotificationServiceTests.swift` | XCTest | Every path through `NotificationService.evaluateAndSchedule` at explicit instants with delivery recorded and settings in an isolated `UserDefaults` suite: two-pass rain-start and rain-end confirmation, same-event suppression, rain resuming within the hour, quiet hours, opt-outs, hourly-only and unconfirmed-nowcast periods |
 | iOS location service | `WillItRain/WillItRainTests/LocationServiceTests.swift` | XCTest | `LocationService.currentLocation()` against a stubbed `CLLocationManager`, including the stuck-continuation regression (see section 4) |
 | iOS build product | `WillItRain/WillItRainTests/BuildProductTests.swift` | XCTest | Generated `Info.plist` keys: portrait lock, bundle ID, display name, Live Activity entitlement flags, background task ID, location usage strings, version keys present |
 
 ### What is missing
 
-- **Backend:** `weatherkit.ts` (WeatherKit REST parsing), `apns.ts` (`sendRainAlert`/`sendRainEndAlert` payload shaping and APNs response handling), and the `scheduled()` cron handler in
-  `index.ts` have no unit tests — `abuse.test.ts`'s "cron fan-out budget" `describe` blocks test the
-  *budget arithmetic* (`createPushBudget`, imported from `abuse.ts`), not the cron entry point
-  actually calling WeatherKit or APNs. `validate.ts` (payload validation) is exercised only
-  indirectly through `/register` HTTP calls, not with direct unit cases per validator.
-- **iOS:** `WeatherService.swift` (WeatherKit fetch, `findPrecipitationPeriods`, precipitation-type
-  mapping), `NotificationService.swift`, `PushRegistrationService.swift` (token storage,
+- **Backend:** `weatherkit.ts` (WeatherKit REST parsing and the request it builds) and `apns.ts`
+  (`sendRainAlert`/`sendRainEndAlert` payload shaping and APNs response handling) have no unit tests
+  of their own — `cron-alerts.test.ts` reaches them only through the real `scheduled()` handler with
+  WeatherKit and APNs stubbed, and `abuse.test.ts`'s "cron fan-out budget" `describe` blocks test the
+  *budget arithmetic* (`createPushBudget`, imported from `abuse.ts`). `validate.ts` (payload
+  validation) is exercised only indirectly through `/register` HTTP calls, not with direct unit
+  cases per validator.
+- **iOS:** `WeatherService.swift` (WeatherKit fetch, precipitation-type mapping — the minute/hourly
+  merge itself is the pure `ForecastMerge.merge(minute:hourly:now:)`, covered together with
+  `PrecipitationPeriod.detect(in:)` by `ForecastMergeTests.swift`; the WeatherKit-to-`ChartDataPoint`
+  mapping that feeds them is not), `PushRegistrationService.swift` (token storage,
   `registerLocation`, Live Activity token register/unregister), and `LiveActivityService.swift`
-  have no unit tests. `RainForecastTests.swift` covers only `PrecipitationIntensity`, not
-  `PrecipitationPeriod.detect(in:)` or the chart-data-point pipeline that feeds it. No view-level
-  (`ViewInspector`-style) tests exist for `ContentView`, `SettingsView`, `RainChartView`, or the
-  widgets.
+  have no unit tests. No view-level (`ViewInspector`-style) tests exist for `ContentView`,
+  `SettingsView`, `RainChartView`, or the widgets.
 
 ### Naming and location conventions
 
@@ -124,6 +131,7 @@ if the bug came back; `UNGUARDED` means no such test exists today.
 | `14611e1` Fix chart touch offset, show rain duration, fix precip type mapping | Touch-position-to-data-point mapping and precip-type mapping were both wrong | **UNGUARDED** — no `WeatherService` precip-type-mapping test (the gap noted in section 2) |
 | `01bbbf6` Fix background refresh by configuring Info.plist correctly | `BGTaskSchedulerPermittedIdentifiers` missing/wrong broke background refresh silently | `BuildProductTests.testBackgroundRefreshTaskRegistered` |
 | `28d14a2` Fix push registration timing: wait for APNs token before registering | A race could register a device before its APNs token was captured | **UNGUARDED** — no `PushRegistrationService` test (per section 3) |
+| fix: hourly fallback where WeatherKit has no minute forecast, and keep the hourly reading containing now + 1h (edge-case report finding 10) | The minute/hourly merge cut at a hard now + 1h: with no minute forecast the series began an hour out and the hole never closed (never "raining", no rain-start alert possible at any lead time, and the cron returned early on the same boundary); with minute data the hourly reading for the hour the minute data ends in was dropped (at 10:05, 11:00 fell and 12:00 was next) | `ForecastMergeTests.swift` (`testTheHourlyReadingContainingNowPlusOneHourIsKept`, `testLateInTheHourNoMinuteReadingIsLostToTheHourlyReading`, `testWithoutMinuteDataTheSeriesStartsAtTheHourContainingNow`, `testWithoutMinuteDataRainNextHourIsInsideTheLongestLeadTime`, `testALagSliverBetweenTheNowcastAndTheNextHourDoesNotConfirmIt`), `NotificationServiceTests.swift` → `testHourlyOnlyRainNextHourGoesThroughTheLeadTimeGate`, `testAWetHourTheNowcastHasNotReachedIsNotAlertedOnPollAfterPoll`, `testAWetHourFurtherOutStaysConfirmedUntilTheNowcastBordersItAndIsNeverAlertedOnUnseen`; backend `next-hour.test.ts` and `cron-alerts.test.ts` → `reach devices where WeatherKit has no minute forecast`, `end the activity at the tick after a wet hour ends` |
 
 **Rule for future fixes:** every commit whose message starts `fix:`/`fix(...)` or is tagged
 `hotfix` must add or extend a test in the same PR that fails on the pre-fix code, named for the
@@ -169,6 +177,7 @@ failure blocks the release.
 | M12 | Accessibility pass | See section 9 | — |
 | M13 | Widget rendering | Add small and medium widgets to the Home Screen | Both render current forecast without truncation or placeholder data |
 | M14 | Abuse-gate symptom spot-check | Deliberately trigger one 503 (`coverage_at_capacity` or `cell_at_capacity`) against a non-production or disposable registration | Response matches the symptom table in [Appendix A section G](#appendix-a-production-ops--notification-testing-runbook); confirms the gate is live in the deployed environment, not just in `abuse.test.ts` |
+| M15 | Hourly-only forecast state | Set a custom simulator location (Features > Location > Custom Location…) in a country without next-hour precipitation on Apple's iOS feature-availability page, then background and foreground the app so it re-fetches | The line "Minute-by-minute forecast isn't available here; showing hourly" appears above the charts, there is no "Next Hour" chart section, the hourly chart starts at the hour containing now rather than an hour out, and the hero line reads off the hourly data (`ForecastMergeTests` guards the model — see the hourly-fallback row in section 4 — but nothing renders this state) |
 
 ## 7. Performance and load
 
@@ -225,7 +234,7 @@ accessibility regression is caught only if a human runs this table before releas
 | iOS unit tests (headless, iPhone 17 Pro) | ✅ CI | Same |
 | `xcodebuild ... build-for-testing` / `test-without-building` locally before pushing | Manual (recommended) | [`AGENTS.md`](AGENTS.md) "Build & test" |
 | `npx wrangler deploy --dry-run` | Manual (recommended), not in CI | [`AGENTS.md`](AGENTS.md) "Backend Worker" |
-| Manual scenarios M1–M14 (section 6) | ❌ Manual only | This document |
+| Manual scenarios M1–M15 (section 6) | ❌ Manual only | This document |
 | Accessibility pass (section 9) | ❌ Manual only | This document |
 | App Store submission checklist (below) | ❌ Manual only | This document |
 | Regression catalog reviewed for new UNGUARDED rows on this release's fixes (section 4) | ❌ Manual only | This document |
@@ -267,35 +276,27 @@ Ordered by risk × how cheap the fix is; effort is rough.
 | P0 | No unit tests for `apns.ts` (payload shaping, APNs error-code handling: 410/BadDeviceToken paths) | A regression in dead-token cleanup or payload shape ships undetected until production logs show it — this is exactly the class of bug section 4 already lists as UNGUARDED twice | S–M: inject a fake `fetch`, assert request/response handling per status code |
 | P0 | No unit tests for `weatherkit.ts` | An upstream WeatherKit schema change silently breaks forecasts; no fixture pins the expected shape | S: fixture-based parse test |
 | P1 | No `PushRegistrationService`/`WeatherService` tests on iOS (no protocol seam for `WeatherKit.WeatherService.shared` or `URLSession`) | Same class of silent breakage as above, client-side; also leaves `28d14a2`'s timing fix and `14611e1`'s precip-type mapping fix unguarded | M: introduce a protocol seam (same pattern as `LocationServiceTests.swift`'s `CLLocationManager` subclass) |
-| P1 | No test for `PrecipitationPeriod.detect(in:)` or the chart-data-point pipeline | Chart/period-detection regressions (two of which already happened: `d0f0452`, `14611e1`) have no guard | S–M |
 | P2 | No 401-without-`X-Admin-Token` test for `/test-rain`/`/test-cron` | A future refactor could accidentally leave the debug endpoints open, burning WeatherKit/APNs quota | S: add to `abuse.test.ts` |
 | P2 | No `validate.test.ts` isolating each validator | Validation bugs are only caught through full-HTTP integration tests, making failures harder to localize | S |
 | P2 | No test simulating a full day's cron ticks against the 1,000 daily KV write/delete ceilings | A schedule or cap change could pass the per-invocation test yet still blow the daily budget (the exact multi-bucket risk `AGENTS.md` calls out) | M |
 | P3 | No accessibility or Dynamic Type automation | Regressions caught only by the manual pass (section 9) | M–L: `XCUIApplication` accessibility audit as a start |
-| P3 | No E2E/XCUITest automation of the manual scenarios in section 6 | Every release depends on a human running all 14 scenarios by hand | L: would need simulator/device time explicitly out of scope for this PR's no-GUI constraint |
+| P3 | No E2E/XCUITest automation of the manual scenarios in section 6 | Every release depends on a human running all 15 scenarios by hand | L: would need simulator/device time explicitly out of scope for this PR's no-GUI constraint |
 | P3 | No automated contract test for the iOS↔Worker JSON payload shape | A field rename on either side is caught only by manual testing or production failure | M: a schema shared or asserted on both sides |
 
 ## 12. Running everything headlessly, in one place
 
 ```bash
-# Backend — typecheck + unit/integration tests
-cd backend && npm ci && npm run typecheck && npm test
-
-# Backend — deploy dry-run (no actual deploy)
-cd backend && npx wrangler deploy --dry-run
-
-# iOS — build for testing, then run tests headlessly on iPhone 17 Pro
-# (full invocation and simulator-boot caveats: see AGENTS.md "Build & test")
-xcodebuild build-for-testing \
-  -project WillItRain/WillItRain.xcodeproj -scheme WillItRain \
-  -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO
-xcodebuild test-without-building \
-  -project WillItRain/WillItRain.xcodeproj -scheme WillItRain \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
-xcrun simctl shutdown all
+./scripts/test-headless.sh            # backend + iOS
+./scripts/test-headless.sh backend    # npm ci, typecheck, vitest, wrangler deploy --dry-run
+./scripts/test-headless.sh ios        # build-for-testing, then test-without-building on iPhone 17 Pro
 ```
 
-CI runs the backend and iOS jobs above automatically on every push/PR to `main`
+The script boots a shut-down `iPhone 17 Pro` by UDID, waits for it to settle, and shuts that one
+device down afterwards; its header documents the simulator traps it works around. It is also what
+the no-mistakes test step runs (`.no-mistakes.yaml`). The raw `xcodebuild` invocation stays in
+[`AGENTS.md`](AGENTS.md) "Build & test".
+
+CI runs the backend and iOS jobs automatically on every push/PR to `main`
 (`.github/workflows/ci.yml`); everything else in sections 5, 6, 9, and the App Store checklist in
 section 10 is manual today, per the backlog in section 11.
 
