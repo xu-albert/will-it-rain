@@ -269,12 +269,12 @@ accessibility regression is caught only if a human runs this table before releas
 | Gate | CI-enforced today? | Where |
 |---|---|---|
 | Backend typecheck (`npm run typecheck`) | ✅ CI | `.github/workflows/ci.yml` backend job |
-| Backend tests (`npm test`, 122 tests) | ✅ CI | Same |
+| Backend tests (`npm test`) | ✅ CI | Same |
 | iOS unsigned simulator build | ✅ CI | `.github/workflows/ci.yml` iOS job |
 | iOS unit tests (headless, iPhone 17 Pro) | ✅ CI | Same |
 | `xcodebuild ... build-for-testing` / `test-without-building` locally before pushing | Manual (recommended) | [`AGENTS.md`](AGENTS.md) "Build & test" |
 | `npx wrangler deploy --dry-run` | Manual (recommended), not in CI | [`AGENTS.md`](AGENTS.md) "Backend Worker" |
-| Manual scenarios M1–M15 (section 6) | ❌ Manual only | This document |
+| Manual scenarios (section 6) | ❌ Manual only | This document |
 | Accessibility pass (section 9) | ❌ Manual only | This document |
 | App Store submission checklist (below) | ❌ Manual only | This document |
 | Regression catalog reviewed for new UNGUARDED rows on this release's fixes (section 4) | ❌ Manual only | This document |
@@ -330,7 +330,7 @@ Ordered by risk × how cheap the fix is; effort is rough.
 | P2 | No snapshot/geometry test for the Live Activity views | The 1.1.2 track-alignment fix (section 4) and the wintry palette are checked only by eye in M6 | M: a `ImageRenderer`-based snapshot of `LockScreenActivityView` per scenario in the app-hosted test target |
 | P2 | No test simulating a full day's cron ticks against the 1,000 daily KV write/delete ceilings | A schedule or cap change could pass the per-invocation test yet still blow the daily budget (the exact multi-bucket risk `AGENTS.md` calls out) | M |
 | P3 | No accessibility or Dynamic Type automation | Regressions caught only by the manual pass (section 9) | M–L: `XCUIApplication` accessibility audit as a start |
-| P3 | No E2E/XCUITest automation of the manual scenarios in section 6 | Every release depends on a human running all 17 scenarios by hand | L: would need simulator/device time explicitly out of scope for this PR's no-GUI constraint |
+| P3 | No E2E/XCUITest automation of the manual scenarios in section 6 | Every release depends on a human running every section 6 scenario by hand | L: would need simulator/device time explicitly out of scope for this PR's no-GUI constraint |
 | P3 | No automated contract test for the iOS↔Worker JSON payload shape | A field rename on either side is caught only by manual testing or production failure | M: a schema shared or asserted on both sides |
 
 ## 12. Running everything headlessly, in one place
