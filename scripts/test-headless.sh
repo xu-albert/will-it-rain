@@ -74,7 +74,6 @@ run_ios() {
   sleep 15
 
   echo "== iOS: test-without-building on $SIM_NAME ($SIM_UDID)"
-  status=0
   xcodebuild test-without-building \
     -project "$PROJECT" -scheme "$SCHEME" \
     -destination "platform=iOS Simulator,id=$SIM_UDID" \
@@ -82,7 +81,7 @@ run_ios() {
     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
     | tee "$DERIVED/test-headless.log" \
     | grep -E "Test Suite '.*' (started|passed|failed)|Executed [0-9]+ tests|error:|\*\* TEST" \
-    || status=$?
+    || true
   # grep's own exit code is not the verdict; the log's summary line is.
   xcrun simctl shutdown "$SIM_UDID" >/dev/null 2>&1 || true
   if grep -q "\*\* TEST EXECUTE FAILED \*\*" "$DERIVED/test-headless.log"; then
