@@ -9,3 +9,6 @@ build/
 # capture-icon-shots.sh writes its full-frame screenshots here (~45 MB); only
 # the 1:1 crops and 4x magnifications alongside them are committed.
 data/wir-icon-adopt/native/
+
+# Wrangler local dev state (cache, KV sqlite, etc.) is ignored at the repo root.
+.wrangler/

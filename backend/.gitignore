@@ -1,4 +1,4 @@
 node_modules/
 .wrangler/
-../.wrangler/
+# Root .gitignore owns .wrangler/; patterns here cannot escape this directory.
 .dev.vars
