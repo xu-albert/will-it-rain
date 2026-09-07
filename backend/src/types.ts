@@ -83,8 +83,8 @@ export interface WeatherKitForecast {
     minutes: WeatherKitMinute[];
   };
   /**
-   * Hourly readings, starting on the current hour. Only the first few are
-   * requested (see weatherkit.ts); they stand in for forecastNextHour where
+   * Hourly readings, from the hour requested (see weatherkit.ts). Only the few
+   * around now are asked for; they stand in for forecastNextHour where
    * WeatherKit has no minute forecast (see nextHour.ts).
    */
   forecastHourly?: {

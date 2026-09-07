@@ -82,18 +82,35 @@ async function plant(harness: Harness, devices: Planted[], now: number): Promise
   }
 }
 
+/** Plants a Live Activity push token for device `n`, as /register-activity would. */
+async function plantActivity(harness: Harness, n: number, activityN: number, now: number): Promise<void> {
+  await harness.kv.put(
+    `activity:${fakeToken(n)}`,
+    JSON.stringify({ activityToken: fakeToken(activityN), activityUpdatedAt: new Date(now).toISOString() }),
+    { expirationTtl: DEVICE_RECORD_TTL_SECONDS, metadata: { activityToken: fakeToken(activityN) } }
+  );
+}
+
 interface AlertPush {
   token: string;
   title: string;
 }
 
-/** Runs one real cron tick and returns every ordinary (non-Live-Activity) alert it sent. */
+interface ActivityPush {
+  token: string;
+  event: string;
+  statusText: string;
+  subBold: string;
+}
+
+/** Runs one real cron tick and returns every alert and Live Activity update it sent. */
 async function tick(
   harness: Harness,
   forecastFor: (now: number) => unknown
-): Promise<{ alerts: AlertPush[]; now: number }> {
+): Promise<{ alerts: AlertPush[]; activities: ActivityPush[]; now: number }> {
   const now = Date.now();
   const alerts: AlertPush[] = [];
+  const activities: ActivityPush[] = [];
 
   vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input instanceof Request ? input.url : input);
@@ -102,9 +119,17 @@ async function tick(
     }
     if (url.includes('push.apple.com')) {
       const headers = new Headers(init?.headers);
+      const token = url.slice(url.lastIndexOf('/') + 1);
       if (headers.get('apns-push-type') === 'alert') {
         const payload = JSON.parse(String(init?.body)) as { aps: { alert: { title: string } } };
-        alerts.push({ token: url.slice(url.lastIndexOf('/') + 1), title: payload.aps.alert.title });
+        alerts.push({ token, title: payload.aps.alert.title });
+      }
+      if (headers.get('apns-push-type') === 'liveactivity') {
+        const payload = JSON.parse(String(init?.body)) as {
+          aps: { event: string; 'content-state': { statusText: string; subBold: string } };
+        };
+        const state = payload.aps['content-state'];
+        activities.push({ token, event: payload.aps.event, statusText: state.statusText, subBold: state.subBold });
       }
       return new Response('', { status: 200 });
     }
@@ -120,7 +145,7 @@ async function tick(
     vi.unstubAllGlobals();
   }
 
-  return { alerts, now };
+  return { alerts, activities, now };
 }
 
 function alerted(alerts: AlertPush[]): string[] {
@@ -304,6 +329,62 @@ describe('rain-end alerts', () => {
 
     const { alerts } = await tick(harness, (t) => forecast(t, () => true));
     expect(alerts).toEqual([]);
+  });
+});
+
+describe('Live Activity updates where WeatherKit has no minute forecast', () => {
+  it('end the activity at the tick after a wet hour ends', async () => {
+    // Hour 10 wet, hour 11 dry, one device with a Live Activity. The terminal
+    // "Rain ended" update goes out at the tick that first sees a dry minute at
+    // or before now behind a wet one. With the real feed that is the 11:00
+    // tick, because the feed's first minute lags it; the synthesized series
+    // begins one cron interval back for the same reason, so that tick still
+    // opens on the last wet minutes of hour 10 instead of on a dry hour 11 it
+    // would have returned from before any Live Activity work.
+    const hour = (h: number) => Date.UTC(2026, 0, 1, h, 0, 0);
+    const hourly = () => ({
+      forecastHourly: {
+        hours: [9, 10, 11, 12].map((h) => ({
+          forecastStart: new Date(hour(h)).toISOString(),
+          precipitationChance: h === 10 ? 0.9 : 0,
+          precipitationIntensity: h === 10 ? 2 : 0,
+        })),
+      },
+    });
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date(hour(10) + 50 * 60_000));
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1 }], Date.now());
+      await plantActivity(harness, 1, 2, Date.now());
+
+      // Ten to eleven: still raining, ten minutes left on the countdown.
+      const tenTo = await tick(harness, hourly);
+      expect(tenTo.activities).toEqual([
+        { token: fakeToken(2), event: 'update', statusText: 'Raining now', subBold: 'stops in about 10 min' },
+      ]);
+      expect(alerted(tenTo.alerts)).toEqual([fakeToken(1)]);
+      expect(tenTo.alerts[0].title).toBe('Rain ending soon');
+
+      // On the hour: the dry minute has arrived, so the activity is ended and
+      // its token dropped; the rain-end alert was already sent ten minutes ago.
+      vi.setSystemTime(new Date(hour(11)));
+      const onTheHour = await tick(harness, hourly);
+      expect(onTheHour.activities).toEqual([
+        { token: fakeToken(2), event: 'end', statusText: 'Rain ended', subBold: 'Rain has stopped' },
+      ]);
+      expect(harness.kv.raw(`activity:${fakeToken(1)}`)).toBeUndefined();
+      expect(onTheHour.alerts).toEqual([]);
+
+      // Ten past: a dry hour all round, nothing more to say.
+      vi.setSystemTime(new Date(hour(11) + 10 * 60_000));
+      const tenPast = await tick(harness, hourly);
+      expect(tenPast.activities).toEqual([]);
+      expect(tenPast.alerts).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
