@@ -5,9 +5,12 @@
 `main` without this work, so it lands one release later.
 **Branch:** originally `release-1.1.1-wintry-live-activity` (PR #8, head
 `cfc09c6`), hand-ported onto `main` in 2026-09 rather than merged. The rendered
-mockup PNGs and the simulator captures referenced below (`snow-mockup-v*.png`,
-`screenshots/live-activity/*.png`, ~6 MB) were deliberately left on PR #8 and
-are not in this tree; the `.html` mockups are, and render the same thing.
+mockup PNGs and PR #8's simulator captures referenced below (`snow-mockup-v*.png`,
+its `screenshots/live-activity/` shots, ~6 MB) were deliberately left on PR #8
+and are not in this tree; the `.html` mockups are, and render the same thing.
+The `stateA/B/C_*.png` files already in `screenshots/live-activity/` are 1.1's
+rain captures, tracked before this work; the harness's new output there is
+gitignored.
 
 ## Problem
 

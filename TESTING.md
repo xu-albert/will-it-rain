@@ -158,7 +158,8 @@ land a fix with no row here and no manual step.
 There is no automated E2E suite (no XCUITest target, no Playwright/Puppeteer-driven web
 surface — the Worker has no UI). The closest thing to E2E today is manual: TestFlight builds plus
 the [Appendix A](#appendix-a-production-ops--notification-testing-runbook) production push flow
-(`/test-rain`, `/test-cron`) against a real device.
+(`/test-rain`, `/test-cron`, and `/test-activity` via `scripts/test-activity-push.sh`) against a
+real device.
 
 If UI automation is added, it needs:
 
@@ -240,10 +241,10 @@ protect.
 | Concern | Status | Where |
 |---|---|---|
 | `/register`, `/register-activity` are unauthenticated by construction (Worker URL ships in the app binary; APNs tokens aren't server-verifiable) | Accepted, bounded by the abuse gate rather than auth | [`AGENTS.md`](AGENTS.md) "Backend Worker"; `abuse.test.ts` covers the gate |
-| `/test-rain`, `/test-cron` (real-push, real-WeatherKit-quota debug endpoints) | Gated by `X-Admin-Token` against the `ADMIN_TOKEN` Worker secret | [Appendix A section C](#appendix-a-production-ops--notification-testing-runbook); no automated test currently asserts the 401-without-header case — candidate for `abuse.test.ts` |
+| `/test-rain`, `/test-cron`, `/test-activity` (real-push, real-WeatherKit-quota debug endpoints) | Gated by `X-Admin-Token` against the `ADMIN_TOKEN` Worker secret | [Appendix A section C](#appendix-a-production-ops--notification-testing-runbook); `live-activity.test.ts` → `describe('/test-activity')` asserts all three return 401 on a missing or wrong header and fail closed when no `ADMIN_TOKEN` is configured |
 | Secrets at rest | `APNS_ENV`, `ADMIN_TOKEN` are Wrangler secrets, not env vars or committed config; never written to this file (Appendix A explicitly says "never in this file") | `wrangler secret put` per Appendix A sections C, E |
 | Device data at rest | KV stores lat/lon/token/settings with a 45-day TTL (`DEVICE_RECORD_TTL_SECONDS`); no PII beyond coordinates and an opaque device token | `backend/src/types.ts` `DeviceRegistration`; TTL behavior covered by `abuse.test.ts` → `describe('registration records expire')` |
-| Input validation | `validate.ts` checks token format (64–128 hex), content-type | `abuse.test.ts` → `describe('content type')`; no dedicated `validate.test.ts` (gap, section 2) |
+| Input validation | `validate.ts` checks token format (64–128 hex), content-type | `abuse.test.ts` → `describe('content type')`; each validator in isolation in `validate.test.ts` (section 2) |
 | Abuse limits (flood, per-client, per-cell) | Covered — see sections 4, 7 | `abuse.test.ts` |
 | iOS location data | Only sent to this project's own Worker over HTTPS; no third-party analytics/tracking SDK present in `Package.swift`/project deps (confirm on any dependency addition) | Verify manually if dependencies change — not currently automated |
 | App Transport Security | Default ATS (no exceptions found in Info.plist build settings) | Spot-check `INFOPLIST_KEY_*` in the pbxproj on release |
@@ -268,7 +269,7 @@ accessibility regression is caught only if a human runs this table before releas
 | Gate | CI-enforced today? | Where |
 |---|---|---|
 | Backend typecheck (`npm run typecheck`) | ✅ CI | `.github/workflows/ci.yml` backend job |
-| Backend tests (`npm test`, 115 tests) | ✅ CI | Same |
+| Backend tests (`npm test`, 122 tests) | ✅ CI | Same |
 | iOS unsigned simulator build | ✅ CI | `.github/workflows/ci.yml` iOS job |
 | iOS unit tests (headless, iPhone 17 Pro) | ✅ CI | Same |
 | `xcodebuild ... build-for-testing` / `test-without-building` locally before pushing | Manual (recommended) | [`AGENTS.md`](AGENTS.md) "Build & test" |
@@ -418,7 +419,7 @@ There are several device tokens (old reinstalls each make a new one). To find
 
 ### C. Fire a real end-to-end push to your phone
 
-**Both test endpoints now require the `X-Admin-Token` header.** They send real
+**All three test endpoints require the `X-Admin-Token` header.** They send real
 pushes and spend real WeatherKit quota, and the Worker URL is extractable from
 the shipped app, so they can't stay open. Without a correct header they return
 `401`. The secret lives in the Worker as `ADMIN_TOKEN` — set it with
@@ -442,6 +443,12 @@ curl -X POST https://will-it-rain.albertwxu.workers.dev/test-cron \
   -H "Content-Type: application/json" \
   -H "X-Admin-Token: $ADMIN_TOKEN" \
   -d '{"token":"<your-token>","lat":37.7749,"lon":-122.4194}'
+# Add "dryRun":true to get the derived `precip` and raw `summary` back with no
+# push — backend/test/probe-weatherkit-summary.sh wraps this (section 6, M16).
+
+# Content-state push at a running Live Activity (/test-activity): driven by
+# scripts/test-activity-push.sh, whose header covers finding both tokens
+# (section 6, M15). Its `end` event also clears the stored activity token.
 ```
 
 #### Dead token cleanup (automatic since 2026-07-27)
