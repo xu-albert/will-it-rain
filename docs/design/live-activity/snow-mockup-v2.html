@@ -1,0 +1,192 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0b0f16;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+    padding: 36px 40px; color: #fff;
+  }
+  h1 { font-size: 19px; font-weight: 700; margin-bottom: 4px; }
+  .sub { font-size: 12.5px; color: rgba(255,255,255,.45); margin-bottom: 26px; }
+  h2 { font-size: 13px; font-weight: 700; letter-spacing:.05em; text-transform:uppercase;
+       color: rgba(255,255,255,.5); margin: 34px 0 16px; }
+
+  .grid { display: flex; flex-wrap: wrap; gap: 30px 38px; max-width: 1200px; }
+  .cell { width: 360px; }
+  .label { font-size: 12px; font-weight: 700; letter-spacing:.04em; text-transform: uppercase;
+           color: rgba(255,255,255,.6); margin-bottom: 3px; }
+  .note { font-size: 11.5px; color: rgba(255,255,255,.4); margin-bottom: 10px; line-height:1.45; height: 30px; }
+
+  .card { width: 360px; padding: 14px 16px 16px; border-radius: 22px;
+          background: linear-gradient(135deg,#28394F 0%,#15233D 100%); }
+  .hdr { display:flex; align-items:center; gap:7px; }
+  .badge { width:20px; height:20px; border-radius:6px; display:flex; align-items:center; justify-content:center; }
+  .appname { font-size:12px; font-weight:600; color:rgba(255,255,255,.72); }
+  .spacer { flex:1; }
+  .status { display:flex; align-items:center; gap:5px; }
+  .statusdot { width:6px; height:6px; border-radius:50%; }
+  .statustext { font-size:11px; font-weight:600; color:rgba(255,255,255,.55); }
+  .hero { display:flex; align-items:flex-end; gap:12px; margin-top:11px; }
+  .heroleft { display:flex; flex-direction:column; gap:5px; }
+  .count { display:flex; align-items:baseline; gap:3px; }
+  .count .num { font-size:31px; font-weight:800; font-variant-numeric:tabular-nums; letter-spacing:-.5px; }
+  .count .unit { font-size:16px; font-weight:700; color:rgba(255,255,255,.72); }
+  .ctx { font-size:13px; }
+  .ctx b { font-weight:600; color:#fff; }
+  .ctx span { font-weight:500; color:rgba(255,255,255,.72); }
+  .right { font-size:12px; font-weight:600; color:rgba(255,255,255,.55); text-align:right; margin-left:auto; }
+  .track { margin-top:18px; padding:0 4px; }
+  .rail-wrap { position:relative; height:20px; padding-top:4px; }
+  .rail { position:absolute; left:0; right:0; top:6px; height:4px; border-radius:2px; background:rgba(255,255,255,.15); }
+  .seg { position:absolute; top:6px; height:4px; border-radius:2px; }
+  .hourdot { position:absolute; width:3px; height:3px; border-radius:50%; top:6.5px; }
+  .nowdot { position:absolute; left:0; top:3px; width:10px; height:10px; border-radius:50%; background:#fff; }
+  .flag { position:absolute; top:-5px; font-size:9.5px; font-weight:600; }
+  .labels { display:flex; justify-content:space-between; margin-top:5px; font-size:9.5px;
+            font-weight:500; font-variant-numeric:tabular-nums; color:rgba(255,255,255,.4); }
+
+  /* Dynamic Island */
+  .di-row { display:flex; flex-wrap:wrap; gap:34px; align-items:flex-start; }
+  .di-block { }
+  .di-cap { font-size:11.5px; font-weight:600; color:rgba(255,255,255,.45); margin-bottom:9px; }
+  .phone { background:#000; border-radius:26px; padding:18px 14px; width:392px; }
+  .pill { background:#000; border-radius:22px; height:37px; width:250px; margin:0 auto;
+          display:flex; align-items:center; justify-content:space-between; padding:0 13px;
+          border:1px solid rgba(255,255,255,.07); }
+  .pill .ct { font-size:13px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .expanded { background:#000; border-radius:32px; width:364px; margin:0 auto; padding:14px 16px 16px;
+              border:1px solid rgba(255,255,255,.07); }
+  .exp-top { display:flex; align-items:center; justify-content:space-between; }
+  .exp-lead { display:flex; align-items:center; gap:8px; }
+  .exp-lead .t { font-size:13px; font-weight:600; }
+  .exp-trail { display:flex; align-items:baseline; gap:3px; }
+  .exp-trail .num { font-size:18px; font-weight:800; font-variant-numeric:tabular-nums; }
+  .exp-trail .unit { font-size:9.4px; font-weight:700; color:rgba(255,255,255,.72); }
+  .minimal { width:37px; height:37px; border-radius:50%; background:#000; display:flex;
+             align-items:center; justify-content:center; border:1px solid rgba(255,255,255,.07); }
+</style>
+</head>
+<body>
+
+<h1>Frost — refinement + Dynamic Island</h1>
+<div class="sub">Locking down the near-white treatment. The question in each: does the track still separate from the white “now” dot, and does it still look lit?</div>
+
+<h2>Lock screen · frost variants</h2>
+<div class="grid" id="lock"></div>
+
+<h2>Dynamic Island · rain vs frost</h2>
+<div class="di-row" id="di"></div>
+
+<script>
+const SEGMENTS = [[0.10,0.46],[0.62,0.85]];
+const HOURS = [0.667];
+
+const RAIN = { a:'#54C3F5', b:'#38ADE7', flag:'#9DDCFF', compact:'#CFEEFF', glyph:'drop', badgeGlyph:'#fff' };
+
+const FROSTS = [
+  { key:'b1', name:'B1 · Frost as shown',
+    note:'The version you picked, unchanged. Track and now-dot are both near-white.',
+    a:'#E8F4FC', b:'#BCD8EA', flag:'#E8F4FC', compact:'#E8F4FC',
+    glow:'#E8F4FC', nowRing:'rgba(255,255,255,.22)', badgeGlyph:'#12233b' },
+
+  { key:'b2', name:'B2 · Frost, blue-tailed',
+    note:'Same white head, but the gradient lands on a colder blue. Keeps a trace of hue so it reads icy, not grey.',
+    a:'#F0F8FF', b:'#9FC4DE', flag:'#DCEEFB', compact:'#E8F4FC',
+    glow:'#9FC4DE', nowRing:'rgba(255,255,255,.22)', badgeGlyph:'#12233b' },
+
+  { key:'b3', name:'B3 · Frost + ice glow',
+    note:'B2 plus an ice-blue glow under the track and a tinted ring on the now-dot, so the two whites stop touching.',
+    a:'#F0F8FF', b:'#9FC4DE', flag:'#DCEEFB', compact:'#E8F4FC',
+    glow:'#7FB6DC', nowRing:'rgba(127,182,220,.42)', badgeGlyph:'#12233b', ringWide:true },
+];
+
+function glyphSVG(kind, color, size) {
+  if (kind === 'drop') {
+    return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="${color}">
+      <path d="M12 2.5c-.3 0-.6.15-.78.4C9.6 5.2 5.5 11 5.5 14.6a6.5 6.5 0 0 0 13 0c0-3.6-4.1-9.4-5.72-11.7a.95.95 0 0 0-.78-.4z"/></svg>`;
+  }
+  const sw = size <= 14 ? 2.4 : (size <= 17 ? 2.0 : 1.8);
+  const s = `stroke="${color}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" fill="none"`;
+  let arms = '';
+  for (let i=0;i<3;i++){
+    arms += `<g transform="rotate(${i*60} 12 12)">
+      <line x1="12" y1="3.2" x2="12" y2="20.8" ${s}/>
+      <polyline points="9.4,6.0 12,8.5 14.6,6.0" ${s}/>
+      <polyline points="9.4,18.0 12,15.5 14.6,18.0" ${s}/></g>`;
+  }
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24">${arms}</svg>`;
+}
+
+function trackHTML(v){
+  const segs = SEGMENTS.map(([s,e])=>
+    `<div class="seg" style="left:${(s*100).toFixed(2)}%;width:${((e-s)*100).toFixed(2)}%;
+      background:linear-gradient(90deg,${v.a},${v.b});
+      box-shadow:0 0 4.5px ${v.glow}${v.key==='b3'?'':'8c'};"></div>`).join('');
+  const dots = HOURS.map(f=>{
+    const wet = SEGMENTS.some(([s,e])=>f>=s&&f<=e);
+    return `<span class="hourdot" style="left:calc(${(f*100).toFixed(1)}% - 1.5px);
+      background:${wet?v.a:'rgba(255,255,255,.4)'};${wet?`box-shadow:0 0 3.5px ${v.glow};`:''}"></span>`;
+  }).join('');
+  const ring = v.ringWide ? `0 0 0 3px ${v.nowRing}, 0 1px 1.5px rgba(0,0,0,.45)`
+                          : `0 0 0 3px ${v.nowRing}, 0 1px 1.5px rgba(0,0,0,.45)`;
+  return `<div class="track"><div class="rail-wrap">
+      <div class="flag" style="left:26%;color:${v.flag};">4:33</div>
+      <div class="rail"></div>${segs}${dots}
+      <div class="nowdot" style="box-shadow:${ring};"></div>
+    </div>
+    <div class="labels"><span>Now</span><span>+45 min</span><span>+90 min</span></div></div>`;
+}
+
+function card(v){
+  return `<div class="cell">
+    <div class="label">${v.name}</div><div class="note">${v.note}</div>
+    <div class="card">
+      <div class="hdr">
+        <div class="badge" style="background:linear-gradient(90deg,${v.a},${v.b});">
+          ${glyphSVG('flake', v.badgeGlyph, 12)}</div>
+        <div class="appname">Gonna Rain?</div><div class="spacer"></div>
+        <div class="status"><span class="statusdot" style="background:${v.a};box-shadow:0 0 3.5px ${v.glow};"></span>
+        <span class="statustext">Snow incoming</span></div>
+      </div>
+      <div class="hero"><div class="heroleft">
+        <div class="count"><span class="num">24</span><span class="unit">min</span></div>
+        <div class="ctx"><b>Light snow</b><span> · lasts about 40 min</span></div>
+      </div><div class="right">Chicago</div></div>
+      ${trackHTML(v)}
+    </div></div>`;
+}
+document.getElementById('lock').innerHTML = FROSTS.map(card).join('');
+
+// ---- Dynamic Island ----
+function di(v, title, isSnow){
+  const g = isSnow ? 'flake' : 'drop';
+  const glyphCol = v.a;
+  return `<div class="di-block">
+    <div class="di-cap">${title} · compact</div>
+    <div class="phone"><div class="pill">
+      ${glyphSVG(g, glyphCol, 15)}
+      <span class="ct" style="color:${v.compact};">24:00</span>
+    </div></div>
+    <div class="di-cap" style="margin-top:16px;">${title} · expanded</div>
+    <div class="phone"><div class="expanded">
+      <div class="exp-top">
+        <div class="exp-lead">${glyphSVG(g, glyphCol, 16)}
+          <span class="t">${isSnow?'Snow incoming':'Rain incoming'}</span></div>
+        <div class="exp-trail"><span class="num">24</span><span class="unit">min</span></div>
+      </div>
+      ${trackHTML(v)}
+    </div></div>
+    <div class="di-cap" style="margin-top:16px;">${title} · minimal</div>
+    <div class="phone" style="width:392px;display:flex;justify-content:center;">
+      <div class="minimal">${glyphSVG(g, glyphCol, 15)}</div>
+    </div>
+  </div>`;
+}
+const rainV = {...RAIN, glow:RAIN.a, nowRing:'rgba(255,255,255,.22)', key:'rain'};
+document.getElementById('di').innerHTML = di(rainV,'Rain (today)',false) + di(FROSTS[2],'Frost B3',true);
+</script>
+</body>
+</html>

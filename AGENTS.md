@@ -68,6 +68,14 @@ rescale one PNG into another size. `verify_mark.py` checks that the SwiftUI
   cannot see a sub-second burst. The wrangler migration must stay on
   `new_sqlite_classes` — `new_classes` is the Paid-only backend and would make the
   Worker undeployable here.
+- A Live Activity push's `content-state` is a **full replacement, not a merge**: the widget
+  draws whatever the last push carried. Two rules follow. Every field the Worker sends must be
+  on every push (`LiveActivityContentState` in `backend/src/types.ts` makes `precip` required for
+  that reason; `live-activity.test.ts` asserts it), and every field the widget reads must be
+  `Optional` on the Swift side (`RainActivityAttributes.ContentState`), because the synthesized
+  `Codable` init throws on a missing key and ActivityKit then drops the update silently — the
+  card freezes with no error. Consequence for releases: **deploy the Worker before an app that
+  adds a content-state field reaches users**, or the old Worker's next tick strips the field.
 - A `device:` record's 45-day TTL is only safe because the client genuinely renews
   it: `ContentView` re-registers on cold launch, on `willEnterForeground` and after
   every successful weather poll, and `LocationService` re-registers past a 10 km

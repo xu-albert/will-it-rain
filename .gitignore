@@ -12,3 +12,7 @@ data/wir-icon-adopt/native/
 
 # Wrangler local dev state (cache, KV sqlite, etc.) is ignored at the repo root.
 .wrangler/
+
+# scripts/test-live-activity.sh writes its simulator captures here (~6 MB a
+# run); they are review artefacts for the PR, not history.
+screenshots/live-activity/

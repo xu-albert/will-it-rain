@@ -59,6 +59,24 @@ final class RainForecastTests: XCTestCase {
                        [.none, .light, .moderate, .heavy])
     }
 
+    func testMixedPrecipitationIsWintryAndHasItsOwnCopy() {
+        // WeatherKit's `.mixed` used to fall into the rain default. It is ice,
+        // so it takes the wintry Live Activity treatment and says so.
+        XCTAssertTrue(PrecipitationType.mixed.isWintry)
+        XCTAssertEqual(PrecipitationType.mixed.icon, "cloud.sleet.fill")
+        for type in [PrecipitationType.snow, .sleet, .hail] {
+            XCTAssertTrue(type.isWintry, "\(type) should be wintry")
+        }
+        XCTAssertFalse(PrecipitationType.rain.isWintry)
+        XCTAssertFalse(PrecipitationType.none.isWintry)
+
+        let fallingNow = forecast(periods: [period(from: -10, to: 20, type: .mixed)])
+        XCTAssertEqual(fallingNow.heroStatus(for: .clear, at: now).title, "Wintry mix")
+
+        let coming = forecast(periods: [period(from: 30, to: 60, type: .mixed)])
+        XCTAssertEqual(coming.heroStatus(for: .clear, at: now).title, "Wintry mix in 30 min")
+    }
+
     func testPrecipitationPeriodContains() {
         let start = Date(timeIntervalSince1970: 1_000_000)
         let end = start.addingTimeInterval(3600)

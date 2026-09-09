@@ -10,7 +10,7 @@ export interface Env {
   WEATHERKIT_SERVICE_ID: string;
   APNS_TOPIC: string;
   APNS_ENV: string; // "sandbox" or "production"
-  ADMIN_TOKEN?: string; // secret gating /test-rain and /test-cron
+  ADMIN_TOKEN?: string; // secret gating /test-rain, /test-cron and /test-activity
 }
 
 export interface DeviceRegistration {
@@ -94,7 +94,21 @@ export interface WeatherKitForecast {
       /** mm/h, the same unit as a minute's. */
       precipitationIntensity: number;
     }>;
+    // Per-period rollup carrying the precipitation *type* ("clear", "rain",
+    // "snow", "sleet", "hail", "mixed"). The per-minute entries only carry
+    // chance and intensity, so this is the only place the type appears in the
+    // forecastNextHour dataset — and it costs no extra quota, since the Worker
+    // already requests that dataset. Optional throughout: treated as absent
+    // rather than trusted, so a schema change degrades to rain, never throws.
+    summary?: SummaryPeriod[];
   };
+}
+
+export interface SummaryPeriod {
+  startTime?: string;
+  condition?: string;
+  precipitationChance?: number;
+  precipitationIntensity?: number;
 }
 
 // Mirrors the iOS widget extension's `ContentState` (Codable, Hashable) exactly —
@@ -104,6 +118,9 @@ export interface LiveActivitySegment {
   start: number; // 0...1, fraction of windowMinutes
   end: number; // 0...1, fraction of windowMinutes
 }
+
+// Mirrors the widget's `RainActivityAttributes.Precip`.
+export type Precip = 'rain' | 'wintry';
 
 export interface LiveActivityContentState {
   statusText: string;
@@ -119,4 +136,8 @@ export interface LiveActivityContentState {
   endLabel: string;
   flagText: string | null;
   flagPosition: number | null;
+  // Rain vs wintry styling. Must be sent on every push: content-state is a
+  // full replacement, not a merge, so omitting it would decode as nil on the
+  // widget and revert a snowing card to rain visuals on the next cron tick.
+  precip: Precip;
 }

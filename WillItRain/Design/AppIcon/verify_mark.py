@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check that the Live Activity's vector mark still matches the app icon.
 
-`WillItRainWidgets/AppIconMark.swift` transcribes `AppIcon.svg` into a SwiftUI
+`Shared/AppIconMark.swift` transcribes `AppIcon.svg` into a SwiftUI
 `Shape` so the Live Activity's identity badge draws the same silhouette the
 home screen does. Nothing enforces that by construction, so this renders both
 and compares them:
@@ -63,7 +63,7 @@ def render_swiftui(tmp, size, out):
     main = os.path.join(tmp, "main.swift")
     shutil.copy(os.path.join(HERE, "verify_mark.swift"), main)
     mark = os.path.abspath(
-        os.path.join(HERE, "..", "..", "WillItRainWidgets", "AppIconMark.swift")
+        os.path.join(HERE, "..", "..", "Shared", "AppIconMark.swift")
     )
     binary = os.path.join(tmp, "verify_mark")
     if not os.path.exists(binary):

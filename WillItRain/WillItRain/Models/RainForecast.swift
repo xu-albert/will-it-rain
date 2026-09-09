@@ -5,6 +5,7 @@ enum PrecipitationType: String {
     case snow = "Snow"
     case hail = "Hail"
     case sleet = "Sleet"
+    case mixed = "Mixed"
     case none = "None"
 
     var icon: String {
@@ -13,7 +14,16 @@ enum PrecipitationType: String {
         case .snow: return "cloud.snow.fill"
         case .hail: return "cloud.hail.fill"
         case .sleet: return "cloud.sleet.fill"
+        case .mixed: return "cloud.sleet.fill"
         case .none: return "sun.max.fill"
+        }
+    }
+
+    /// Everything with ice in it shares one Live Activity treatment.
+    var isWintry: Bool {
+        switch self {
+        case .snow, .hail, .sleet, .mixed: return true
+        case .rain, .none: return false
         }
     }
 }
@@ -317,6 +327,7 @@ struct RainForecast {
             case .snow: return ("Snowing", "Stops in \(stopsIn)")
             case .hail: return ("Hailing", "Stops in \(stopsIn)")
             case .sleet: return ("Sleet", "Stops in \(stopsIn)")
+            case .mixed: return ("Wintry mix", "Stops in \(stopsIn)")
             case .none: return ("Raining", "Stops in \(stopsIn)")
             }
         }
@@ -332,6 +343,7 @@ struct RainForecast {
             case .snow: return ("Snows in \(timeStr)", durationStr)
             case .hail: return ("Hails in \(timeStr)", durationStr)
             case .sleet: return ("Sleet in \(timeStr)", durationStr)
+            case .mixed: return ("Wintry mix in \(timeStr)", durationStr)
             case .none: return ("Rains in \(timeStr)", durationStr)
             }
         }
