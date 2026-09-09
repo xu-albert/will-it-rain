@@ -47,7 +47,10 @@ function forecast(
   now: number,
   wet: (i: number) => boolean,
   options: { firstMinuteOffsetMinutes?: number; summary?: SummaryPeriod[] } = {}
-): { forecastNextHour: { minutes: Minute[]; summary?: SummaryPeriod[] } } {
+): {
+  forecastNextHour: { minutes: Minute[] };
+  forecastHourly?: { hours: []; summary?: SummaryPeriod[] };
+} {
   const offset = (options.firstMinuteOffsetMinutes ?? 0) * 60_000;
   return {
     forecastNextHour: {
@@ -56,8 +59,8 @@ function forecast(
         precipitationChance: wet(i) ? 0.9 : 0,
         precipitationIntensity: wet(i) ? 2 : 0,
       })),
-      ...(options.summary === undefined ? {} : { summary: options.summary }),
     },
+    ...(options.summary === undefined ? {} : { forecastHourly: { hours: [], summary: options.summary } }),
   };
 }
 
@@ -159,7 +162,7 @@ const rainingUntil = (until: number, summary?: SummaryPeriod[]) => (t: number) =
 
 describe('precipFromForecast', () => {
   const withSummary = (summary?: SummaryPeriod[]) => ({
-    forecastNextHour: { minutes: [], ...(summary === undefined ? {} : { summary }) },
+    forecastHourly: { hours: [], ...(summary === undefined ? {} : { summary }) },
   });
 
   it('defaults to rain when the summary is missing, empty, or all clear', () => {

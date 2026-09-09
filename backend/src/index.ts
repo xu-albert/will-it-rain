@@ -67,7 +67,7 @@ const isWet = (m: { precipitationChance: number; precipitationIntensity: number 
   m.precipitationChance > 0.3 && m.precipitationIntensity > 0;
 
 // WeatherKit condition strings that should render with the wintry treatment.
-// The WeatherKit REST API documents forecastNextHour.summary[].condition as
+// The WeatherKit REST API documents forecastHourly.summary[].condition as
 // its PrecipitationType enum: clear, precipitation, rain, snow, sleet, hail,
 // mixed — lowercase bare nouns, confirmed live. This is an exact match on the
 // four with ice in them; everything else, documented or not, is rain.
@@ -112,7 +112,7 @@ function copyFor(precip: Precip) {
 // docs/superpowers/specs/): the field is real, values are lowercase bare nouns,
 // periods run in chronological order.
 export function precipFromForecast(forecast: WeatherKitForecast, at?: string): Precip {
-  const summary = forecast.forecastNextHour?.summary;
+  const summary = forecast.forecastHourly?.summary;
   if (!summary?.length) return 'rain';
 
   const condition = periodFor(summary, at)?.condition;
@@ -385,7 +385,7 @@ export default {
         // been seen in the wild (spec, "Server changes are load-bearing").
         console.log(
           `[Cron] Grid ${grid.gridKey} precip=${precip} summary=` +
-            JSON.stringify(forecast.forecastNextHour?.summary?.map((s) => s.condition) ?? null)
+            JSON.stringify(forecast.forecastHourly?.summary?.map((s) => s.condition) ?? null)
         );
 
         // At most one push per device per event type, deduped for 30 min via KV.
@@ -902,7 +902,7 @@ async function handleTestActivity(request: Request, env: Env): Promise<Response>
 // `dryRun: true` skips the push, which makes this usable as a plain forecast
 // probe against any coordinate — no device has to exist there and nobody's
 // phone buzzes. That is the only way to answer "does WeatherKit actually
-// populate forecastNextHour.summary[].condition, and with what values?", since
+// populate forecastHourly.summary[].condition, and with what values?", since
 // the cron's own summary log only fires for a grid that already has a
 // registered device AND active precipitation. backend/test/probe-weatherkit-summary.sh
 // drives it.
@@ -930,7 +930,7 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
     // The raw conditions, not just the derived value: if Apple renames a case
     // or ships one WINTRY_CONDITIONS does not know about, `precip` alone would
     // read as a confident "rain" and hide it.
-    const summary = forecast.forecastNextHour?.summary?.map((s) => s.condition) ?? null;
+    const summary = forecast.forecastHourly?.summary?.map((s) => s.condition) ?? null;
     const diagnostics = {
       precip: precipFromForecast(forecast, rainingNow ? undefined : rainStart?.startTime),
       summary,
