@@ -53,7 +53,7 @@ integration coverage of the services that talk to WeatherKit, APNs tokens, or th
 | iOS forecast merge | `WillItRain/WillItRainTests/ForecastMergeTests.swift` | XCTest | `ForecastMerge.merge(minute:hourly:now:)` at fixed instants and `PrecipitationPeriod.detect(in:)` on the merged series: which hourly reading is kept and how it is clipped, `hasMinuteForecast`, and which periods are `isConfirmed` (see section 4) |
 | iOS alert gate | `WillItRain/WillItRainTests/NotificationServiceTests.swift` | XCTest | Every path through `NotificationService.evaluateAndSchedule` at explicit instants with delivery recorded and settings in an isolated `UserDefaults` suite: two-pass rain-start and rain-end confirmation, same-event suppression, rain resuming within the hour, quiet hours, opt-outs, hourly-only and unconfirmed-nowcast periods |
 | iOS location service | `WillItRain/WillItRainTests/LocationServiceTests.swift` | XCTest | `LocationService.currentLocation()` against a stubbed `CLLocationManager`, including the stuck-continuation regression (see section 4) |
-| iOS build product | `WillItRain/WillItRainTests/BuildProductTests.swift` | XCTest | Generated `Info.plist` keys: portrait lock, bundle ID, display name, Live Activity entitlement flags, background task ID, location usage strings, version keys present |
+| iOS build product | `WillItRain/WillItRainTests/BuildProductTests.swift` | XCTest | Generated `Info.plist` keys: portrait lock, bundle ID, display name, Live Activity entitlement flags, background task ID, location usage strings, version keys present, and the deployment floor (`MinimumOSVersion`) on the app and on the embedded widget appex, asserted equal so the two cannot drift apart |
 
 ### What is missing
 
@@ -245,6 +245,10 @@ accessibility regression is caught only if a human runs this table before releas
       and matches the intended release notes.
 - [ ] `BuildProductTests` green on the actual archive configuration, not just Debug/simulator
       (Info.plist merging can differ by configuration).
+- [ ] Deployment floor unchanged since the last release, or the listing's "Requires iOS …" line
+      and the release notes say so — raising it drops devices that could install the previous
+      build. The floor is `IPHONEOS_DEPLOYMENT_TARGET`, set at the project level in the pbxproj
+      with no per-target overrides; guarded by `BuildProductTests`.
 - [ ] WeatherKit attribution present and correct in every weather-showing state (M10) — guideline
       5.2.5 was a prior rejection risk (`a4f6392`).
 - [ ] Live Activity / Dynamic Island entitlements present (`NSSupportsLiveActivities`,

@@ -15,8 +15,8 @@ struct WillItRainApp: App {
         WindowGroup {
             ContentView()
         }
-        .onChange(of: scenePhase) { phase in
-            if phase == .background {
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .background {
                 scheduleBackgroundRefresh(after: 15 * 60)
             }
         }

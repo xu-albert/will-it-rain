@@ -184,7 +184,7 @@ struct PrecipChart: View {
                     .gesture(
                         DragGesture(minimumDistance: 0)
                             .onChanged { value in
-                                let plotArea = proxy.plotAreaSize
+                                let plotArea = proxy.plotSize
                                 let plotOrigin = CGPoint(
                                     x: geo.size.width - plotArea.width,
                                     y: 0
