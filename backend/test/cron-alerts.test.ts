@@ -267,25 +267,73 @@ describe('rain-start alerts', () => {
   });
 
   it('are not repeated for the same event within 30 minutes', async () => {
-    // 30 minutes is the floor, which is the whole window for a lead time of 20
-    // or less: it already covers everything such a device can be alerted about.
-    const harness = makeHarness({ signingKey });
-    const now = Date.now();
-    await plant(harness, [{ n: 1, leadTimeMinutes: 20 }], now);
-    const rainSoon = (t: number) => forecast(t, (i) => i >= 10);
+    // 30 minutes is the floor, and the whole window for a lead time of 15 or
+    // less: lead time, one cron period and the post-onset slack fit inside it.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T12:00:00.000Z'));
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 15 }], Date.now());
+      const rainSoon = (t: number) => forecast(t, (i) => i >= 10);
 
-    const first = await tick(harness, rainSoon);
-    expect(alerted(first.alerts)).toEqual([fakeToken(1)]);
+      const first = await tick(harness, rainSoon);
+      expect(alerted(first.alerts)).toEqual([fakeToken(1)]);
 
-    const second = await tick(harness, rainSoon);
-    expect(second.alerts).toEqual([]);
+      const second = await tick(harness, rainSoon);
+      expect(second.alerts).toEqual([]);
 
-    // Once the dedup record is older than 30 minutes the next tick may alert again.
-    await harness.kv.put(`notified-start:${fakeToken(1)}`, String(Date.now() - 31 * 60_000), {
-      expirationTtl: 3600,
+      // A tick landing exactly on the window's edge is still the same event.
+      await harness.kv.put(`notified-start:${fakeToken(1)}`, String(Date.now() - 30 * 60_000), {
+        expirationTtl: 3600,
+      });
+      const atEdge = await tick(harness, rainSoon);
+      expect(atEdge.alerts).toEqual([]);
+
+      // Strictly past it, the next tick may alert again.
+      await harness.kv.put(`notified-start:${fakeToken(1)}`, String(Date.now() - 31 * 60_000), {
+        expirationTtl: 3600,
+      });
+      const third = await tick(harness, rainSoon);
+      expect(alerted(third.alerts)).toEqual([fakeToken(1)]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('are not repeated by the tick that watches one onset arrive', async () => {
+    // Hourly-fallback path, where onsets sit on clock hours and the synthesized
+    // series starts one cron period behind `now` — so at 13:00 the first minute
+    // read is 12:50, still dry, and the 13:00 onset is still a rain START. The
+    // default lead time alerts at 12:30 and every later tick in the span is the
+    // same event, including the one that lands as the rain begins.
+    const hourly = (wetHour: number) => () => ({
+      forecastHourly: {
+        hours: [11, 12, 13, 14].map((h) => ({
+          forecastStart: new Date(Date.parse(`2026-01-01T${h}:00:00.000Z`)).toISOString(),
+          precipitationChance: h === wetHour ? 0.9 : 0,
+          precipitationIntensity: h === wetHour ? 2 : 0,
+        })),
+      },
     });
-    const third = await tick(harness, rainSoon);
-    expect(alerted(third.alerts)).toEqual([fakeToken(1)]);
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T12:30:00.000Z'));
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 20 }], Date.now());
+
+      const first = await tick(harness, hourly(13));
+      expect(alerted(first.alerts)).toEqual([fakeToken(1)]);
+      expect(first.alerts[0].title).toBe('Rain in ~30 min');
+
+      for (const at of ['12:40', '12:50', '13:00']) {
+        vi.setSystemTime(new Date(`2026-01-01T${at}:00.000Z`));
+        const later = await tick(harness, hourly(13));
+        expect(later.alerts).toEqual([]);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('are not repeated by a later tick still inside the widened window', async () => {

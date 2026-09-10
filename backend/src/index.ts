@@ -63,6 +63,11 @@ const ACTIVITY_WINDOW_MINUTES = 90;
 // See recordPushFailure for why this isn't 1.
 const BAD_TOKEN_STRIKES = 5;
 
+// How far past a forecast onset a rain-start alert is still worth sending. The
+// merged minute/hourly series is stamped a few minutes behind the tick that
+// reads it (see AGENTS.md), so the first wet minute can already be in the past.
+const START_SLACK_MINUTES = 5;
+
 // The per-minute precipitation test behind rain-start and rain-end detection.
 const isWet = (m: { precipitationChance: number; precipitationIntensity: number }) =>
   m.precipitationChance > 0.3 && m.precipitationIntensity > 0;
@@ -390,19 +395,22 @@ export default {
         );
 
         // At most one push per device per event type, deduped via KV for 30
-        // minutes, or for the full width of the rain-start alert window (lead
-        // time plus one cron period) where that is wider: every tick inside
-        // that window still sees the one onset it already announced.
+        // minutes, or for the whole span in which one rain-start onset can be
+        // alerted where that is wider: a tick may announce it from lead time
+        // plus a cron period ahead of it right through to START_SLACK_MINUTES
+        // past it, and every tick in between sees the same onset.
         const notifyOnce = async (
           device: DeviceRegistration,
           kind: 'start' | 'end',
           send: () => Promise<void>
         ) => {
           const dedupMinutes =
-            kind === 'start' ? Math.max(30, device.leadTimeMinutes + CRON_PERIOD_MINUTES) : 30;
+            kind === 'start'
+              ? Math.max(30, device.leadTimeMinutes + CRON_PERIOD_MINUTES + START_SLACK_MINUTES)
+              : 30;
           const metaKey = `notified-${kind}:${device.token}`;
           const lastNotified = await env.DEVICES.get(metaKey);
-          if (lastNotified && now - parseInt(lastNotified) < dedupMinutes * 60 * 1000) return;
+          if (lastNotified && now - parseInt(lastNotified) <= dedupMinutes * 60 * 1000) return;
           // Claimed after the dedup check, so a push we were never going to
           // send does not spend budget a later device could have used.
           if (!budget.spend()) return;
@@ -428,12 +436,14 @@ export default {
             // (rounds to 11, no alert) and the next tick fire with under a minute to
             // spare — any cron delay turned that into a miss. Firing slightly early
             // is the safe direction for a rain warning.
-            // The `>= -5` slack stays: `rainStart` can be a minute already in the
-            // past (the merged minute/hourly series is stamped a few minutes behind
-            // `now`, see AGENTS.md), so a negative `minutesUntilRain` is reachable
+            // The START_SLACK_MINUTES slack stays: `rainStart` can be a minute
+            // already in the past, so a negative `minutesUntilRain` is reachable
             // here, not dead — see "still fire when the feed says the rain began a
             // few minutes ago" in cron-alerts.test.ts.
-            if (minutesUntilRain <= device.leadTimeMinutes + CRON_PERIOD_MINUTES && minutesUntilRain >= -5) {
+            if (
+              minutesUntilRain <= device.leadTimeMinutes + CRON_PERIOD_MINUTES &&
+              minutesUntilRain >= -START_SLACK_MINUTES
+            ) {
               await notifyOnce(device, 'start', () =>
                 sendRainAlert(device.token, minutesUntilRain, env, intensityFromMmPerHr(rainStart.precipitationIntensity))
               );
@@ -1162,7 +1172,8 @@ async function handleUnregister(request: Request, env: Env): Promise<Response> {
 
 // Drops a device: the two keys that would otherwise outlive it, and its cell
 // slot. Deliberately NOT every key keyed off its token — `notified-start:`,
-// `notified-end:` and `apnsfail:` are left to their own 3600s/86400s TTLs.
+// `notified-end:` and `apnsfail:` are left to their own TTLs: an hour, or the
+// dedup window itself where that is longer, and 86400s.
 //
 // Deleting those three bought an hour or a day of tidiness for three fifths of
 // this function's delete cost, against a Free-plan allowance of 1,000 deletes a
@@ -1170,7 +1181,9 @@ async function handleUnregister(request: Request, env: Env): Promise<Response> {
 // draws on directly. Two consequences follow, and both are accepted rather than
 // overlooked:
 //
-//   * A device reaped and re-registering within 30 minutes may still be
+//   * A device reaped and re-registering inside its dedup window — 30 minutes,
+//     or lead time plus a cron period plus the start slack where that is longer,
+//     so 75 minutes at the longest lead time the app offers — may still be
 //     suppressed by its surviving `notified-*` key. That key exists only
 //     because the device was already notified for that rain event, so the
 //     suppression drops a duplicate rather than a distinct alert.
