@@ -12,6 +12,7 @@ import {
 import { LegacyRecord, readActivityTokens, readCoverage, gridCenter, toGridKey } from './grid';
 import { fetchForecast } from './weatherkit';
 import { nextHourMinutes } from './nextHour';
+import { CRON_PERIOD_MINUTES } from './scheduling';
 import {
   APNsError,
   sendRainAlert,
@@ -414,7 +415,17 @@ export default {
           const activityToken = activityTokens.get(device.token);
           if (rainStart && device.rainStartEnabled !== false) {
             const minutesUntilRain = Math.round((new Date(rainStart.startTime).getTime() - now) / 60000);
-            if (minutesUntilRain <= device.leadTimeMinutes && minutesUntilRain >= -5) {
+            // Widened by one cron period: at a 10-minute lead time the alert window
+            // equalled the tick period exactly, so a tick could see rain at 10.6m
+            // (rounds to 11, no alert) and the next tick fire with under a minute to
+            // spare — any cron delay turned that into a miss. Firing slightly early
+            // is the safe direction for a rain warning.
+            // The `>= -5` slack stays: `rainStart` can be a minute already in the
+            // past (the merged minute/hourly series is stamped a few minutes behind
+            // `now`, see AGENTS.md), so a negative `minutesUntilRain` is reachable
+            // here, not dead — see "still fire when the feed says the rain began a
+            // few minutes ago" in cron-alerts.test.ts.
+            if (minutesUntilRain <= device.leadTimeMinutes + CRON_PERIOD_MINUTES && minutesUntilRain >= -5) {
               await notifyOnce(device, 'start', () =>
                 sendRainAlert(device.token, minutesUntilRain, env, intensityFromMmPerHr(rainStart.precipitationIntensity))
               );

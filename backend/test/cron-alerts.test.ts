@@ -173,6 +173,29 @@ describe('rain-start alerts', () => {
     expect(alerts.every((a) => a.title === 'Rain in ~25 min')).toBe(true);
   });
 
+  it('widens the window by one cron period so the shortest lead time can fire on its first tick', async () => {
+    // A 10-minute lead time equals the cron period: rain 10.6 minutes out (here,
+    // the first wet minute at i=11) used to land outside `<= leadTimeMinutes`
+    // and only alert on the following tick, with under a minute of lead left.
+    const harness = makeHarness({ signingKey });
+    const now = Date.now();
+    await plant(harness, [{ n: 1, leadTimeMinutes: 10 }], now);
+
+    const { alerts } = await tick(harness, (t) => forecast(t, (i) => i >= 11));
+
+    expect(alerted(alerts)).toEqual([fakeToken(1)]);
+  });
+
+  it('still holds a ceiling: nothing fires further out than lead time plus one cron period', async () => {
+    const harness = makeHarness({ signingKey });
+    const now = Date.now();
+    await plant(harness, [{ n: 1, leadTimeMinutes: 10 }], now);
+
+    const { alerts } = await tick(harness, (t) => forecast(t, (i) => i >= 21));
+
+    expect(alerts).toEqual([]);
+  });
+
   it('still fire when the feed says the rain began a few minutes ago', async () => {
     // WeatherKit's minute series is often stamped a few minutes before the tick
     // reads it. A first wet minute slightly in the past is "starting now", not
