@@ -1180,7 +1180,8 @@ describe('registration records expire', () => {
 
   it('leaves the self-expiring keys to their own TTLs when a device is torn down', async () => {
     // Teardown deliberately deletes only the two keys that would outlive the
-    // device. `notified-*` (1h) and `apnsfail:` (24h) expire on their own, and
+    // device. `notified-*` (an hour, or the span one rain-start onset stays
+    // alertable for where that is longer) and `apnsfail:` (24h) expire on their own, and
     // deleting them would triple what an unthrottled `/unregister` costs
     // against the Free plan's 1,000-deletes-a-day allowance.
     await worker.fetch(registerRequest(1), env);

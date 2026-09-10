@@ -68,6 +68,56 @@ const BAD_TOKEN_STRIKES = 5;
 // reads it (see AGENTS.md), so the first wet minute can already be in the past.
 const START_SLACK_MINUTES = 5;
 
+// How far a forecast onset may move between two ticks and still be the same
+// rain: one tick's gap, plus the slack by which the series lags the tick.
+const SAME_ONSET_DRIFT_MINUTES = CRON_PERIOD_MINUTES + START_SLACK_MINUTES;
+
+/**
+ * What a `notified-*` record means to the tick that reads it back, and so which
+ * pushes it suppresses.
+ */
+interface NotifiedRecord {
+  /** The value stored once the push has gone out. */
+  mark: string;
+  /** Long enough for the record to outlive the span it suppresses. */
+  ttlSeconds: number;
+  /** Whether a record already in KV stands for the push about to be sent. */
+  covers: (recorded: string) => boolean;
+}
+
+/**
+ * The rain-start record: WHICH onset was announced, not when. Every tick from
+ * lead time plus a cron period ahead of an onset through to START_SLACK_MINUTES
+ * past it sees that one shower, so a plain time window wide enough to cover them
+ * all would also swallow a second, distinct shower forecast inside it — silence
+ * where an alert was owed. The onset itself is the event, exactly as it is on
+ * the client (`isSameEvent`, NotificationService.swift).
+ *
+ * `onset:` tags the value because a record written by the previous build is a
+ * bare timestamp: unreadable as an onset, it goes on suppressing until it
+ * expires rather than re-announcing rain the device was already told about.
+ */
+function onsetRecord(startTime: string, leadTimeMinutes: number): NotifiedRecord {
+  const onsetMinute = Math.round(new Date(startTime).getTime() / 60_000);
+  return {
+    mark: `onset:${onsetMinute}`,
+    ttlSeconds: Math.max(3600, (leadTimeMinutes + SAME_ONSET_DRIFT_MINUTES) * 60),
+    covers: (recorded) => {
+      const previous = /^onset:(-?\d+)$/.exec(recorded);
+      return previous === null || Math.abs(Number(previous[1]) - onsetMinute) <= SAME_ONSET_DRIFT_MINUTES;
+    },
+  };
+}
+
+/** The rain-end record: one alert per `minutes`, keyed on when it was sent. */
+function elapsedRecord(now: number, minutes: number): NotifiedRecord {
+  return {
+    mark: now.toString(),
+    ttlSeconds: Math.max(3600, minutes * 60),
+    covers: (recorded) => now - parseInt(recorded) <= minutes * 60 * 1000,
+  };
+}
+
 // The per-minute precipitation test behind rain-start and rain-end detection.
 const isWet = (m: { precipitationChance: number; precipitationIntensity: number }) =>
   m.precipitationChance > 0.3 && m.precipitationIntensity > 0;
@@ -394,32 +444,24 @@ export default {
             JSON.stringify(forecast.forecastHourly?.summary?.map((s) => s.condition) ?? null)
         );
 
-        // At most one push per device per event type, deduped via KV for 30
-        // minutes, or for the whole span in which one rain-start onset can be
-        // alerted where that is wider: a tick may announce it from lead time
-        // plus a cron period ahead of it right through to START_SLACK_MINUTES
-        // past it, and every tick in between sees the same onset.
+        // At most one push per device per event, deduped via KV: one rain-start
+        // alert per onset, one rain-end alert per 30 minutes. What counts as the
+        // same event is the record's business — see NotifiedRecord.
         const notifyOnce = async (
           device: DeviceRegistration,
           kind: 'start' | 'end',
+          record: NotifiedRecord,
           send: () => Promise<void>
         ) => {
-          const dedupMinutes =
-            kind === 'start'
-              ? Math.max(30, device.leadTimeMinutes + CRON_PERIOD_MINUTES + START_SLACK_MINUTES)
-              : 30;
           const metaKey = `notified-${kind}:${device.token}`;
-          const lastNotified = await env.DEVICES.get(metaKey);
-          if (lastNotified && now - parseInt(lastNotified) <= dedupMinutes * 60 * 1000) return;
+          const recorded = await env.DEVICES.get(metaKey);
+          if (recorded !== null && record.covers(recorded)) return;
           // Claimed after the dedup check, so a push we were never going to
           // send does not spend budget a later device could have used.
           if (!budget.spend()) return;
           try {
             await send();
-            // The record has to outlive the window it enforces.
-            await env.DEVICES.put(metaKey, now.toString(), {
-              expirationTtl: Math.max(3600, dedupMinutes * 60),
-            });
+            await env.DEVICES.put(metaKey, record.mark, { expirationTtl: record.ttlSeconds });
           } catch (err) {
             console.error(`[Cron] Failed to notify device (${kind}): ${err}`);
             await recordPushFailure(device.token, err, env, reaps);
@@ -444,8 +486,17 @@ export default {
               minutesUntilRain <= device.leadTimeMinutes + CRON_PERIOD_MINUTES &&
               minutesUntilRain >= -START_SLACK_MINUTES
             ) {
-              await notifyOnce(device, 'start', () =>
-                sendRainAlert(device.token, minutesUntilRain, env, intensityFromMmPerHr(rainStart.precipitationIntensity))
+              await notifyOnce(
+                device,
+                'start',
+                onsetRecord(rainStart.startTime, device.leadTimeMinutes),
+                () =>
+                  sendRainAlert(
+                    device.token,
+                    minutesUntilRain,
+                    env,
+                    intensityFromMmPerHr(rainStart.precipitationIntensity)
+                  )
               );
               console.log(`[Cron] Rain-start grid ${grid.gridKey}, in ${minutesUntilRain}m`);
 
@@ -485,7 +536,9 @@ export default {
           if (rainEnd && device.rainEndEnabled !== false) {
             const minutesUntilEnd = Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000);
             if (minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
-              await notifyOnce(device, 'end', () => sendRainEndAlert(device.token, env, minutesUntilEnd));
+              await notifyOnce(device, 'end', elapsedRecord(now, 30), () =>
+                sendRainEndAlert(device.token, env, minutesUntilEnd)
+              );
               console.log(`[Cron] Rain-end grid ${grid.gridKey}, in ${minutesUntilEnd}m`);
             }
 
@@ -1173,7 +1226,7 @@ async function handleUnregister(request: Request, env: Env): Promise<Response> {
 // Drops a device: the two keys that would otherwise outlive it, and its cell
 // slot. Deliberately NOT every key keyed off its token — `notified-start:`,
 // `notified-end:` and `apnsfail:` are left to their own TTLs: an hour, or the
-// dedup window itself where that is longer, and 86400s.
+// span one rain-start onset stays alertable for where that is longer, and 86400s.
 //
 // Deleting those three bought an hour or a day of tidiness for three fifths of
 // this function's delete cost, against a Free-plan allowance of 1,000 deletes a
@@ -1181,12 +1234,12 @@ async function handleUnregister(request: Request, env: Env): Promise<Response> {
 // draws on directly. Two consequences follow, and both are accepted rather than
 // overlooked:
 //
-//   * A device reaped and re-registering inside its dedup window — 30 minutes,
-//     or lead time plus a cron period plus the start slack where that is longer,
-//     so 75 minutes at the longest lead time the app offers — may still be
-//     suppressed by its surviving `notified-*` key. That key exists only
-//     because the device was already notified for that rain event, so the
-//     suppression drops a duplicate rather than a distinct alert.
+//   * A device reaped and re-registering while a `notified-*` key of its own
+//     outlives it — an hour, or up to 75 minutes for `notified-start:` at the
+//     longest lead time the app offers — may still be suppressed by it. That key
+//     exists only because the device was already notified for that rain event,
+//     and the start key names the very onset it announced, so the suppression
+//     drops a duplicate rather than a distinct alert.
 //   * A device re-registering within 24h carries its surviving `apnsfail:`
 //     strike count, so it can be reaped after fewer fresh failures. Bounded by
 //     BAD_TOKEN_STRIKES, and every strike reflects a real APNs rejection.
