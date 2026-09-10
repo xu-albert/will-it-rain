@@ -3,6 +3,9 @@ main = "src/index.ts"
 compatibility_date = "2025-03-01"
 
 [triggers]
+# Changing this period means changing `CRON_PERIOD_MINUTES` in src/scheduling.ts
+# too: a Workers cron exposes no schedule the Worker can read back, and the
+# rain-start alert window and its dedup are derived from it.
 crons = ["*/10 * * * *"]
 
 [[kv_namespaces]]
