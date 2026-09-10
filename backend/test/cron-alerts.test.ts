@@ -269,9 +269,9 @@ describe('rain-start alerts', () => {
   });
 
   it('are not repeated for one onset, however long the ticks watch it approach', async () => {
-    // The dedup asks WHICH onset was announced, not how long ago: a 60-minute
-    // lead time watches one shower come in for the best part of an hour, well
-    // past any fixed window, and it is one event the whole way.
+    // A 60-minute lead time watches one shower come in for the best part of an
+    // hour, and it is one event the whole way. The last two ticks here are past
+    // the 30-minute floor, so it is the recorded onset holding them silent.
     vi.useFakeTimers();
     try {
       const noon = Date.parse('2026-01-01T12:00:00.000Z');
@@ -297,11 +297,48 @@ describe('rain-start alerts', () => {
     }
   });
 
-  it('still announce a second, distinct shower the first alert never covered', async () => {
-    // Suppressing on elapsed time swallowed this: at a 60-minute lead time the
-    // record from the noon shower covered every tick until 13:15, so a wholly
-    // different shower forecast inside that band was never announced — the
-    // silent-alert failure VISION.md ranks alongside the duplicate.
+  it('are floored at one every 30 minutes when the forecast onset oscillates', async () => {
+    // The far end of the nowcast is where it is least sure, and `isWet`'s hard
+    // chance cut flips a whole minute on a small change — so a single band can
+    // read as an onset 50 minutes out on one tick and 59 on the next, each a
+    // different onset. Without a floor that is a push every tick.
+    vi.useFakeTimers();
+    try {
+      const noon = Date.parse('2026-01-01T12:00:00.000Z');
+      vi.setSystemTime(new Date(noon));
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 60 }], Date.now());
+
+      const near = Date.parse('2026-01-01T12:50:00.000Z');
+      const far = Date.parse('2026-01-01T13:09:00.000Z');
+      const onsetAt = (onset: number) => (t: number) =>
+        forecast(t, (i) => t + i * 60_000 >= onset);
+
+      const first = await tick(harness, onsetAt(near));
+      expect(alerted(first.alerts)).toEqual([fakeToken(1)]);
+
+      // 19 minutes of wander each way — a distinct onset every time, and every
+      // one of these ticks is inside the floor, the last exactly on its edge.
+      for (const [minute, onset] of [
+        [10, far],
+        [20, near],
+        [30, far],
+      ] as const) {
+        vi.setSystemTime(new Date(noon + minute * 60_000));
+        const later = await tick(harness, onsetAt(onset));
+        expect(later.alerts).toEqual([]);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still announce a second, distinct shower once the floor is past', async () => {
+    // Suppressing on elapsed time alone swallowed this: at a 60-minute lead time
+    // the record from the noon shower covered every tick until 13:15, so a
+    // wholly different shower forecast inside that band was never announced —
+    // the silent-alert failure VISION.md ranks alongside the duplicate. The
+    // 30-minute floor still holds the tick before it, as it did at the base.
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-01-01T12:00:00.000Z'));
@@ -313,27 +350,69 @@ describe('rain-start alerts', () => {
       expect(alerted(first.alerts)).toEqual([fakeToken(1)]);
       expect(first.alerts[0].title).toBe('Rain in a few minutes');
 
-      // 12:20: A has passed, and the feed now shows shower B starting at 12:50.
-      vi.setSystemTime(new Date('2026-01-01T12:20:00.000Z'));
+      // A has passed, and the feed now shows shower B starting at 12:50.
       const onsetB = Date.parse('2026-01-01T12:50:00.000Z');
-      const second = await tick(harness, (t) => forecast(t, (i) => t + i * 60_000 >= onsetB));
+      const showerB = (t: number) => forecast(t, (i) => t + i * 60_000 >= onsetB);
+
+      // 12:20, twenty minutes on: a distinct onset, but inside the floor.
+      vi.setSystemTime(new Date('2026-01-01T12:20:00.000Z'));
+      const held = await tick(harness, showerB);
+      expect(held.alerts).toEqual([]);
+
+      // 12:40, past the floor: B is nothing the noon alert covered.
+      vi.setSystemTime(new Date('2026-01-01T12:40:00.000Z'));
+      const second = await tick(harness, showerB);
       expect(alerted(second.alerts)).toEqual([fakeToken(1)]);
-      expect(second.alerts[0].title).toBe('Rain in ~30 min');
+      expect(second.alerts[0].title).toBe('Rain in ~10 min');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('take an onset that has drifted by a cron period plus the slack for the same rain', async () => {
+    // The edge of that judgement, past the floor so only the onset decides: one
+    // shower's forecast onset wanders between ticks, and up to a tick's gap plus
+    // the lag the series is stamped with, it is the rain already announced.
+    const noon = Date.parse('2026-01-01T12:00:00.000Z');
+    const onset = Date.parse('2026-01-01T12:55:00.000Z');
+    const announce = async (): Promise<Harness> => {
+      const harness = makeHarness({ signingKey });
+      vi.setSystemTime(new Date(noon));
+      await plant(harness, [{ n: 1, leadTimeMinutes: 60 }], Date.now());
+      const first = await tick(harness, (t) => forecast(t, (i) => t + i * 60_000 >= onset));
+      expect(alerted(first.alerts)).toEqual([fakeToken(1)]);
+      return harness;
+    };
+    // Forty minutes on, so the 30-minute floor has expired either way.
+    const driftedTo = async (harness: Harness, minutes: number) => {
+      vi.setSystemTime(new Date(noon + 40 * 60_000));
+      const moved = onset + minutes * 60_000;
+      return tick(harness, (t) => forecast(t, (i) => t + i * 60_000 >= moved));
+    };
+
+    vi.useFakeTimers();
+    try {
+      const atEdge = await driftedTo(await announce(), 15);
+      expect(atEdge.alerts).toEqual([]);
+
+      const past = await driftedTo(await announce(), 16);
+      expect(alerted(past.alerts)).toEqual([fakeToken(1)]);
     } finally {
       vi.useRealTimers();
     }
   });
 
   it('treat a dedup record written before onset keying as the same rain', async () => {
-    // `notified-start:` used to hold the time of the last alert. Such a record
-    // says only "this device has been told about the rain it can see now", so it
-    // goes on suppressing until it expires: a deploy must not repeat an alert.
+    // `notified-start:` used to hold nothing but the time of the last alert.
+    // Such a record says only "this device has been told about the rain it can
+    // see now", so past the floor it goes on suppressing until it expires: a
+    // deploy must not repeat an alert.
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-01-01T12:00:00.000Z'));
       const harness = makeHarness({ signingKey });
       await plant(harness, [{ n: 1, leadTimeMinutes: 20 }], Date.now());
-      await harness.kv.put(`notified-start:${fakeToken(1)}`, String(Date.now() - 5 * 60_000), {
+      await harness.kv.put(`notified-start:${fakeToken(1)}`, String(Date.now() - 40 * 60_000), {
         expirationTtl: 3600,
       });
 

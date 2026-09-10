@@ -72,51 +72,11 @@ const START_SLACK_MINUTES = 5;
 // rain: one tick's gap, plus the slack by which the series lags the tick.
 const SAME_ONSET_DRIFT_MINUTES = CRON_PERIOD_MINUTES + START_SLACK_MINUTES;
 
-/**
- * What a `notified-*` record means to the tick that reads it back, and so which
- * pushes it suppresses.
- */
-interface NotifiedRecord {
-  /** The value stored once the push has gone out. */
-  mark: string;
-  /** Long enough for the record to outlive the span it suppresses. */
-  ttlSeconds: number;
-  /** Whether a record already in KV stands for the push about to be sent. */
-  covers: (recorded: string) => boolean;
-}
-
-/**
- * The rain-start record: WHICH onset was announced, not when. Every tick from
- * lead time plus a cron period ahead of an onset through to START_SLACK_MINUTES
- * past it sees that one shower, so a plain time window wide enough to cover them
- * all would also swallow a second, distinct shower forecast inside it — silence
- * where an alert was owed. The onset itself is the event, exactly as it is on
- * the client (`isSameEvent`, NotificationService.swift).
- *
- * `onset:` tags the value because a record written by the previous build is a
- * bare timestamp: unreadable as an onset, it goes on suppressing until it
- * expires rather than re-announcing rain the device was already told about.
- */
-function onsetRecord(startTime: string, leadTimeMinutes: number): NotifiedRecord {
-  const onsetMinute = Math.round(new Date(startTime).getTime() / 60_000);
-  return {
-    mark: `onset:${onsetMinute}`,
-    ttlSeconds: Math.max(3600, (leadTimeMinutes + SAME_ONSET_DRIFT_MINUTES) * 60),
-    covers: (recorded) => {
-      const previous = /^onset:(-?\d+)$/.exec(recorded);
-      return previous === null || Math.abs(Number(previous[1]) - onsetMinute) <= SAME_ONSET_DRIFT_MINUTES;
-    },
-  };
-}
-
-/** The rain-end record: one alert per `minutes`, keyed on when it was sent. */
-function elapsedRecord(now: number, minutes: number): NotifiedRecord {
-  return {
-    mark: now.toString(),
-    ttlSeconds: Math.max(3600, minutes * 60),
-    covers: (recorded) => now - parseInt(recorded) <= minutes * 60 * 1000,
-  };
-}
+// However the forecast moves, a device gets at most one alert of a kind this
+// often. A nowcast onset that oscillates near the far end of the alert window
+// is a different onset each time it moves, and without this floor that is a
+// push every tick.
+const ALERT_FLOOR_MINUTES = 30;
 
 // The per-minute precipitation test behind rain-start and rain-end detection.
 const isWet = (m: { precipitationChance: number; precipitationIntensity: number }) =>
@@ -444,24 +404,54 @@ export default {
             JSON.stringify(forecast.forecastHourly?.summary?.map((s) => s.condition) ?? null)
         );
 
-        // At most one push per device per event, deduped via KV: one rain-start
-        // alert per onset, one rain-end alert per 30 minutes. What counts as the
-        // same event is the record's business — see NotifiedRecord.
+        // At most one push per device per event type, deduped via KV. Both kinds
+        // are floored at ALERT_FLOOR_MINUTES since the last one sent. A rain
+        // start carries a second test past that floor: the record names the
+        // onset it announced, so the shower a long lead time watches approach
+        // for the best part of an hour stays one event, while a genuinely
+        // different shower still earns its own alert — the client keys on the
+        // onset the same way (`isSameEvent`, NotificationService.swift).
+        //
+        // A record with no onset in it was written before that keying and stands
+        // for whatever rain the device was last told about, so it goes on
+        // suppressing until it expires rather than repeating an alert on deploy.
         const notifyOnce = async (
           device: DeviceRegistration,
           kind: 'start' | 'end',
-          record: NotifiedRecord,
+          onsetTime: string | undefined,
           send: () => Promise<void>
         ) => {
+          const onsetMinute =
+            onsetTime === undefined ? undefined : Math.round(new Date(onsetTime).getTime() / 60_000);
           const metaKey = `notified-${kind}:${device.token}`;
           const recorded = await env.DEVICES.get(metaKey);
-          if (recorded !== null && record.covers(recorded)) return;
+          if (recorded !== null) {
+            const [notifiedAt, notifiedOnset] = recorded.split(':');
+            if (now - parseInt(notifiedAt) <= ALERT_FLOOR_MINUTES * 60 * 1000) return;
+            if (
+              onsetMinute !== undefined &&
+              (notifiedOnset === undefined ||
+                Math.abs(parseInt(notifiedOnset) - onsetMinute) <= SAME_ONSET_DRIFT_MINUTES)
+            ) {
+              return;
+            }
+          }
           // Claimed after the dedup check, so a push we were never going to
           // send does not spend budget a later device could have used.
           if (!budget.spend()) return;
           try {
             await send();
-            await env.DEVICES.put(metaKey, record.mark, { expirationTtl: record.ttlSeconds });
+            // The record has to outlive the span it suppresses.
+            await env.DEVICES.put(
+              metaKey,
+              onsetMinute === undefined ? now.toString() : `${now}:${onsetMinute}`,
+              {
+                expirationTtl:
+                  onsetMinute === undefined
+                    ? 3600
+                    : Math.max(3600, (device.leadTimeMinutes + SAME_ONSET_DRIFT_MINUTES) * 60),
+              }
+            );
           } catch (err) {
             console.error(`[Cron] Failed to notify device (${kind}): ${err}`);
             await recordPushFailure(device.token, err, env, reaps);
@@ -486,17 +476,13 @@ export default {
               minutesUntilRain <= device.leadTimeMinutes + CRON_PERIOD_MINUTES &&
               minutesUntilRain >= -START_SLACK_MINUTES
             ) {
-              await notifyOnce(
-                device,
-                'start',
-                onsetRecord(rainStart.startTime, device.leadTimeMinutes),
-                () =>
-                  sendRainAlert(
-                    device.token,
-                    minutesUntilRain,
-                    env,
-                    intensityFromMmPerHr(rainStart.precipitationIntensity)
-                  )
+              await notifyOnce(device, 'start', rainStart.startTime, () =>
+                sendRainAlert(
+                  device.token,
+                  minutesUntilRain,
+                  env,
+                  intensityFromMmPerHr(rainStart.precipitationIntensity)
+                )
               );
               console.log(`[Cron] Rain-start grid ${grid.gridKey}, in ${minutesUntilRain}m`);
 
@@ -536,7 +522,7 @@ export default {
           if (rainEnd && device.rainEndEnabled !== false) {
             const minutesUntilEnd = Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000);
             if (minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
-              await notifyOnce(device, 'end', elapsedRecord(now, 30), () =>
+              await notifyOnce(device, 'end', undefined, () =>
                 sendRainEndAlert(device.token, env, minutesUntilEnd)
               );
               console.log(`[Cron] Rain-end grid ${grid.gridKey}, in ${minutesUntilEnd}m`);
