@@ -2,7 +2,8 @@
 //
 // abuse.test.ts drives scheduled() to count what a tick spends; nothing there
 // asserts that the right device is alerted at the right minute. That gate is the
-// product: an alert outside the lead time the user asked for, a duplicate, or a
+// product: an alert later than the lead time the user asked for (up to one
+// server check period early is the accepted safe direction), a duplicate, or a
 // missing one is (per VISION.md) a bug of the highest class. These pin the
 // contract through the real scheduled() handler with a stubbed WeatherKit and a
 // stubbed APNs, so the arithmetic inside the tick is what is under test.
@@ -266,9 +267,11 @@ describe('rain-start alerts', () => {
   });
 
   it('are not repeated for the same event within 30 minutes', async () => {
+    // 30 minutes is the floor, which is the whole window for a lead time of 20
+    // or less: it already covers everything such a device can be alerted about.
     const harness = makeHarness({ signingKey });
     const now = Date.now();
-    await plant(harness, [{ n: 1, leadTimeMinutes: 30 }], now);
+    await plant(harness, [{ n: 1, leadTimeMinutes: 20 }], now);
     const rainSoon = (t: number) => forecast(t, (i) => i >= 10);
 
     const first = await tick(harness, rainSoon);
@@ -283,6 +286,35 @@ describe('rain-start alerts', () => {
     });
     const third = await tick(harness, rainSoon);
     expect(alerted(third.alerts)).toEqual([fakeToken(1)]);
+  });
+
+  it('are not repeated by a later tick still inside the widened window', async () => {
+    // The dedup window has to be at least as wide as the window that alerts:
+    // at a 30-minute lead time the tick 30 minutes after the first alert still
+    // sees the same onset (5 minutes out, so not yet raining) and used to
+    // announce it a second time.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T12:00:00.000Z'));
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 30 }], Date.now());
+
+      // One fixed onset, 35 minutes out at noon, seen afresh by every tick.
+      const onset = Date.parse('2026-01-01T12:35:00.000Z');
+      const sameRain = (t: number) => forecast(t, (i) => t + i * 60_000 >= onset);
+
+      const noon = await tick(harness, sameRain);
+      expect(alerted(noon.alerts)).toEqual([fakeToken(1)]);
+      expect(noon.alerts[0].title).toBe('Rain in ~35 min');
+
+      for (const minute of [10, 20, 30]) {
+        vi.setSystemTime(new Date(Date.parse('2026-01-01T12:00:00.000Z') + minute * 60_000));
+        const later = await tick(harness, sameRain);
+        expect(later.alerts).toEqual([]);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('respect a device that turned rain-start alerts off', async () => {

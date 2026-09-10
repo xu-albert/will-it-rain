@@ -389,21 +389,29 @@ export default {
             JSON.stringify(forecast.forecastHourly?.summary?.map((s) => s.condition) ?? null)
         );
 
-        // At most one push per device per event type, deduped for 30 min via KV.
+        // At most one push per device per event type, deduped via KV for 30
+        // minutes, or for the full width of the rain-start alert window (lead
+        // time plus one cron period) where that is wider: every tick inside
+        // that window still sees the one onset it already announced.
         const notifyOnce = async (
           device: DeviceRegistration,
           kind: 'start' | 'end',
           send: () => Promise<void>
         ) => {
+          const dedupMinutes =
+            kind === 'start' ? Math.max(30, device.leadTimeMinutes + CRON_PERIOD_MINUTES) : 30;
           const metaKey = `notified-${kind}:${device.token}`;
           const lastNotified = await env.DEVICES.get(metaKey);
-          if (lastNotified && now - parseInt(lastNotified) < 30 * 60 * 1000) return;
+          if (lastNotified && now - parseInt(lastNotified) < dedupMinutes * 60 * 1000) return;
           // Claimed after the dedup check, so a push we were never going to
           // send does not spend budget a later device could have used.
           if (!budget.spend()) return;
           try {
             await send();
-            await env.DEVICES.put(metaKey, now.toString(), { expirationTtl: 3600 });
+            // The record has to outlive the window it enforces.
+            await env.DEVICES.put(metaKey, now.toString(), {
+              expirationTtl: Math.max(3600, dedupMinutes * 60),
+            });
           } catch (err) {
             console.error(`[Cron] Failed to notify device (${kind}): ${err}`);
             await recordPushFailure(device.token, err, env, reaps);

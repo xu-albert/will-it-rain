@@ -12,7 +12,7 @@ A feature that answers a different question - climate, radar browsing, severe-we
 
 ## An interruption must earn itself
 
-A notification exists only because the user asked for a lead time; it arrives inside that lead time or it is a bug of the highest class.
+A notification exists only because the user asked for a lead time; it arrives no later than that lead time - up to one server check period (currently 10 minutes) early is the safe direction and is accepted - or it is a bug of the highest class.
 A wrong alert, a duplicate alert, or an alert that silently stops coming ranks above any feature work.
 Copy states what the rain does - starts, stops - in plain, friendly words, and never gives advice.
 Quiet hours are honoured, no badge is requested, and nothing nags.
