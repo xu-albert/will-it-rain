@@ -57,6 +57,10 @@ rescale one PNG into another size. `verify_mark.py` checks that the SwiftUI
   sizes `MAX_TTL_MIGRATIONS_PER_TICK`, `MAX_DEVICE_REAPS_PER_TICK`,
   `DEVICE_RECORD_REFRESH_SECONDS` and `DEVICE_REWRITE_COOLDOWN_SECONDS` — and two of
   those daily KV buckets, writes and reads, do *not* fit at a full-fleet 15 x 20.
+  A cron-schedule change has a second edit site: the period is also hard-coded as
+  `CRON_PERIOD_MINUTES` (`backend/src/scheduling.ts`), because a Workers cron trigger
+  exposes no schedule the Worker can read back, and the rain-start alert window and its
+  dedup are derived from it.
 - The registration endpoints are **unauthenticated by construction**: the Worker URL
   ships in the iOS binary and an APNs token cannot be verified server-side. What
   bounds abuse is the gate in `abuse.ts` — per-client throttle, global cell cap,
