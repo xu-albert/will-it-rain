@@ -85,11 +85,6 @@ class NotificationSettings: ObservableObject {
         self.pendingPrecipEnd = Self.storedDate(forKey: "pendingPrecipEnd", in: d)
         self.lastRainEndTime = Self.storedDate(forKey: "lastRainEndTime", in: d)
         self.lastPrecipitatingTime = Self.storedDate(forKey: "lastPrecipitatingTime", in: d)
-        // Older releases persisted only a Bool here. It has no timestamp, so
-        // it cannot prove that the wet reading was recent enough to start a
-        // resume transition. Remove it after loading so it cannot linger as
-        // misleading state.
-        d.removeObject(forKey: "wasPrecipitating")
     }
 
     // Dates are stored as seconds since the reference date. A nil clears the key,

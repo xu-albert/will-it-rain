@@ -82,7 +82,6 @@ final class NotificationSettingsTests: XCTestCase {
         let settings = NotificationSettings(defaults: defaults)
 
         XCTAssertNil(settings.lastPrecipitatingTime)
-        XCTAssertNil(defaults.object(forKey: "wasPrecipitating"))
     }
 
     func testDatesAreStoredUnderTheirExistingKeysAsReferenceSeconds() {
