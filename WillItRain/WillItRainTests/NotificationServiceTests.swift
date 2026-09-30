@@ -442,6 +442,46 @@ final class NotificationServiceTests: XCTestCase {
         XCTAssertNil(settings.lastRainEndTime)
     }
 
+    func testRainThatEndedDuringQuietHoursIsNotAnnouncedAsResumingAfterThem() {
+        settings.leadTime = 20
+        settings.rainEndEnabled = false
+        settings.quietHoursEnabled = true
+        settings.quietHoursStart = minutes(10)
+        settings.quietHoursEnd = minutes(180)
+
+        // Wet just before quiet hours; every poll inside them is skipped, so the
+        // last wet stamp is three hours old by the first poll after they end.
+        evaluate(forecast([(-30, 5)]), at: t0)
+        evaluate(forecast([]), at: minutes(30))
+        evaluate(forecast([]), at: minutes(120))
+        let rainAhead = forecast([(215, 260)])
+        evaluate(rainAhead, at: minutes(185))
+        XCTAssertEqual(delivered, [], "Rain 30 min out is beyond the lead time and is not a brief gap")
+
+        evaluate(rainAhead, at: minutes(195))
+        evaluate(rainAhead, at: minutes(200))
+        XCTAssertEqual(identifiers, ["precip-start"])
+        XCTAssertEqual(delivered.first?.title, "Rain in ~15 min")
+    }
+
+    func testAWetFlagSavedByAnOlderBuildDoesNotAnnounceRainAsResuming() {
+        defaults.set(true, forKey: "wasPrecipitating")
+        settings = NotificationSettings(defaults: defaults)
+        settings.leadTime = 20
+        settings.rainEndEnabled = false
+
+        // The older build's Bool says only that some past poll was wet, not
+        // when, so the first poll after the upgrade is not a rain ending.
+        let rainAhead = forecast([(30, 60)])
+        evaluate(rainAhead, at: t0)
+        XCTAssertEqual(delivered, [])
+
+        evaluate(rainAhead, at: minutes(10))
+        evaluate(rainAhead, at: minutes(15))
+        XCTAssertEqual(identifiers, ["precip-start"])
+        XCTAssertEqual(delivered.first?.title, "Rain in ~15 min")
+    }
+
     // MARK: - Quiet hours
 
     func testQuietHoursSuppressEveryAlertAndLeaveStateUntouched() {
