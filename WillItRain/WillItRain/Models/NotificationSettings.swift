@@ -47,11 +47,12 @@ class NotificationSettings: ObservableObject {
     @Published var lastRainEndTime: Date? {
         didSet { persist(lastRainEndTime, forKey: "lastRainEndTime") }
     }
-    /// Whether the previous evaluated forecast was wet. This is separate from
-    /// `lastRainEndTime`: a fresh install must not mistake its first dry
-    /// forecast for a rain ending and send a resume alert.
-    @Published var wasPrecipitating: Bool {
-        didSet { defaults.set(wasPrecipitating, forKey: "wasPrecipitating") }
+    /// When the previous evaluated forecast was wet. This is separate from
+    /// `lastRainEndTime`: a fresh install, or a launch after a long gap, must
+    /// not mistake its first dry forecast for a rain ending and send a resume
+    /// alert.
+    @Published var lastPrecipitatingTime: Date? {
+        didSet { persist(lastPrecipitatingTime, forKey: "lastPrecipitatingTime") }
     }
 
     /// Check if two dates refer to the same event (within 10 minutes).
@@ -83,7 +84,7 @@ class NotificationSettings: ObservableObject {
         self.pendingPrecipStart = Self.storedDate(forKey: "pendingPrecipStart", in: d)
         self.pendingPrecipEnd = Self.storedDate(forKey: "pendingPrecipEnd", in: d)
         self.lastRainEndTime = Self.storedDate(forKey: "lastRainEndTime", in: d)
-        self.wasPrecipitating = d.bool(forKey: "wasPrecipitating")
+        self.lastPrecipitatingTime = Self.storedDate(forKey: "lastPrecipitatingTime", in: d)
     }
 
     // Dates are stored as seconds since the reference date. A nil clears the key,
