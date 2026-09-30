@@ -82,10 +82,7 @@ class NotificationSettings: ObservableObject {
         self.lastNotifiedPrecipEnd = Self.storedDate(forKey: "lastNotifiedPrecipEnd", in: d)
         self.pendingPrecipStart = Self.storedDate(forKey: "pendingPrecipStart", in: d)
         self.pendingPrecipEnd = Self.storedDate(forKey: "pendingPrecipEnd", in: d)
-        // Older installs recorded a timestamp on any dry poll, so without the
-        // transition bit their value is not evidence of an observed rain end.
-        let hasTransitionState = d.object(forKey: "wasPrecipitating") != nil
-        self.lastRainEndTime = hasTransitionState ? Self.storedDate(forKey: "lastRainEndTime", in: d) : nil
+        self.lastRainEndTime = Self.storedDate(forKey: "lastRainEndTime", in: d)
         self.wasPrecipitating = d.bool(forKey: "wasPrecipitating")
     }
 

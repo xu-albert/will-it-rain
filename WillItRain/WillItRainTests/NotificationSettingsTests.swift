@@ -92,16 +92,6 @@ final class NotificationSettingsTests: XCTestCase {
         XCTAssertEqual(defaults.double(forKey: "quietHoursStart"), stamp.timeIntervalSinceReferenceDate)
     }
 
-    func testLegacyRainEndTimestampWithoutTransitionStateIsIgnored() {
-        let stamp = Date(timeIntervalSince1970: 1_700_000_000)
-        defaults.set(stamp.timeIntervalSinceReferenceDate, forKey: "lastRainEndTime")
-
-        let settings = NotificationSettings(defaults: defaults)
-
-        XCTAssertNil(settings.lastRainEndTime)
-        XCTAssertFalse(settings.wasPrecipitating)
-    }
-
     func testClearingADateRemovesItsKey() {
         let settings = NotificationSettings(defaults: defaults)
         settings.pendingPrecipStart = Date()
