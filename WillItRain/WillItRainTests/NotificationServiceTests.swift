@@ -158,7 +158,7 @@ final class NotificationServiceTests: XCTestCase {
     func testFreshInstallDoesNotTreatFirstDryForecastAsRainEnd() {
         settings.leadTime = 20
         settings.lastRainEndTime = nil
-        settings.wasPrecipitating = false
+        settings.lastPrecipitatingTime = nil
         let rainAt15 = forecast([(15, 45)])
 
         // A fresh install sees dry now and rain ahead. That is not an observed
@@ -422,6 +422,24 @@ final class NotificationServiceTests: XCTestCase {
         evaluate(forecast([(40, 60)]), at: minutes(25))
         XCTAssertEqual(delivered, [])
         XCTAssertEqual(settings.pendingPrecipStart, minutes(40))
+    }
+
+    func testRainReturningAfterHoursDoesNotUseStaleWetState() {
+        settings.leadTime = 20
+        settings.rainEndEnabled = false
+
+        // The app was last evaluated while raining, then stayed closed for
+        // hours. A dry evaluation with rain 30 minutes ahead is not a brief
+        // gap, so it must use the ordinary lead-time confirmation gate.
+        evaluate(forecast([(-30, 5)]), at: t0)
+        let rainAhead = forecast([(210, 260)])
+        evaluate(rainAhead, at: minutes(180))
+        evaluate(rainAhead, at: minutes(190))
+        evaluate(rainAhead, at: minutes(195))
+
+        XCTAssertEqual(identifiers, ["precip-start"])
+        XCTAssertEqual(delivered.first?.title, "Rain in ~15 min")
+        XCTAssertNil(settings.lastRainEndTime)
     }
 
     // MARK: - Quiet hours

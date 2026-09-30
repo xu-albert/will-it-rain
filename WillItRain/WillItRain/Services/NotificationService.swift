@@ -11,6 +11,7 @@ final class NotificationService {
 
     static let shared = NotificationService()
     private static let center = UNUserNotificationCenter.current()
+    private static let maximumInRainPollInterval: TimeInterval = 15 * 60
 
     private let deliver: Deliver
 
@@ -35,16 +36,20 @@ final class NotificationService {
         let formatter = DateFormatter()
         formatter.dateFormat = "h:mm a"
 
-        // Track lastRainEndTime only after observing a wet-to-dry transition.
-        // On a fresh install, a dry forecast with rain ahead is not evidence
-        // that rain just stopped; recording it would trigger a false resume
-        // alert and suppress the real lead-time alert that follows.
+        // Track lastRainEndTime only after observing a recent wet-to-dry
+        // transition. On a fresh install, or after a long gap between polls, a
+        // dry forecast with rain ahead is not evidence that rain just stopped;
+        // recording it would trigger a false resume alert and suppress the
+        // real lead-time alert that follows.
         if forecast.isPrecipitating(at: now) {
             settings.lastRainEndTime = nil
-            settings.wasPrecipitating = true
-        } else if settings.wasPrecipitating {
-            settings.lastRainEndTime = now
-            settings.wasPrecipitating = false
+            settings.lastPrecipitatingTime = now
+        } else if let lastWet = settings.lastPrecipitatingTime {
+            let timeSinceWet = now.timeIntervalSince(lastWet)
+            if timeSinceWet >= 0, timeSinceWet <= Self.maximumInRainPollInterval {
+                settings.lastRainEndTime = now
+            }
+            settings.lastPrecipitatingTime = nil
         }
 
         // --- Rain starting (two-pass confirmation) ---
