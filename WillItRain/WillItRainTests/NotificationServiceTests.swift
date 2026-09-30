@@ -155,6 +155,25 @@ final class NotificationServiceTests: XCTestCase {
         XCTAssertNil(settings.pendingPrecipStart)
     }
 
+    func testFreshInstallDoesNotTreatFirstDryForecastAsRainEnd() {
+        settings.leadTime = 20
+        settings.lastRainEndTime = nil
+        settings.wasPrecipitating = false
+        let rainAt15 = forecast([(15, 45)])
+
+        // A fresh install sees dry now and rain ahead. That is not an observed
+        // rain ending, so it must not send the resume copy or seed the end time.
+        evaluate(rainAt15, at: t0)
+        XCTAssertEqual(delivered, [])
+        XCTAssertNil(settings.lastRainEndTime)
+
+        // The ordinary lead-time alert remains available on its confirmation
+        // pass instead of being suppressed by the false resume state.
+        evaluate(rainAt15, at: minutes(5))
+        XCTAssertEqual(identifiers, ["precip-start"])
+        XCTAssertEqual(delivered.first?.title, "Rain in ~10 min")
+    }
+
     func testRainStartTitleSaysSoonInsideFiveMinutes() {
         settings.leadTime = 20
         let rainAt4 = forecast([(4, 45)], type: .snow, peak: .light)

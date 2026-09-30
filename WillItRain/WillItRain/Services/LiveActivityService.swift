@@ -35,6 +35,10 @@ final class LiveActivityService {
 
         let content = ActivityContent(state: state, staleDate: now.addingTimeInterval(45 * 60))
         if let activity = Activity<RainActivityAttributes>.activities.first {
+            // ActivityKit activities survive an app relaunch. Reattach the
+            // token observer before updating so the Worker receives the
+            // activity token again after the process that created it is gone.
+            observePushToken(for: activity)
             Task { await activity.update(content) }
         } else {
             do {

@@ -35,11 +35,16 @@ final class NotificationService {
         let formatter = DateFormatter()
         formatter.dateFormat = "h:mm a"
 
-        // Track lastRainEndTime
+        // Track lastRainEndTime only after observing a wet-to-dry transition.
+        // On a fresh install, a dry forecast with rain ahead is not evidence
+        // that rain just stopped; recording it would trigger a false resume
+        // alert and suppress the real lead-time alert that follows.
         if forecast.isPrecipitating(at: now) {
             settings.lastRainEndTime = nil
-        } else if settings.lastRainEndTime == nil {
+            settings.wasPrecipitating = true
+        } else if settings.wasPrecipitating {
             settings.lastRainEndTime = now
+            settings.wasPrecipitating = false
         }
 
         // --- Rain starting (two-pass confirmation) ---

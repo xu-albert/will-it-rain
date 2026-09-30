@@ -47,6 +47,12 @@ class NotificationSettings: ObservableObject {
     @Published var lastRainEndTime: Date? {
         didSet { persist(lastRainEndTime, forKey: "lastRainEndTime") }
     }
+    /// Whether the previous evaluated forecast was wet. This is separate from
+    /// `lastRainEndTime`: a fresh install must not mistake its first dry
+    /// forecast for a rain ending and send a resume alert.
+    @Published var wasPrecipitating: Bool {
+        didSet { defaults.set(wasPrecipitating, forKey: "wasPrecipitating") }
+    }
 
     /// Check if two dates refer to the same event (within 10 minutes).
     func isSameEvent(_ a: Date?, _ b: Date?) -> Bool {
@@ -76,7 +82,11 @@ class NotificationSettings: ObservableObject {
         self.lastNotifiedPrecipEnd = Self.storedDate(forKey: "lastNotifiedPrecipEnd", in: d)
         self.pendingPrecipStart = Self.storedDate(forKey: "pendingPrecipStart", in: d)
         self.pendingPrecipEnd = Self.storedDate(forKey: "pendingPrecipEnd", in: d)
-        self.lastRainEndTime = Self.storedDate(forKey: "lastRainEndTime", in: d)
+        // Older installs recorded a timestamp on any dry poll, so without the
+        // transition bit their value is not evidence of an observed rain end.
+        let hasTransitionState = d.object(forKey: "wasPrecipitating") != nil
+        self.lastRainEndTime = hasTransitionState ? Self.storedDate(forKey: "lastRainEndTime", in: d) : nil
+        self.wasPrecipitating = d.bool(forKey: "wasPrecipitating")
     }
 
     // Dates are stored as seconds since the reference date. A nil clears the key,
