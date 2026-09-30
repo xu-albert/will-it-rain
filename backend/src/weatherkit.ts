@@ -1,10 +1,18 @@
 import { Env, WeatherKitForecast } from './types';
 import { SYNTHESIZED_LOOKBACK_MINUTES } from './nextHour';
 
+// WeatherKit accepts tokens for up to one hour; refresh a little earlier so a
+// cron burst never signs one token per grid cell.
+let cachedWeatherKitJWT: { token: string; iat: number } | null = null;
+
 // Generate JWT for WeatherKit REST API authentication
 async function generateJWT(env: Env): Promise<string> {
-  const header = { alg: 'ES256', kid: env.APPLE_KEY_ID, id: `${env.APPLE_TEAM_ID}.${env.WEATHERKIT_SERVICE_ID}` };
   const now = Math.floor(Date.now() / 1000);
+  if (cachedWeatherKitJWT && now - cachedWeatherKitJWT.iat < 40 * 60) {
+    return cachedWeatherKitJWT.token;
+  }
+
+  const header = { alg: 'ES256', kid: env.APPLE_KEY_ID, id: `${env.APPLE_TEAM_ID}.${env.WEATHERKIT_SERVICE_ID}` };
   const payload = {
     iss: env.APPLE_TEAM_ID,
     iat: now,
@@ -31,9 +39,10 @@ async function generateJWT(env: Env): Promise<string> {
   const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(signingInput));
 
   // Convert DER signature to raw r||s format for ES256
-  const sig = b64url(signature);
+  const token = `${signingInput}.${b64url(signature)}`;
+  cachedWeatherKitJWT = { token, iat: now };
 
-  return `${signingInput}.${sig}`;
+  return token;
 }
 
 export async function fetchForecast(lat: number, lon: number, env: Env): Promise<WeatherKitForecast> {

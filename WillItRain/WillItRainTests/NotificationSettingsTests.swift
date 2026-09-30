@@ -34,6 +34,7 @@ final class NotificationSettingsTests: XCTestCase {
         XCTAssertNil(settings.pendingPrecipStart)
         XCTAssertNil(settings.pendingPrecipEnd)
         XCTAssertNil(settings.lastRainEndTime)
+        XCTAssertFalse(settings.wasPrecipitating)
 
         let calendar = Calendar.current
         XCTAssertEqual(calendar.component(.hour, from: settings.quietHoursStart), 22)
@@ -56,6 +57,7 @@ final class NotificationSettingsTests: XCTestCase {
         first.pendingPrecipStart = stamp.addingTimeInterval(180)
         first.pendingPrecipEnd = stamp.addingTimeInterval(240)
         first.lastRainEndTime = stamp.addingTimeInterval(300)
+        first.wasPrecipitating = true
 
         let second = NotificationSettings(defaults: defaults)
         XCTAssertEqual(second.leadTime, 30)
@@ -71,6 +73,7 @@ final class NotificationSettingsTests: XCTestCase {
         XCTAssertEqual(second.pendingPrecipStart, stamp.addingTimeInterval(180))
         XCTAssertEqual(second.pendingPrecipEnd, stamp.addingTimeInterval(240))
         XCTAssertEqual(second.lastRainEndTime, stamp.addingTimeInterval(300))
+        XCTAssertTrue(second.wasPrecipitating)
     }
 
     func testDatesAreStoredUnderTheirExistingKeysAsReferenceSeconds() {
