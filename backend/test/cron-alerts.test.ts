@@ -693,6 +693,37 @@ describe('rain-resume alerts', () => {
     }
   });
 
+  it('are floored like any start alert when rain flickers off and on every tick', async () => {
+    // Each tick sees a one-minute dip just ahead with rain right behind it. The
+    // first resume is news; the ones after it, inside the floor, are a push
+    // every ten minutes about the same rain.
+    vi.useFakeTimers();
+    try {
+      at('12:00');
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 20 }], Date.now());
+      const weather = showers([
+        ['12:00', '12:08'],
+        ['12:09', '12:18'],
+        ['12:19', '12:28'],
+        ['12:29', '12:40'],
+      ]);
+
+      const first = await tick(harness, weather);
+      expect(first.alerts.map((a) => a.title)).toEqual(['More rain coming']);
+
+      for (const clock of ['12:10', '12:20']) {
+        at(clock);
+        expect((await tick(harness, weather)).alerts).toEqual([]);
+      }
+
+      at('12:30');
+      expect((await tick(harness, weather)).alerts.map((a) => a.title)).toEqual(['Rain ending soon']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('wait for a break that opens before the next tick, ending as usual until then', async () => {
     vi.useFakeTimers();
     try {

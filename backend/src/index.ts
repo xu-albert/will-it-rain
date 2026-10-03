@@ -465,9 +465,11 @@ export default {
         //
         // A resume shares the start record, so whichever announces an onset
         // first, the other stays silent for it. The one difference: to a resume,
-        // a record whose onset has already begun is spent — that is the rain now
-        // breaking, and the rain after the break is a different event however
-        // soon after the last alert it comes.
+        // a record a start alert wrote whose onset has already begun is spent —
+        // that is the rain now breaking, and the rain after the break is a
+        // different event however soon after the last alert it comes. A record
+        // a resume wrote is never spent, so in flickering rain one resume holds
+        // the next ones to the floor. The record names its kind for that.
         const notifyOnce = async (
           device: DeviceRegistration,
           kind: 'start' | 'resume' | 'end',
@@ -479,9 +481,10 @@ export default {
           const metaKey = `notified-${kind === 'end' ? 'end' : 'start'}:${device.token}`;
           const recorded = await env.DEVICES.get(metaKey);
           if (recorded !== null) {
-            const [notifiedAt, notifiedOnset] = recorded.split(':');
+            const [notifiedAt, notifiedOnset, notifiedKind] = recorded.split(':');
             const spent =
               kind === 'resume' &&
+              notifiedKind !== 'resume' &&
               notifiedOnset !== undefined &&
               parseInt(notifiedOnset) * 60_000 <= now;
             if (!spent) {
@@ -509,7 +512,7 @@ export default {
                 : device.leadTimeMinutes;
             await env.DEVICES.put(
               metaKey,
-              onsetMinute === undefined ? now.toString() : `${now}:${onsetMinute}`,
+              onsetMinute === undefined ? now.toString() : `${now}:${onsetMinute}:${kind}`,
               {
                 expirationTtl:
                   onsetMinute === undefined
