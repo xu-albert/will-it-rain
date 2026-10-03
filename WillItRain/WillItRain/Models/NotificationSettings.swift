@@ -115,4 +115,60 @@ class NotificationSettings: ObservableObject {
             return nowMinutes >= startMinutes || nowMinutes < endMinutes
         }
     }
+
+    /// The complete alert policy mirrored to the Worker. SwiftUI keys a
+    /// debounced registration task on this value, so changing any server-side
+    /// alert setting promptly replaces the pending registration with the newest
+    /// one while display-only settings do not create network traffic.
+    var remoteAlertSettings: RemoteAlertSettings {
+        RemoteAlertSettings(settings: self)
+    }
+}
+
+struct RemoteAlertSettings: Hashable {
+    let leadTimeMinutes: Int
+    let rainStartEnabled: Bool
+    let rainEndEnabled: Bool
+    let quietHoursEnabled: Bool
+    let quietHoursStartMinutes: Int
+    let quietHoursEndMinutes: Int
+    let timeZoneIdentifier: String
+
+    init(
+        leadTimeMinutes: Int,
+        rainStartEnabled: Bool,
+        rainEndEnabled: Bool,
+        quietHoursEnabled: Bool,
+        quietHoursStartMinutes: Int,
+        quietHoursEndMinutes: Int,
+        timeZoneIdentifier: String
+    ) {
+        self.leadTimeMinutes = leadTimeMinutes
+        self.rainStartEnabled = rainStartEnabled
+        self.rainEndEnabled = rainEndEnabled
+        self.quietHoursEnabled = quietHoursEnabled
+        self.quietHoursStartMinutes = quietHoursStartMinutes
+        self.quietHoursEndMinutes = quietHoursEndMinutes
+        self.timeZoneIdentifier = timeZoneIdentifier
+    }
+
+    init(
+        settings: NotificationSettings,
+        calendar: Calendar = .autoupdatingCurrent,
+        timeZone: TimeZone = .autoupdatingCurrent
+    ) {
+        var localCalendar = calendar
+        localCalendar.timeZone = timeZone
+        leadTimeMinutes = settings.leadTime
+        rainStartEnabled = settings.rainStartEnabled
+        rainEndEnabled = settings.rainEndEnabled
+        quietHoursEnabled = settings.quietHoursEnabled
+        quietHoursStartMinutes = Self.minutesSinceMidnight(settings.quietHoursStart, calendar: localCalendar)
+        quietHoursEndMinutes = Self.minutesSinceMidnight(settings.quietHoursEnd, calendar: localCalendar)
+        timeZoneIdentifier = timeZone.identifier
+    }
+
+    private static func minutesSinceMidnight(_ date: Date, calendar: Calendar) -> Int {
+        calendar.component(.hour, from: date) * 60 + calendar.component(.minute, from: date)
+    }
 }

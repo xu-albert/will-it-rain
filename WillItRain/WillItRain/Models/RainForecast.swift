@@ -138,13 +138,18 @@ struct PrecipitationPeriod: Identifiable {
         date >= start && date <= end
     }
 
-    /// A point counts as precipitation when a specific amount is predicted (`intensity != .none`)
+    /// A point counts as precipitation when at least 0.1 mm/h is predicted
     /// OR when rain is more likely than not (`probability >= 0.5`). Keying off amount alone made the
     /// app show "Clear" when WeatherKit reported a high chance but a low probability-weighted amount —
     /// the "says nothing's happening when it's going to rain" bug. Adding the chance gate only *adds*
     /// detections (never removes), and 0.5 keeps marginal <50% forecasts from crying wolf. This makes
     /// the in-app status agree with the backend, which already gates on precipitation chance.
     static let likelyRainProbability = 0.5
+    static let minimumWetMillimetersPerHour = 0.1
+
+    static func isWet(probability: Double, millimetersPerHour: Double) -> Bool {
+        millimetersPerHour >= minimumWetMillimetersPerHour || probability >= likelyRainProbability
+    }
 
     /// Collapses a time-ordered series of points into contiguous wet stretches.
     ///
@@ -162,7 +167,10 @@ struct PrecipitationPeriod: Identifiable {
         var periodIsConfirmed = true
 
         for (index, point) in dataPoints.enumerated() {
-            let isWet = point.intensity != .none || point.probability >= likelyRainProbability
+            let isWet = Self.isWet(
+                probability: point.probability,
+                millimetersPerHour: point.precipitationAmount
+            )
             if isWet {
                 let intensity = point.intensity == .none ? .light : point.intensity
                 if periodStart == nil {

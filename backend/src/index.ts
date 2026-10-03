@@ -28,6 +28,8 @@ import {
   isValidLongitude,
   isValidActivityToken,
   isValidDeviceToken,
+  isValidMinuteOfDay,
+  isValidTimeZoneIdentifier,
   secureEquals,
 } from './validate';
 import {
@@ -78,9 +80,40 @@ const SAME_ONSET_DRIFT_MINUTES = CRON_PERIOD_MINUTES + START_SLACK_MINUTES;
 // push every tick.
 const ALERT_FLOOR_MINUTES = 30;
 
-// The per-minute precipitation test behind rain-start and rain-end detection.
-const isWet = (m: { precipitationChance: number; precipitationIntensity: number }) =>
-  m.precipitationChance > 0.3 && m.precipitationIntensity > 0;
+// Shared with PrecipitationPeriod.detect on iOS. WeatherKit reports intensity
+// in mm/h on both APIs; the boundaries are deliberately inclusive.
+export const LIKELY_RAIN_PROBABILITY = 0.5;
+export const MINIMUM_WET_MM_PER_HOUR = 0.1;
+export const isWet = (m: { precipitationChance: number; precipitationIntensity: number }) =>
+  m.precipitationIntensity >= MINIMUM_WET_MM_PER_HOUR ||
+  m.precipitationChance >= LIKELY_RAIN_PROBABILITY;
+
+/** Whether ordinary alerts are currently silenced in the device's local time. */
+export function isInQuietHours(device: DeviceRegistration, at: Date): boolean {
+  if (device.quietHoursEnabled !== true) return false;
+  const start = device.quietHoursStartMinutes;
+  const end = device.quietHoursEndMinutes;
+  const timeZone = device.timeZoneIdentifier;
+  if (start === undefined || end === undefined || timeZone === undefined) return true;
+
+  let parts: Intl.DateTimeFormatPart[];
+  try {
+    parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hourCycle: 'h23',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).formatToParts(at);
+  } catch {
+    return true;
+  }
+  const hour = Number(parts.find((part) => part.type === 'hour')?.value);
+  const minute = Number(parts.find((part) => part.type === 'minute')?.value);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return true;
+  const localMinutes = hour * 60 + minute;
+  if (start <= end) return localMinutes >= start && localMinutes < end;
+  return localMinutes >= start || localMinutes < end;
+}
 
 // WeatherKit condition strings that should render with the wintry treatment.
 // The WeatherKit REST API documents forecastHourly.summary[].condition as
@@ -461,6 +494,7 @@ export default {
         for (const device of grid.devices) {
           if (pendingReaps.has(device.token)) continue;
           const activityToken = activityTokens.get(device.token);
+          const alertsQuiet = isInQuietHours(device, new Date(now));
           if (rainStart && device.rainStartEnabled !== false) {
             const minutesUntilRain = Math.round((new Date(rainStart.startTime).getTime() - now) / 60000);
             // Widened by one cron period: at a 10-minute lead time the alert window
@@ -476,15 +510,17 @@ export default {
               minutesUntilRain <= device.leadTimeMinutes + CRON_PERIOD_MINUTES &&
               minutesUntilRain >= -START_SLACK_MINUTES
             ) {
-              await notifyOnce(device, 'start', rainStart.startTime, () =>
-                sendRainAlert(
-                  device.token,
-                  minutesUntilRain,
-                  env,
-                  intensityFromMmPerHr(rainStart.precipitationIntensity)
-                )
-              );
-              console.log(`[Cron] Rain-start grid ${grid.gridKey}, in ${minutesUntilRain}m`);
+              if (!alertsQuiet) {
+                await notifyOnce(device, 'start', rainStart.startTime, () =>
+                  sendRainAlert(
+                    device.token,
+                    minutesUntilRain,
+                    env,
+                    intensityFromMmPerHr(rainStart.precipitationIntensity)
+                  )
+                );
+                console.log(`[Cron] Rain-start grid ${grid.gridKey}, in ${minutesUntilRain}m`);
+              }
 
               // Live Activity: rain incoming (State A). Only relevant within the same
               // lead-time window as the alert above; a push failure here must never
@@ -521,7 +557,7 @@ export default {
           }
           if (rainEnd && device.rainEndEnabled !== false) {
             const minutesUntilEnd = Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000);
-            if (minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
+            if (!alertsQuiet && minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
               await notifyOnce(device, 'end', undefined, () =>
                 sendRainEndAlert(device.token, env, minutesUntilEnd)
               );
@@ -681,6 +717,10 @@ interface RegistrationSettings {
   leadTimeMinutes: number;
   rainStartEnabled: boolean;
   rainEndEnabled: boolean;
+  quietHoursEnabled: boolean;
+  quietHoursStartMinutes: number;
+  quietHoursEndMinutes: number;
+  timeZoneIdentifier: string;
 }
 
 type WriteDecision = 'write' | 'unchanged' | 'cooling-down';
@@ -706,23 +746,18 @@ type WriteDecision = 'write' | 'unchanged' | 'cooling-down';
  *   4. same cell, unchanged   -> skip. The common case: the client re-registers
  *                                on cold launch, on every foreground and after
  *                                every poll, and almost all of it is a repeat.
- *   5. same cell, changed,
- *      inside the cooldown    -> defer. Only settings can reach here
- *                                (leadTimeMinutes, rainStartEnabled,
- *                                rainEndEnabled), and it self-heals on the next
- *                                registration, which the client issues after
- *                                every successful poll.
+ *   5. alert enabled -> off   -> write immediately. An explicit opt-out must
+ *                                never wait behind an abuse cooldown.
+ *   6. same cell, changed,
+ *      inside the cooldown    -> return an explicit 202 deferral. The client
+ *                                retries after the remaining cooldown instead
+ *                                of mistaking stale settings for success.
  *
  * A record with no `renewedAt` counts as refresh-due: it predates the field, so
  * there is no evidence of when it was last written and guessing young would risk
  * the very expiry step 2 exists to prevent.
  *
- * If the adversarial rewrite drain ever shows up in real traffic, the fix that
- * was deliberately NOT taken here is an explicit deferral protocol — 202 with
- * `deferred: true` and a `retryAfterSeconds`, plus a client that records a
- * location only once the server confirms it stored it. That keeps a deferred
- * move retryable instead of silently dropped, which is what made deferring a
- * cell change unacceptable in the first place.
+ * Cell changes remain immediate and are never part of the deferral protocol.
  */
 function writeDecision(
   existing: DeviceRegistration,
@@ -750,13 +785,29 @@ function writeDecision(
     return 'write';
   }
 
+  const disablesAlert =
+    ((existing.rainStartEnabled ?? true) && !settings.rainStartEnabled) ||
+    ((existing.rainEndEnabled ?? true) && !settings.rainEndEnabled);
+  if (disablesAlert) return 'write';
+
   const changed =
     existing.leadTimeMinutes !== settings.leadTimeMinutes ||
     (existing.rainStartEnabled ?? true) !== settings.rainStartEnabled ||
-    (existing.rainEndEnabled ?? true) !== settings.rainEndEnabled;
+    (existing.rainEndEnabled ?? true) !== settings.rainEndEnabled ||
+    (existing.quietHoursEnabled ?? false) !== settings.quietHoursEnabled ||
+    (existing.quietHoursStartMinutes ?? 22 * 60) !== settings.quietHoursStartMinutes ||
+    (existing.quietHoursEndMinutes ?? 7 * 60) !== settings.quietHoursEndMinutes ||
+    (existing.timeZoneIdentifier ?? 'UTC') !== settings.timeZoneIdentifier;
   if (!changed) return 'unchanged';
 
   return sinceWrite >= DEVICE_REWRITE_COOLDOWN_SECONDS * 1000 ? 'write' : 'cooling-down';
+}
+
+function rewriteCooldownRemainingSeconds(existing: DeviceRegistration): number {
+  const renewedAt = existing.renewedAt ? Date.parse(existing.renewedAt) : Number.NaN;
+  if (Number.isNaN(renewedAt)) return 0;
+  const elapsed = Math.max(0, Date.now() - renewedAt);
+  return Math.max(1, Math.ceil(DEVICE_REWRITE_COOLDOWN_SECONDS - elapsed / 1000));
 }
 
 // Every write of a `device:` record goes through here so none can silently
@@ -1040,6 +1091,10 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     leadTimeMinutes?: unknown;
     rainStartEnabled?: unknown;
     rainEndEnabled?: unknown;
+    quietHoursEnabled?: unknown;
+    quietHoursStartMinutes?: unknown;
+    quietHoursEndMinutes?: unknown;
+    timeZoneIdentifier?: unknown;
   }>(request);
   if (!body) return json({ error: 'Malformed JSON body' }, 400);
 
@@ -1048,6 +1103,18 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   }
   if (!isValidLatitude(body.lat) || !isValidLongitude(body.lon)) {
     return json({ error: 'Invalid or missing lat/lon' }, 400);
+  }
+  const quietHoursEnabled = asBoolean(body.quietHoursEnabled, false);
+  if (
+    (body.quietHoursStartMinutes !== undefined && !isValidMinuteOfDay(body.quietHoursStartMinutes)) ||
+    (body.quietHoursEndMinutes !== undefined && !isValidMinuteOfDay(body.quietHoursEndMinutes)) ||
+    (body.timeZoneIdentifier !== undefined && !isValidTimeZoneIdentifier(body.timeZoneIdentifier)) ||
+    (quietHoursEnabled &&
+      (!isValidMinuteOfDay(body.quietHoursStartMinutes) ||
+        !isValidMinuteOfDay(body.quietHoursEndMinutes) ||
+        !isValidTimeZoneIdentifier(body.timeZoneIdentifier)))
+  ) {
+    return json({ error: 'Invalid quiet-hours policy' }, 400);
   }
 
   const gridKey = toGridKey(body.lat, body.lon);
@@ -1086,6 +1153,16 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     leadTimeMinutes: clampLeadTimeMinutes(body.leadTimeMinutes),
     rainStartEnabled: asBoolean(body.rainStartEnabled, true),
     rainEndEnabled: asBoolean(body.rainEndEnabled, true),
+    quietHoursEnabled,
+    quietHoursStartMinutes: isValidMinuteOfDay(body.quietHoursStartMinutes)
+      ? body.quietHoursStartMinutes
+      : 22 * 60,
+    quietHoursEndMinutes: isValidMinuteOfDay(body.quietHoursEndMinutes)
+      ? body.quietHoursEndMinutes
+      : 7 * 60,
+    timeZoneIdentifier: isValidTimeZoneIdentifier(body.timeZoneIdentifier)
+      ? body.timeZoneIdentifier
+      : 'UTC',
   };
 
   // Opening a *new* grid cell is the expensive act: it adds ~4,383 WeatherKit
@@ -1169,6 +1246,14 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
           ? `[Register] Unchanged and still fresh, skipped the write for grid ${gridKey}`
           : `[Register] Same-cell settings change cooling down, kept grid ${gridKey} for now`
       );
+      if (decision === 'cooling-down') {
+        const retryAfterSeconds = rewriteCooldownRemainingSeconds(existing);
+        return json(
+          { ok: false, deferred: true, retryAfterSeconds, gridKey },
+          202,
+          { 'Retry-After': String(retryAfterSeconds) }
+        );
+      }
       return json({ ok: true, gridKey });
     }
   }

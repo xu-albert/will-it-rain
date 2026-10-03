@@ -9,7 +9,8 @@
 // stubbed APNs, so the arithmetic inside the tick is what is under test.
 
 import { describe, expect, it, beforeAll, beforeEach, vi } from 'vitest';
-import worker from '../src/index';
+import worker, { isInQuietHours, isWet } from '../src/index';
+import { DeviceRegistration } from '../src/types';
 import { DEVICE_RECORD_TTL_SECONDS } from '../src/abuse';
 import { Harness, coordsForCell, fakeToken, generateSigningKey, makeHarness } from './harness';
 
@@ -60,6 +61,10 @@ interface Planted {
   leadTimeMinutes?: number;
   rainStartEnabled?: boolean;
   rainEndEnabled?: boolean;
+  quietHoursEnabled?: boolean;
+  quietHoursStartMinutes?: number;
+  quietHoursEndMinutes?: number;
+  timeZoneIdentifier?: string;
 }
 
 /** Puts every device straight into KV, all in the same grid cell. */
@@ -75,6 +80,10 @@ async function plant(harness: Harness, devices: Planted[], now: number): Promise
         leadTimeMinutes: d.leadTimeMinutes ?? 20,
         rainStartEnabled: d.rainStartEnabled,
         rainEndEnabled: d.rainEndEnabled,
+        quietHoursEnabled: d.quietHoursEnabled,
+        quietHoursStartMinutes: d.quietHoursStartMinutes,
+        quietHoursEndMinutes: d.quietHoursEndMinutes,
+        timeZoneIdentifier: d.timeZoneIdentifier,
         registeredAt: new Date(now - d.n * 1000).toISOString(),
         renewedAt: new Date(now).toISOString(),
       }),
@@ -152,6 +161,79 @@ async function tick(
 function alerted(alerts: AlertPush[]): string[] {
   return alerts.map((a) => a.token).sort();
 }
+
+describe('shared alert contract', () => {
+  it.each([
+    { chance: 0.5, intensity: 0, wet: true },
+    { chance: 0.499, intensity: 0, wet: false },
+    { chance: 0.4, intensity: 0.1, wet: true },
+    { chance: 0.4, intensity: 0.099, wet: false },
+    { chance: 0.2, intensity: 1, wet: true },
+    { chance: 0.6, intensity: 0, wet: true },
+  ])('classifies chance=$chance intensity=$intensity as wet=$wet', ({ chance, intensity, wet }) => {
+    expect(isWet({ precipitationChance: chance, precipitationIntensity: intensity })).toBe(wet);
+  });
+
+  const device = (overrides: Partial<DeviceRegistration>): DeviceRegistration => ({
+    token: fakeToken(1),
+    lat: 0,
+    lon: 0,
+    leadTimeMinutes: 20,
+    registeredAt: '2026-01-01T00:00:00.000Z',
+    quietHoursEnabled: true,
+    quietHoursStartMinutes: 22 * 60,
+    quietHoursEndMinutes: 7 * 60,
+    timeZoneIdentifier: 'America/Los_Angeles',
+    ...overrides,
+  });
+
+  it('handles overnight and same-day windows at inclusive/exclusive boundaries', () => {
+    const overnight = device({});
+    expect(isInQuietHours(overnight, new Date('2026-01-01T06:00:00.000Z'))).toBe(true); // 22:00
+    expect(isInQuietHours(overnight, new Date('2026-01-01T15:00:00.000Z'))).toBe(false); // 07:00
+
+    const daytime = device({ quietHoursStartMinutes: 9 * 60, quietHoursEndMinutes: 17 * 60 });
+    expect(isInQuietHours(daytime, new Date('2026-01-01T17:00:00.000Z'))).toBe(true); // 09:00
+    expect(isInQuietHours(daytime, new Date('2026-01-02T01:00:00.000Z'))).toBe(false); // 17:00
+  });
+
+  it('uses IANA timezone rules across DST and timezone changes', () => {
+    const losAngeles = device({ quietHoursStartMinutes: 22 * 60, quietHoursEndMinutes: 3 * 60 });
+    expect(isInQuietHours(losAngeles, new Date('2026-03-08T09:30:00.000Z'))).toBe(true); // 01:30 PST
+    expect(isInQuietHours(losAngeles, new Date('2026-03-08T10:30:00.000Z'))).toBe(false); // 03:30 PDT
+
+    const morning = { quietHoursStartMinutes: 8 * 60, quietHoursEndMinutes: 9 * 60 };
+    const instant = new Date('2026-01-01T16:30:00.000Z');
+    expect(isInQuietHours(device({ ...morning, timeZoneIdentifier: 'America/Los_Angeles' }), instant)).toBe(true);
+    expect(isInQuietHours(device({ ...morning, timeZoneIdentifier: 'America/New_York' }), instant)).toBe(false);
+  });
+
+  it('fails closed when an enabled quiet-hours record is incomplete', () => {
+    expect(isInQuietHours(device({ timeZoneIdentifier: undefined }), new Date())).toBe(true);
+  });
+
+  it('suppresses both rain-start and rain-end alert pushes while quiet', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T12:00:00.000Z'));
+      const policy = {
+        quietHoursEnabled: true,
+        quietHoursStartMinutes: 11 * 60,
+        quietHoursEndMinutes: 13 * 60,
+        timeZoneIdentifier: 'UTC',
+      };
+      const starting = makeHarness({ signingKey });
+      await plant(starting, [{ n: 1, ...policy }], Date.now());
+      expect((await tick(starting, (t) => forecast(t, (i) => i >= 10))).alerts).toEqual([]);
+
+      const ending = makeHarness({ signingKey });
+      await plant(ending, [{ n: 2, ...policy }], Date.now());
+      expect((await tick(ending, (t) => forecast(t, (i) => i < 20))).alerts).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe('rain-start alerts', () => {
   it('reach a device only once the rain is inside its own lead time', async () => {
@@ -615,28 +697,23 @@ describe('Live Activity updates where WeatherKit has no minute forecast', () => 
 });
 
 describe('what counts as a wet minute', () => {
-  // The cron's own threshold, not WeatherKit's: chance strictly above 30% AND
-  // some predicted intensity. Either half alone is not rain.
+  // This is the same OR predicate used by iOS: an actual amount or at least a
+  // 50% chance is rain. These exercise it through the complete cron path.
   const rainAt10 = (options: { chance: number; intensity: number }) => (t: number) =>
     forecast(t, (i) => i >= 10, options);
 
-  it('needs the chance to be above 30%, not at it', async () => {
+  it('accepts a predicted amount even when chance is low', async () => {
     const harness = makeHarness({ signingKey });
     await plant(harness, [{ n: 1, leadTimeMinutes: 30 }], Date.now());
-    const at = await tick(harness, rainAt10({ chance: 0.3, intensity: 2 }));
-    expect(at.alerts).toEqual([]);
-
-    const above = makeHarness({ signingKey });
-    await plant(above, [{ n: 1, leadTimeMinutes: 30 }], Date.now());
-    const over = await tick(above, rainAt10({ chance: 0.31, intensity: 2 }));
-    expect(alerted(over.alerts)).toEqual([fakeToken(1)]);
+    const { alerts } = await tick(harness, rainAt10({ chance: 0.2, intensity: 0.1 }));
+    expect(alerted(alerts)).toEqual([fakeToken(1)]);
   });
 
-  it('needs some predicted intensity, however likely the rain', async () => {
+  it('accepts likely rain even when the predicted amount is zero', async () => {
     const harness = makeHarness({ signingKey });
     await plant(harness, [{ n: 1, leadTimeMinutes: 30 }], Date.now());
     const { alerts } = await tick(harness, rainAt10({ chance: 0.95, intensity: 0 }));
-    expect(alerts).toEqual([]);
+    expect(alerted(alerts)).toEqual([fakeToken(1)]);
   });
 
   it('sends nothing at all for a dry hour', async () => {

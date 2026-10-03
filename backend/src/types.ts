@@ -24,6 +24,10 @@ export interface DeviceRegistration {
   renewedAt?: string;
   rainStartEnabled?: boolean;
   rainEndEnabled?: boolean;
+  quietHoursEnabled?: boolean;
+  quietHoursStartMinutes?: number;
+  quietHoursEndMinutes?: number;
+  timeZoneIdentifier?: string;
 }
 
 /**

@@ -164,4 +164,27 @@ final class NotificationSettingsTests: XCTestCase {
         settings.quietHoursEnabled = false
         XCTAssertFalse(settings.isInQuietHours(at: calendar.date(bySettingHour: 23, minute: 0, second: 0, of: Date())!))
     }
+
+    func testRemoteAlertSettingsCarryEveryServerPolicyField() {
+        var calendar = Calendar(identifier: .gregorian)
+        let timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        calendar.timeZone = timeZone
+        let settings = NotificationSettings(defaults: defaults)
+        settings.leadTime = 45
+        settings.rainStartEnabled = false
+        settings.rainEndEnabled = true
+        settings.quietHoursEnabled = true
+        settings.quietHoursStart = calendar.date(from: DateComponents(year: 2026, month: 1, day: 1, hour: 21, minute: 30))!
+        settings.quietHoursEnd = calendar.date(from: DateComponents(year: 2026, month: 1, day: 2, hour: 6, minute: 15))!
+
+        let remote = RemoteAlertSettings(settings: settings, calendar: calendar, timeZone: timeZone)
+
+        XCTAssertEqual(remote.leadTimeMinutes, 45)
+        XCTAssertFalse(remote.rainStartEnabled)
+        XCTAssertTrue(remote.rainEndEnabled)
+        XCTAssertTrue(remote.quietHoursEnabled)
+        XCTAssertEqual(remote.quietHoursStartMinutes, 21 * 60 + 30)
+        XCTAssertEqual(remote.quietHoursEndMinutes, 6 * 60 + 15)
+        XCTAssertEqual(remote.timeZoneIdentifier, "America/Los_Angeles")
+    }
 }

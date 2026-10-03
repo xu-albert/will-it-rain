@@ -93,6 +93,17 @@ struct ContentView: View {
                 Task { await renewPushRegistration() }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name.NSSystemTimeZoneDidChange)) { _ in
+            Task { await renewPushRegistration() }
+        }
+        .task(id: settings.remoteAlertSettings) {
+            // Time pickers can publish several intermediate values. Cancellation
+            // from task(id:) turns those into one registration carrying the final
+            // policy instead of a burst of stale writes.
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled else { return }
+            await renewPushRegistration()
+        }
         .sheet(isPresented: $showSettings) {
             SettingsView(settings: settings)
                 .presentationDetents([.medium])
