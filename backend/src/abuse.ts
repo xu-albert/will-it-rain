@@ -168,10 +168,10 @@ export const MAX_DEVICE_RECORDS = MAX_GRID_CELLS * MAX_DEVICES_PER_CELL;
 // themselves, and a busy household or carrier-NAT block behind one egress IP
 // reaches it sooner. The limit is kept anyway because the consequence is benign
 // and self-healing — the 429 is raised by guardMutation before any stored state
-// is touched, so it changes nothing, and the next foreground simply retries.
-// The one case that is not self-healing is a brand-new user whose very first
-// registration is refused: they get no alerts until they open the app again,
-// with no UI signal, because surfacing throttle state was deliberately left out.
+// is touched, so it changes nothing, and the app persists the refused
+// registration and replays it once `retryAfterSeconds` has passed, from a
+// background refresh if it has been suspended by then (PushRegistrationService).
+// That covers a brand-new user whose very first registration is refused, too.
 //
 // Cutting the observed attack (250 registrations in 0.47s from one client) off
 // after the first 20 is what this number is for.

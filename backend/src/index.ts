@@ -17,6 +17,7 @@ import {
   APNsError,
   sendRainAlert,
   sendRainEndAlert,
+  sendRainResumeAlert,
   sendLiveActivityUpdate,
   encodeActivityDate,
   intensityFromMmPerHr,
@@ -424,6 +425,19 @@ export default {
         const rainStart = rainingNow ? undefined : minutes.find(isWet);
         // Rain END: if it's raining now, the first upcoming dry minute (rain tapering off).
         const rainEnd = rainingNow ? minutes.find((m) => !isWet(m)) : undefined;
+        // Rain RESUMING: the break rainEnd opens begins before the next tick, and
+        // more rain follows it inside the hour — the server's half of the app's
+        // "More rain coming" alert. It is announced as the break opens because
+        // the next tick's start alert is exactly what the 30-minute floor
+        // swallows after a short shower.
+        const afterBreak = rainEnd ? minutes.slice(minutes.indexOf(rainEnd)).find(isWet) : undefined;
+        const rainResume =
+          rainEnd &&
+          afterBreak &&
+          Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000) <= CRON_PERIOD_MINUTES &&
+          new Date(afterBreak.startTime).getTime() > now
+            ? afterBreak
+            : undefined;
 
         if (!rainStart && !rainEnd) return;
 
@@ -448,25 +462,37 @@ export default {
         // A record with no onset in it was written before that keying and stands
         // for whatever rain the device was last told about, so it goes on
         // suppressing until it expires rather than repeating an alert on deploy.
+        //
+        // A resume shares the start record, so whichever announces an onset
+        // first, the other stays silent for it. The one difference: to a resume,
+        // a record whose onset has already begun is spent — that is the rain now
+        // breaking, and the rain after the break is a different event however
+        // soon after the last alert it comes.
         const notifyOnce = async (
           device: DeviceRegistration,
-          kind: 'start' | 'end',
+          kind: 'start' | 'resume' | 'end',
           onsetTime: string | undefined,
           send: () => Promise<void>
         ) => {
           const onsetMinute =
             onsetTime === undefined ? undefined : Math.round(new Date(onsetTime).getTime() / 60_000);
-          const metaKey = `notified-${kind}:${device.token}`;
+          const metaKey = `notified-${kind === 'end' ? 'end' : 'start'}:${device.token}`;
           const recorded = await env.DEVICES.get(metaKey);
           if (recorded !== null) {
             const [notifiedAt, notifiedOnset] = recorded.split(':');
-            if (now - parseInt(notifiedAt) <= ALERT_FLOOR_MINUTES * 60 * 1000) return;
-            if (
-              onsetMinute !== undefined &&
-              (notifiedOnset === undefined ||
-                Math.abs(parseInt(notifiedOnset) - onsetMinute) <= SAME_ONSET_DRIFT_MINUTES)
-            ) {
-              return;
+            const spent =
+              kind === 'resume' &&
+              notifiedOnset !== undefined &&
+              parseInt(notifiedOnset) * 60_000 <= now;
+            if (!spent) {
+              if (now - parseInt(notifiedAt) <= ALERT_FLOOR_MINUTES * 60 * 1000) return;
+              if (
+                onsetMinute !== undefined &&
+                (notifiedOnset === undefined ||
+                  Math.abs(parseInt(notifiedOnset) - onsetMinute) <= SAME_ONSET_DRIFT_MINUTES)
+              ) {
+                return;
+              }
             }
           }
           // Claimed after the dedup check, so a push we were never going to
@@ -474,7 +500,13 @@ export default {
           if (!budget.spend()) return;
           try {
             await send();
-            // The record has to outlive the span it suppresses.
+            // The record has to outlive the span it suppresses. A resume can
+            // announce rain further out than the lead time, so its span runs
+            // to its own onset.
+            const spanMinutes =
+              kind === 'resume' && onsetMinute !== undefined
+                ? onsetMinute - Math.floor(now / 60_000)
+                : device.leadTimeMinutes;
             await env.DEVICES.put(
               metaKey,
               onsetMinute === undefined ? now.toString() : `${now}:${onsetMinute}`,
@@ -482,7 +514,7 @@ export default {
                 expirationTtl:
                   onsetMinute === undefined
                     ? 3600
-                    : Math.max(3600, (device.leadTimeMinutes + SAME_ONSET_DRIFT_MINUTES) * 60),
+                    : Math.max(3600, (spanMinutes + SAME_ONSET_DRIFT_MINUTES) * 60),
               }
             );
           } catch (err) {
@@ -555,9 +587,21 @@ export default {
               }
             }
           }
+          // A resume is a start-kind alert, so it follows the rain-start opt-out.
+          const resume = device.rainStartEnabled !== false ? rainResume : undefined;
+          if (resume && !alertsQuiet) {
+            const minutesUntilResume = Math.round((new Date(resume.startTime).getTime() - now) / 60000);
+            await notifyOnce(device, 'resume', resume.startTime, () =>
+              sendRainResumeAlert(device.token, minutesUntilResume, env)
+            );
+            console.log(`[Cron] Rain-resume grid ${grid.gridKey}, in ${minutesUntilResume}m`);
+          }
           if (rainEnd && device.rainEndEnabled !== false) {
             const minutesUntilEnd = Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000);
-            if (!alertsQuiet && minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
+            // The resume above speaks for this break. Saying "Rain ending soon"
+            // as well would read as the end of it, and a second `notified-*`
+            // read would break the one-per-device count in abuse.ts.
+            if (!resume && !alertsQuiet && minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
               await notifyOnce(device, 'end', undefined, () =>
                 sendRainEndAlert(device.token, env, minutesUntilEnd)
               );

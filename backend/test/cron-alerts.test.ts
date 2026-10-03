@@ -640,6 +640,155 @@ describe('rain-end alerts', () => {
   });
 });
 
+describe('rain-resume alerts', () => {
+  // The server's half of the app's "More rain coming": a break in the rain with
+  // more behind it inside the hour. Registered devices get no local alerts at
+  // all, so without this a short break went unannounced — the next start alert
+  // fell inside the 30-minute floor of the one before it.
+
+  /**
+   * A minute series that is wet inside each [from, to) window, given as UTC
+   * clock times, whose first minute lags the tick by `lagMinutes`.
+   */
+  const showers =
+    (windows: Array<[string, string]>, lagMinutes = 0) =>
+    (t: number) => {
+      const first = t - lagMinutes * 60_000;
+      return forecast(first, (i) =>
+        windows.some(
+          ([from, to]) =>
+            first + i * 60_000 >= Date.parse(`2026-01-01T${from}:00.000Z`) &&
+            first + i * 60_000 < Date.parse(`2026-01-01T${to}:00.000Z`)
+        )
+      );
+    };
+  const at = (clock: string) => vi.setSystemTime(new Date(`2026-01-01T${clock}:00.000Z`));
+
+  it('announce rain coming back after a short break, inside the floor of the start alert', async () => {
+    vi.useFakeTimers();
+    try {
+      at('12:00');
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 20 }], Date.now());
+      const weather = showers([['12:02', '12:12'], ['12:25', '12:45']]);
+
+      const first = await tick(harness, weather);
+      expect(first.alerts.map((a) => a.title)).toEqual(['Rain in a few minutes']);
+
+      // Ten minutes after that alert: it is raining, the break opens before the
+      // next tick, and the rain behind it is announced in place of the end.
+      at('12:10');
+      const breaking = await tick(harness, weather);
+      expect(breaking.alerts).toEqual([{ token: fakeToken(1), title: 'More rain coming' }]);
+
+      // The next tick sees the same rain as an ordinary start: already told.
+      at('12:20');
+      expect((await tick(harness, weather)).alerts).toEqual([]);
+
+      // Once it is falling again, the last break of the hour is an ordinary end.
+      at('12:30');
+      expect((await tick(harness, weather)).alerts.map((a) => a.title)).toEqual(['Rain ending soon']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('wait for a break that opens before the next tick, ending as usual until then', async () => {
+    vi.useFakeTimers();
+    try {
+      at('12:00');
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 20 }], Date.now());
+      const weather = showers([['11:30', '12:20'], ['12:35', '13:30']]);
+
+      const early = await tick(harness, weather);
+      expect(early.alerts.map((a) => a.title)).toEqual(['Rain ending soon']);
+
+      at('12:10');
+      const opening = await tick(harness, weather);
+      expect(opening.alerts.map((a) => a.title)).toEqual(['More rain coming']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('are sent once per break, however many ticks still see it', async () => {
+    // The minute feed lags the tick, so the tick after a break opens can still
+    // start on the wet side of it and read the same break a second time.
+    vi.useFakeTimers();
+    try {
+      at('12:10');
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 10 }], Date.now());
+      const windows: Array<[string, string]> = [['12:00', '12:15'], ['12:30', '13:00']];
+
+      const first = await tick(harness, showers(windows));
+      expect(first.alerts.map((a) => a.title)).toEqual(['More rain coming']);
+
+      at('12:20');
+      const again = await tick(harness, showers(windows, 8));
+      expect(again.alerts).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('are not followed by a start alert for the same rain, even when it is due past an hour out', async () => {
+    // A resume can announce rain further out than the lead time, so its dedup
+    // record has to last until that rain arrives — plus the drift one onset
+    // is allowed — rather than the hour a start alert's would.
+    vi.useFakeTimers();
+    try {
+      at('12:10');
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 10 }], Date.now());
+
+      const resumed = await tick(harness, showers([['12:00', '12:15'], ['13:08', '14:00']]));
+      expect(resumed.alerts.map((a) => a.title)).toEqual(['More rain coming']);
+
+      // The onset has drifted 12 minutes later by the time it is inside the
+      // start window, and the alert that announced it is an hour old.
+      at('13:10');
+      const due = await tick(harness, showers([['13:20', '14:00']]));
+      expect(due.alerts).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('respect quiet hours and the rain-start opt-out, which leaves the end alert in place', async () => {
+    vi.useFakeTimers();
+    try {
+      at('12:10');
+      const harness = makeHarness({ signingKey });
+      await plant(
+        harness,
+        [
+          { n: 1 },
+          { n: 2, rainStartEnabled: false },
+          {
+            n: 3,
+            quietHoursEnabled: true,
+            quietHoursStartMinutes: 12 * 60,
+            quietHoursEndMinutes: 13 * 60,
+            timeZoneIdentifier: 'UTC',
+          },
+          { n: 4, rainStartEnabled: false, rainEndEnabled: false },
+        ],
+        Date.now()
+      );
+
+      const { alerts } = await tick(harness, showers([['12:00', '12:12'], ['12:25', '12:45']]));
+      expect(alerts.sort((a, b) => a.token.localeCompare(b.token))).toEqual([
+        { token: fakeToken(1), title: 'More rain coming' },
+        { token: fakeToken(2), title: 'Rain ending soon' },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('Live Activity updates where WeatherKit has no minute forecast', () => {
   it('end the activity at the tick after a wet hour ends', async () => {
     // Hour 10 wet, hour 11 dry, one device with a Live Activity. The terminal

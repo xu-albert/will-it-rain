@@ -100,6 +100,16 @@ export async function sendRainAlert(
   await sendNotification(deviceToken, { title, body }, 1, env);
 }
 
+// The server's copy of the app's "More rain coming" alert, worded the same.
+export async function sendRainResumeAlert(
+  deviceToken: string,
+  minutesUntilRain: number,
+  env: Env
+): Promise<void> {
+  const body = `Rain returns in about ${Math.max(1, minutesUntilRain)} min.`;
+  await sendNotification(deviceToken, { title: 'More rain coming', body }, 1, env);
+}
+
 export async function sendRainEndAlert(
   deviceToken: string,
   env: Env,

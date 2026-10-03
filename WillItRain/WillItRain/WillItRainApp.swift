@@ -28,7 +28,7 @@ struct WillItRainApp: App {
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .background {
-                scheduleBackgroundRefresh(after: 15 * 60)
+                BackgroundRefresh.schedule(after: 15 * 60)
             }
         }
     }
@@ -37,7 +37,7 @@ struct WillItRainApp: App {
 
     private func registerBackgroundTask() {
         BGTaskScheduler.shared.register(
-            forTaskWithIdentifier: "com.willitrain.refresh",
+            forTaskWithIdentifier: BackgroundRefresh.identifier,
             using: nil
         ) { task in
             guard let refreshTask = task as? BGAppRefreshTask else { return }
@@ -45,20 +45,10 @@ struct WillItRainApp: App {
         }
     }
 
-    private func scheduleBackgroundRefresh(after interval: TimeInterval) {
-        let clamped = min(max(interval, 2 * 60), 60 * 60)
-        let request = BGAppRefreshTaskRequest(identifier: "com.willitrain.refresh")
-        request.earliestBeginDate = Date(timeIntervalSinceNow: clamped)
-        do {
-            try BGTaskScheduler.shared.submit(request)
-            print("[Background] Scheduled refresh in \(Int(clamped))s")
-        } catch {
-            print("Background task scheduling failed: \(error)")
-        }
-    }
-
     private func handleBackgroundRefresh(_ task: BGAppRefreshTask) {
         let operation = Task {
+            // Needs no location fix, so it runs even when the weather work below fails.
+            await PushRegistrationService.shared.replayPendingRegistration()
             do {
                 let locationService = LocationService()
                 let weatherService = WeatherService()
@@ -71,10 +61,10 @@ struct WillItRainApp: App {
                 LiveActivityService.shared.sync(forecast: forecast, settings: settings)
 
                 let nextInterval = forecast.nextPollInterval(leadTimeMinutes: settings.leadTime)
-                scheduleBackgroundRefresh(after: nextInterval)
+                BackgroundRefresh.schedule(after: nextInterval)
                 task.setTaskCompleted(success: true)
             } catch {
-                scheduleBackgroundRefresh(after: 15 * 60)
+                BackgroundRefresh.schedule(after: 15 * 60)
                 task.setTaskCompleted(success: false)
             }
         }
