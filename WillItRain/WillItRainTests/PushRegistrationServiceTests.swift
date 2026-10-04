@@ -4,7 +4,8 @@ import XCTest
 
 final class PushRegistrationServiceTests: XCTestCase {
     private final class URLProtocolStub: URLProtocol {
-        static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+        /// Returning nil leaves the request unanswered, as when iOS suspends the app mid-request.
+        static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data)?)?
 
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -15,9 +16,9 @@ final class PushRegistrationServiceTests: XCTestCase {
                 return
             }
             do {
-                let (response, data) = try handler(request)
-                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-                client?.urlProtocol(self, didLoad: data)
+                guard let reply = try handler(request) else { return }
+                client?.urlProtocol(self, didReceive: reply.0, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: reply.1)
                 client?.urlProtocolDidFinishLoading(self)
             } catch {
                 client?.urlProtocol(self, didFailWithError: error)
@@ -156,8 +157,13 @@ final class PushRegistrationServiceTests: XCTestCase {
 
     private static let t0 = Date(timeIntervalSince1970: 1_800_000_000)
 
-    /// Answers each registration with the next canned response and records what was sent.
-    private func respond(with responses: [(status: Int, body: String)]) -> () -> [RegistrationPayload] {
+    /// Answers each registration with the next canned response and records what
+    /// was sent. Status 0 is a transport failure; a negative status is never
+    /// answered at all, and fulfils `unanswered` once the request is out.
+    private func respond(
+        with responses: [(status: Int, body: String)],
+        unanswered: XCTestExpectation? = nil
+    ) -> () -> [RegistrationPayload] {
         var remaining = responses
         var sent: [RegistrationPayload] = []
         URLProtocolStub.handler = { request in
@@ -168,6 +174,10 @@ final class PushRegistrationServiceTests: XCTestCase {
             guard !remaining.isEmpty else { throw URLError(.notConnectedToInternet) }
             let next = remaining.removeFirst()
             if next.status == 0 { throw URLError(.notConnectedToInternet) }
+            if next.status < 0 {
+                unanswered?.fulfill()
+                return nil
+            }
             return (
                 HTTPURLResponse(url: request.url!, statusCode: next.status, httpVersion: nil, headerFields: nil)!,
                 Data(next.body.utf8)
@@ -178,7 +188,7 @@ final class PushRegistrationServiceTests: XCTestCase {
 
     private func makeService(
         now: @escaping () -> Date,
-        scheduleReplay: @escaping (Date) -> Void = { _ in }
+        scheduleReplay: @escaping @MainActor (Date) -> Void = { _ in }
     ) -> PushRegistrationService {
         PushRegistrationService(
             baseURL: URL(string: "https://worker.test")!,
@@ -301,5 +311,77 @@ final class PushRegistrationServiceTests: XCTestCase {
         let nothingWaiting = await service.replayPendingRegistration()
         XCTAssertNil(nothingWaiting)
         XCTAssertEqual(sent().map(\.leadTimeMinutes), [30, 45])
+    }
+
+    func testAFirstAttemptThatIsNeverAnsweredIsReplayedByTheNextProcess() async {
+        let unanswered = expectation(description: "registration sent and never answered")
+        let sent = respond(with: [(-1, ""), (200, "{\"ok\":true}")], unanswered: unanswered)
+        let suspended = makeService(now: { Self.t0 })
+        suspended.storeToken(Data(repeating: 0xab, count: 32))
+
+        let inFlight = Task {
+            await suspended.registerLocation(lat: 37.7, lon: -122.4, leadTimeMinutes: 30, rainStartEnabled: false)
+        }
+        await fulfillment(of: [unanswered], timeout: 2)
+
+        // iOS suspends the app with that request outstanding. The next launch or
+        // background refresh is a new process that knows only what was persisted.
+        let relaunched = makeService(now: { Self.t0 })
+        XCTAssertEqual(relaunched.pendingRetryDate, Self.t0)
+        let replayed = await relaunched.replayPendingRegistration()
+
+        XCTAssertEqual(replayed, .registered)
+        XCTAssertEqual(sent().map(\.rainStartEnabled), [false, false])
+        XCTAssertNil(relaunched.pendingRetryDate)
+        inFlight.cancel()
+    }
+
+    func testTheLastOfSeveralQuickEditsSurvivesLockingThePhoneMidRequest() async {
+        var now = Self.t0
+        var replaysScheduled: [Date] = []
+        let lockedMidRequest = expectation(description: "last edit sent and never answered")
+        let sent = respond(
+            with: [
+                (200, "{\"ok\":true}"),
+                (202, "{\"ok\":false,\"deferred\":true,\"retryAfterSeconds\":290}"),
+                (-1, ""),
+                (200, "{\"ok\":true}"),
+            ],
+            unanswered: lockedMidRequest
+        )
+        let foreground = makeService(now: { now }, scheduleReplay: { replaysScheduled.append($0) })
+        foreground.storeToken(Data(repeating: 0xab, count: 32))
+
+        // Quiet hours turned on, written with the default window; then its start
+        // time, inside the Worker's rewrite cooldown; then its end time, and the
+        // phone is locked before that last answer comes back.
+        _ = await foreground.registerLocation(lat: 37.7, lon: -122.4, leadTimeMinutes: 30, quietHoursEnabled: true)
+        now = Self.t0.addingTimeInterval(10)
+        _ = await foreground.registerLocation(
+            lat: 37.7, lon: -122.4, leadTimeMinutes: 30,
+            quietHoursEnabled: true, quietHoursStartMinutes: 23 * 60
+        )
+        XCTAssertEqual(replaysScheduled, [Self.t0.addingTimeInterval(300)])
+        now = Self.t0.addingTimeInterval(15)
+        let lastEdit = Task {
+            await foreground.registerLocation(
+                lat: 37.7, lon: -122.4, leadTimeMinutes: 30,
+                quietHoursEnabled: true, quietHoursStartMinutes: 23 * 60, quietHoursEndMinutes: 6 * 60
+            )
+        }
+        await fulfillment(of: [lockedMidRequest], timeout: 2)
+
+        // The background refresh asked for at the Worker's retry time runs in a
+        // new process.
+        now = Self.t0.addingTimeInterval(300)
+        let background = makeService(now: { now })
+        let replayed = await background.replayPendingRegistration()
+
+        XCTAssertEqual(replayed, .registered)
+        XCTAssertEqual(sent().count, 4)
+        XCTAssertEqual(sent().last, sent()[2], "The replay carries the last edit, not the deferred one before it")
+        XCTAssertEqual(sent().last?.quietHoursEndMinutes, 6 * 60)
+        XCTAssertNil(background.pendingRetryDate)
+        lastEdit.cancel()
     }
 }

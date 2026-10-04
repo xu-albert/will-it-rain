@@ -20,7 +20,7 @@ final class PushRegistrationService {
     private let defaults: UserDefaults
     private let session: URLSession
     private let now: () -> Date
-    private let scheduleReplay: (Date) -> Void
+    private let scheduleReplay: @MainActor (Date) -> Void
     private let log: (String) -> Void
     private var retryTask: Task<Void, Never>?
     private var registrationChain: Task<Void, Never>?
@@ -30,7 +30,7 @@ final class PushRegistrationService {
         defaults: UserDefaults = .standard,
         session: URLSession = .shared,
         now: @escaping () -> Date = Date.init,
-        scheduleReplay: @escaping (Date) -> Void = { BackgroundRefresh.schedule(at: $0) },
+        scheduleReplay: @escaping @MainActor (Date) -> Void = { BackgroundRefresh.schedule(at: $0) },
         log: @escaping (String) -> Void = { print($0) }
     ) {
         self.baseURL = baseURL
@@ -67,7 +67,7 @@ final class PushRegistrationService {
         defaults.bool(forKey: Self.remoteRegistrationActiveKey)
     }
 
-    /// When the registration the Worker last deferred or throttled may be sent
+    /// When the registration the Worker has not yet confirmed may be sent
     /// again, if one is waiting.
     var pendingRetryDate: Date? {
         pendingRegistration?.retryAt
@@ -160,6 +160,7 @@ final class PushRegistrationService {
             quietHoursEndMinutes: remoteSettings.quietHoursEndMinutes,
             timeZoneIdentifier: remoteSettings.timeZoneIdentifier
         )
+        savePendingRegistration(payload, retryAt: pendingRegistration?.retryAt ?? now())
         return await serialized { [self] in await send(payload) }
     }
 
@@ -189,7 +190,9 @@ final class PushRegistrationService {
             let http = response as? HTTPURLResponse
             if http?.statusCode == 200 {
                 defaults.set(true, forKey: Self.remoteRegistrationActiveKey)
-                defaults.removeObject(forKey: Self.pendingRegistrationKey)
+                if pendingRegistration?.payload == payload {
+                    defaults.removeObject(forKey: Self.pendingRegistrationKey)
+                }
                 retryTask = nil
                 log("[Push] Registered with backend")
                 return .registered
@@ -197,12 +200,13 @@ final class PushRegistrationService {
                       let deferred = try? JSONDecoder().decode(DeferredRegistration.self, from: data) {
                 // 202: a same-cell settings change inside the Worker's rewrite
                 // cooldown. 429: this network has registered too often. Both
-                // say when to come back, and the payload is persisted rather
-                // than only timed in memory: iOS suspends the app soon after
-                // the user locks the phone.
+                // say when to come back, and that becomes the waiting
+                // payload's retry time.
                 let delay = max(0, deferred.retryAfterSeconds)
                 let retryAt = now().addingTimeInterval(TimeInterval(delay))
-                savePendingRegistration(payload, retryAt: retryAt)
+                if pendingRegistration?.payload == payload {
+                    savePendingRegistration(payload, retryAt: retryAt)
+                }
                 scheduleRetry(after: TimeInterval(delay))
                 scheduleReplay(retryAt)
                 log("[Push] Registration deferred for \(delay)s (HTTP \(status))")
@@ -220,7 +224,6 @@ final class PushRegistrationService {
                 // verbatim, rather than letting a rejected registration look
                 // like a success.
                 let detail = String(data: data, encoding: .utf8) ?? "<no body>"
-                defaults.removeObject(forKey: Self.pendingRegistrationKey)
                 if let rejected = try? JSONDecoder().decode(RejectedRegistration.self, from: data),
                    rejected.code == "coverage_at_capacity" || rejected.code == "cell_at_capacity" {
                     defaults.set(false, forKey: Self.remoteRegistrationActiveKey)
@@ -229,11 +232,6 @@ final class PushRegistrationService {
                 return .rejected
             }
         } catch {
-            // Whatever is still waiting is now older than this payload, so it
-            // is this one that a later replay has to send.
-            if let pending = pendingRegistration {
-                savePendingRegistration(payload, retryAt: pending.retryAt)
-            }
             log("[Push] Registration failed: \(error)")
             return .unavailable
         }
@@ -323,7 +321,9 @@ struct RegistrationPayload: Codable, Equatable {
     let timeZoneIdentifier: String
 }
 
-/// A registration the Worker has not stored yet, kept until it does.
+/// The newest registration the Worker has not confirmed. It is saved before it
+/// is first sent and removed only by a 200 for that same payload, so a
+/// suspension, a dropped connection or a refusal all leave it for the replay.
 private struct PendingRegistration: Codable {
     let payload: RegistrationPayload
     let retryAt: Date
