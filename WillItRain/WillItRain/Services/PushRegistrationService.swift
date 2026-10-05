@@ -15,6 +15,7 @@ final class PushRegistrationService {
     private static let deviceTokenKey = "pushDeviceToken"
     private static let remoteRegistrationActiveKey = "remoteRegistrationActive"
     private static let pendingRegistrationKey = "pendingRegistration"
+    private static let lastRegisteredLocationKey = "lastRegisteredLocation"
 
     private let baseURL: URL
     private let defaults: UserDefaults
@@ -76,6 +77,26 @@ final class PushRegistrationService {
     private var pendingRegistration: PendingRegistration? {
         defaults.data(forKey: Self.pendingRegistrationKey)
             .flatMap { try? JSONDecoder().decode(PendingRegistration.self, from: $0) }
+    }
+
+    /// Where this device's newest registration placed it.
+    private var lastRegisteredLocation: (lat: Double, lon: Double)? {
+        guard let pair = defaults.array(forKey: Self.lastRegisteredLocationKey) as? [Double],
+              pair.count == 2 else { return nil }
+        return (pair[0], pair[1])
+    }
+
+    /// Saves an alert-settings change as the waiting registration the moment it
+    /// is made — before any debounce or location fix — so locking the phone
+    /// straight after an edit cannot lose it. It stands at the last registered
+    /// location, or at `lastKnownLocation` when there is none; a registration
+    /// with a fresh fix later replaces it, carrying the same settings.
+    func stageSettingsChange(_ remoteSettings: RemoteAlertSettings, lastKnownLocation: CLLocation?) {
+        guard let token = defaults.string(forKey: Self.deviceTokenKey),
+              let location = lastRegisteredLocation
+                ?? lastKnownLocation.map({ (lat: $0.coordinate.latitude, lon: $0.coordinate.longitude) })
+        else { return }
+        holdUntilConfirmed(RegistrationPayload(token: token, lat: location.lat, lon: location.lon, settings: remoteSettings))
     }
 
     /// Sends the waiting registration once its retry time has come. Called at
@@ -148,19 +169,8 @@ final class PushRegistrationService {
         retryTask?.cancel()
         retryTask = nil
         guard let token = defaults.string(forKey: Self.deviceTokenKey) else { return .unavailable }
-        let payload = RegistrationPayload(
-            token: token,
-            lat: lat,
-            lon: lon,
-            leadTimeMinutes: remoteSettings.leadTimeMinutes,
-            rainStartEnabled: remoteSettings.rainStartEnabled,
-            rainEndEnabled: remoteSettings.rainEndEnabled,
-            quietHoursEnabled: remoteSettings.quietHoursEnabled,
-            quietHoursStartMinutes: remoteSettings.quietHoursStartMinutes,
-            quietHoursEndMinutes: remoteSettings.quietHoursEndMinutes,
-            timeZoneIdentifier: remoteSettings.timeZoneIdentifier
-        )
-        savePendingRegistration(payload, retryAt: pendingRegistration?.retryAt ?? now())
+        let payload = RegistrationPayload(token: token, lat: lat, lon: lon, settings: remoteSettings)
+        holdUntilConfirmed(payload)
         return await serialized { [self] in await send(payload) }
     }
 
@@ -237,9 +247,16 @@ final class PushRegistrationService {
         }
     }
 
+    /// Makes `payload` the one waiting, keeping any retry time the Worker gave
+    /// the one it replaces.
+    private func holdUntilConfirmed(_ payload: RegistrationPayload) {
+        savePendingRegistration(payload, retryAt: pendingRegistration?.retryAt ?? now())
+    }
+
     private func savePendingRegistration(_ payload: RegistrationPayload, retryAt: Date) {
         guard let encoded = try? JSONEncoder().encode(PendingRegistration(payload: payload, retryAt: retryAt)) else { return }
         defaults.set(encoded, forKey: Self.pendingRegistrationKey)
+        defaults.set([payload.lat, payload.lon], forKey: Self.lastRegisteredLocationKey)
     }
 
     private func scheduleRetry(after seconds: TimeInterval) {
@@ -319,6 +336,23 @@ struct RegistrationPayload: Codable, Equatable {
     let quietHoursStartMinutes: Int
     let quietHoursEndMinutes: Int
     let timeZoneIdentifier: String
+}
+
+extension RegistrationPayload {
+    init(token: String, lat: Double, lon: Double, settings: RemoteAlertSettings) {
+        self.init(
+            token: token,
+            lat: lat,
+            lon: lon,
+            leadTimeMinutes: settings.leadTimeMinutes,
+            rainStartEnabled: settings.rainStartEnabled,
+            rainEndEnabled: settings.rainEndEnabled,
+            quietHoursEnabled: settings.quietHoursEnabled,
+            quietHoursStartMinutes: settings.quietHoursStartMinutes,
+            quietHoursEndMinutes: settings.quietHoursEndMinutes,
+            timeZoneIdentifier: settings.timeZoneIdentifier
+        )
+    }
 }
 
 /// The newest registration the Worker has not confirmed. It is saved before it

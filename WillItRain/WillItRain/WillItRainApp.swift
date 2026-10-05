@@ -27,8 +27,13 @@ struct WillItRainApp: App {
             #endif
         }
         .onChange(of: scenePhase) { _, newPhase in
-            if newPhase == .background {
+            switch newPhase {
+            case .background:
                 BackgroundRefresh.schedule(after: 15 * 60)
+            case .active:
+                Task { await PushRegistrationService.shared.replayPendingRegistration() }
+            default:
+                break
             }
         }
     }

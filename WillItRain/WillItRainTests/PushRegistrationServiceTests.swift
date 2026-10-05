@@ -384,4 +384,95 @@ final class PushRegistrationServiceTests: XCTestCase {
         XCTAssertNil(background.pendingRetryDate)
         lastEdit.cancel()
     }
+
+    private func policy(
+        quietHoursEnabled: Bool = false,
+        quietHoursStartMinutes: Int = 22 * 60,
+        quietHoursEndMinutes: Int = 7 * 60
+    ) -> RemoteAlertSettings {
+        RemoteAlertSettings(
+            leadTimeMinutes: 30,
+            rainStartEnabled: true,
+            rainEndEnabled: true,
+            quietHoursEnabled: quietHoursEnabled,
+            quietHoursStartMinutes: quietHoursStartMinutes,
+            quietHoursEndMinutes: quietHoursEndMinutes,
+            timeZoneIdentifier: "America/Los_Angeles"
+        )
+    }
+
+    func testEditsLockedAwayBeforeAnyRequestLeavesAreSentFromTheLastRegisteredLocation() async {
+        var now = Self.t0
+        let sent = respond(with: [(200, "{\"ok\":true}"), (200, "{\"ok\":true}")])
+        let foreground = makeService(now: { now })
+        foreground.storeToken(Data(repeating: 0xab, count: 32))
+        _ = await foreground.registerLocation(lat: 37.7, lon: -122.4, leadTimeMinutes: 30)
+
+        // Three quick edits, and the phone locked inside the debounce: not one
+        // of them has reached the network.
+        let staleFix = CLLocation(latitude: 40.7, longitude: -74.0)
+        foreground.stageSettingsChange(policy(quietHoursEnabled: true), lastKnownLocation: staleFix)
+        foreground.stageSettingsChange(
+            policy(quietHoursEnabled: true, quietHoursStartMinutes: 23 * 60),
+            lastKnownLocation: staleFix
+        )
+        foreground.stageSettingsChange(
+            policy(quietHoursEnabled: true, quietHoursStartMinutes: 23 * 60, quietHoursEndMinutes: 6 * 60),
+            lastKnownLocation: staleFix
+        )
+        XCTAssertEqual(sent().count, 1)
+
+        now = Self.t0.addingTimeInterval(60)
+        let background = makeService(now: { now })
+        let replayed = await background.replayPendingRegistration()
+
+        XCTAssertEqual(replayed, .registered)
+        XCTAssertEqual(sent().count, 2, "Only the last edit is sent")
+        XCTAssertEqual(sent().last?.quietHoursEnabled, true)
+        XCTAssertEqual(sent().last?.quietHoursStartMinutes, 23 * 60)
+        XCTAssertEqual(sent().last?.quietHoursEndMinutes, 6 * 60)
+        XCTAssertEqual(sent().last?.lat, 37.7)
+        XCTAssertEqual(sent().last?.lon, -122.4)
+        XCTAssertNil(background.pendingRetryDate)
+    }
+
+    func testAnEditLockedAwayBeforeAnyFixIsSentFromTheLastKnownLocation() async {
+        let sent = respond(with: [(200, "{\"ok\":true}")])
+        let foreground = makeService(now: { Self.t0 })
+        foreground.storeToken(Data(repeating: 0xab, count: 32))
+
+        // Nothing registered yet, and no fix ever arrives for this edit.
+        foreground.stageSettingsChange(
+            policy(quietHoursEnabled: true),
+            lastKnownLocation: CLLocation(latitude: 51.5, longitude: -0.12)
+        )
+        XCTAssertEqual(foreground.pendingRetryDate, Self.t0)
+
+        let relaunched = makeService(now: { Self.t0 })
+        let replayed = await relaunched.replayPendingRegistration()
+
+        XCTAssertEqual(replayed, .registered)
+        XCTAssertEqual(sent().count, 1)
+        XCTAssertEqual(sent().first?.quietHoursEnabled, true)
+        XCTAssertEqual(sent().first?.lat, 51.5)
+        XCTAssertEqual(sent().first?.lon, -0.12)
+    }
+
+    func testATransportFailureOnTheFirstSendLeavesThePayloadForTheReplay() async {
+        let sent = respond(with: [(0, ""), (200, "{\"ok\":true}")])
+        let offline = makeService(now: { Self.t0 })
+        offline.storeToken(Data(repeating: 0xab, count: 32))
+
+        let failed = await offline.registerLocation(lat: 37.7, lon: -122.4, leadTimeMinutes: 30, quietHoursEnabled: true)
+        XCTAssertEqual(failed, .unavailable)
+
+        let relaunched = makeService(now: { Self.t0 })
+        XCTAssertEqual(relaunched.pendingRetryDate, Self.t0)
+        let replayed = await relaunched.replayPendingRegistration()
+
+        XCTAssertEqual(replayed, .registered)
+        XCTAssertEqual(sent().count, 2)
+        XCTAssertEqual(sent().last, sent().first)
+        XCTAssertNil(relaunched.pendingRetryDate)
+    }
 }
