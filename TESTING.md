@@ -33,11 +33,12 @@ an automated contract test. See section 3 for what that leaves unguarded.
 ```
 
 The backend pyramid is inverted relative to a typical service: there is effectively one large,
-high-value integration suite (`abuse.test.ts`, 59 tests exercising `index.ts`'s real `fetch`
+high-value integration suite (`abuse.test.ts`, exercising `index.ts`'s real `fetch`
 handler end-to-end, plus `cron-alerts.test.ts` through `scheduled()`) and very little narrow unit
 coverage of the pure helper modules underneath it (`next-hour.test.ts` is the exception). The iOS
-pyramid is the opposite problem — five small, genuinely unit-level suites and no
-integration coverage of the services that talk to WeatherKit, APNs tokens, or the backend.
+pyramid is the opposite problem — small, genuinely unit-level suites; of the services that talk to
+WeatherKit, APNs tokens, or the backend only `PushRegistrationService` is covered, and only against
+a stubbed `URLProtocol`, never a live Worker.
 
 ## 2. Unit tests
 
@@ -45,16 +46,18 @@ integration coverage of the services that talk to WeatherKit, APNs tokens, or th
 
 | Area | File | Runner | Covers |
 |---|---|---|---|
-| Backend abuse gate | `backend/test/abuse.test.ts` | Vitest | Rate limiting, grid-cell/device caps, TTL/rewrite-cooldown logic, cron push-budget math, re-registration semantics, content-type validation — see the `describe()` list in section 4 |
-| Backend cron alert gating | `backend/test/cron-alerts.test.ts` | Vitest | The real `scheduled()` handler with WeatherKit and APNs stubbed: which device is alerted at which minute (the lead-time-plus-one-cron-period gate and its post-onset slack, the rain-start dedup keyed on the onset it announced under a 30-minute floor, per-device opt-outs, rain-end window), the hourly fallback where there is no minute forecast, and the terminal Live Activity update at the tick after a wet hour ends |
+| Backend abuse gate | `backend/test/abuse.test.ts` | Vitest | Rate limiting, grid-cell/device caps, TTL/rewrite-cooldown logic (the `202` deferral with `retryAfterSeconds`, opt-outs written at once), the quiet-hours policy a registration stores, cron push-budget math, re-registration semantics, content-type validation — see the `describe()` list in section 4 |
+| Backend cron alert gating | `backend/test/cron-alerts.test.ts` | Vitest | The real `scheduled()` handler with WeatherKit and APNs stubbed: which device is alerted at which minute (the lead-time-plus-one-cron-period gate and its post-onset slack, the rain-start dedup keyed on the onset it announced under a 30-minute floor, per-device opt-outs, quiet hours in the device's time zone, rain-end window, the rain-resume alert), the wet-minute predicate shared with iOS, the hourly fallback where there is no minute forecast, and the terminal Live Activity update at the tick after a wet hour ends |
 | Backend Live Activity payload | `backend/test/live-activity.test.ts` | Vitest | `precipFromForecast` (summary → `rain`/`wintry`), that every `liveactivity` push the cron sends carries `precip` and matching copy, the `/test-activity` endpoint (401/404/409/200, legacy no-`precip` payload, `end`), `/test-cron` `dryRun` diagnostics, and that all three `/test-*` routes 401 without `ADMIN_TOKEN` |
-| Backend validators | `backend/test/validate.test.ts` | Vitest | Each predicate in `validate.ts` in isolation (token shapes, coordinate bounds, lead-time clamp, `asBoolean`, `secureEquals`) — synthetic tokens only |
+| Backend runtime startup | `backend/test/runtime-startup.test.ts` | Vitest | Boots the bundle in the local Workers runtime (as `wrangler dev` does) and sends one `/register`: workerd refuses a main module the Node-imported suites accept, and `wrangler deploy --dry-run` never runs it |
+| Backend validators | `backend/test/validate.test.ts` | Vitest | The predicates in `validate.ts` in isolation (token shapes, coordinate bounds, lead-time clamp, `asBoolean`, `secureEquals`) — synthetic tokens only. The quiet-hours validators (`isValidMinuteOfDay`, `isValidTimeZoneIdentifier`) are reached only through `/register` in `abuse.test.ts` |
 | Backend test harnesses | `backend/test/kvMock.ts`, `backend/test/doMock.ts` | — | In-memory KV (with expiry + stale-read simulation) and a Durable Object namespace mock that runs the *real* `CoverageRegistry`/`RegistrationLimiter` classes, not stubs |
 | Backend next-hour series | `backend/test/next-hour.test.ts` | Vitest | `nextHourMinutes`: a real `forecastNextHour` passes through untouched; otherwise the minute series synthesized from `forecastHourly`, starting one cron interval before now and bounded by the readings on hand |
 | Backend WeatherKit authentication | `backend/test/weatherkit.test.ts` | Vitest | WeatherKit JWTs are reused within the 40-minute cache window and refreshed after it |
 | iOS forecast model | `WillItRain/WillItRainTests/RainForecastTests.swift` | XCTest | `PrecipitationIntensity.from(millimetersPerHour:)` thresholds and `Comparable` ordering, `PrecipitationPeriod.contains`, type icons, `PrecipitationType.isWintry` and the `.mixed` copy, and `RainForecast`'s time-dependent readings (current/next period, hero status copy, poll interval) at a given instant |
 | iOS forecast merge | `WillItRain/WillItRainTests/ForecastMergeTests.swift` | XCTest | `ForecastMerge.merge(minute:hourly:now:)` at fixed instants and `PrecipitationPeriod.detect(in:)` on the merged series: which hourly reading is kept and how it is clipped, `hasMinuteForecast`, and which periods are `isConfirmed` (see section 4) |
-| iOS alert gate | `WillItRain/WillItRainTests/NotificationServiceTests.swift` | XCTest | Every path through `NotificationService.evaluateAndSchedule` at explicit instants with delivery recorded and settings in an isolated `UserDefaults` suite: two-pass rain-start and rain-end confirmation, same-event suppression, rain resuming within the hour, quiet hours, opt-outs, hourly-only and unconfirmed-nowcast periods |
+| iOS alert gate | `WillItRain/WillItRainTests/NotificationServiceTests.swift` | XCTest | Every path through `NotificationService.evaluateAndSchedule` at explicit instants with delivery recorded and settings in an isolated `UserDefaults` suite: two-pass rain-start and rain-end confirmation, same-event suppression, rain resuming within the hour, quiet hours, opt-outs, hourly-only and unconfirmed-nowcast periods, and standing down while a confirmed Worker registration owns alerts |
+| iOS push registration | `WillItRain/WillItRainTests/PushRegistrationServiceTests.swift` | XCTest | `PushRegistrationService` against a stubbed `URLProtocol` and an isolated `UserDefaults` suite: the `/register` body carries the stored token and the whole alert policy, no log line contains the token, a rotated token drops remote ownership, and a waiting registration survives a `202`/`429` (replayed after `retryAfterSeconds`), a transport or `5xx` failure, suspension, and a newer edit — settled only by a `200` for that same registration |
 | iOS Live Activity payload | `WillItRain/WillItRainTests/RainActivityAttributesTests.swift` | XCTest | The `content-state` wire contract: a payload with no `precip` key decodes (the Optional-field guarantee) and renders as rain; `LAStyle.of` picks wintry only for `wintry`; the DEBUG scenarios carry the `precip` their codes promise (`BX` = none) |
 | iOS Live Activity content | `WillItRain/WillItRainTests/LiveActivityServiceTests.swift` | XCTest | `LiveActivityService.makeState` per design state: which period types resolve to `precip: .wintry`, the wintry copy, and that every state the app builds carries `precip` |
 | iOS location service | `WillItRain/WillItRainTests/LocationServiceTests.swift` | XCTest | `LocationService.currentLocation()` against a stubbed `CLLocationManager`, including the stuck-continuation regression (see section 4) |
@@ -75,8 +78,8 @@ integration coverage of the services that talk to WeatherKit, APNs tokens, or th
   mapping — including the `.mixed` → `.mixed` mapping this release adds; the minute/hourly merge
   itself is the pure `ForecastMerge.merge(minute:hourly:now:)`, covered together with
   `PrecipitationPeriod.detect(in:)` by `ForecastMergeTests.swift`; the WeatherKit-to-`ChartDataPoint`
-  mapping that feeds them is not), `NotificationService`'s delivery, and `PushRegistrationService.swift`
-  (token storage, `registerLocation`, Live Activity token register/unregister) have no unit tests.
+  mapping that feeds them is not), `NotificationService`'s delivery, and `PushRegistrationService`'s
+  Live Activity token register/unregister have no unit tests.
   `LiveActivityService` is covered for `makeState` only; `sync` (ActivityKit start/update/end) is
   not. No view-level (`ViewInspector`-style or snapshot) tests exist for `ContentView`,
   `SettingsView`, `RainChartView`, or the widget/Live Activity views, so the wintry palette and the
@@ -109,16 +112,16 @@ integration coverage of the services that talk to WeatherKit, APNs tokens, or th
 | Worker ↔ Durable Objects | Real handler, real DO classes, mocked DO runtime (`doMock.ts`) | Deliberately models single-instance-per-name and serialized delivery so the 250-concurrent-registration flood test exercises genuine interleaving |
 | Worker ↔ WeatherKit REST | **Untested** | No fixture/contract test pins the WeatherKit response shape the Worker's cron parses; a schema change upstream would only surface in production `wrangler tail` logs |
 | Worker ↔ APNs | Real handler, stubbed `fetch`; delivery verified manually | `cron-alerts.test.ts` and `live-activity.test.ts` assert on the exact request the Worker would send APNs (host path = token, `apns-push-type`, `content-state` body), so a payload-shape drift fails in CI. Whether APNs *accepts* it — and that a card on a real phone re-styles — still needs [Appendix A section C](#appendix-a-production-ops--notification-testing-runbook) / `scripts/test-activity-push.sh` with `ADMIN_TOKEN` and a live device |
-| iOS app ↔ Worker (`/register`, `/register-activity`, `/unregister*`) | **Untested** | No iOS test mocks `PushRegistrationService`'s `URLSession` calls; no backend test simulates the exact payload shapes `PushRegistrationService.swift` sends. A shape drift on either side (e.g. a renamed JSON field) is caught by neither suite |
+| iOS app ↔ Worker (`/register`, `/register-activity`, `/unregister*`) | Each side tested alone; no contract test | `PushRegistrationServiceTests.swift` asserts the `/register` body the app sends and how it handles `200`/`202`/`429`/`5xx`, against a stubbed `URLProtocol`; `abuse.test.ts` builds its own bodies. A shape drift on one side only (e.g. a renamed JSON field) is caught by neither suite. `/register-activity` and `/unregister*` are untested from the app. The wet-minute predicate is pinned on both sides by the same boundary cases (`PrecipitationPeriodDetectionTests.testWetPredicateMatchesTheWorkerBoundaryTable`, `cron-alerts.test.ts` → `describe('what counts as a wet minute')`) |
 | iOS app ↔ WeatherKit | **Untested** | `WeatherService.swift` calls `WeatherKit.WeatherService.shared` directly with no protocol seam to inject a fake, unlike `LocationService`'s `CLLocationManager` stub pattern |
-| iOS app ↔ APNs device token | Untested | Token capture (`storeToken`) and the resulting `/register` call are unverified together |
+| iOS app ↔ APNs device token | Unit-tested from `storeToken` on | `PushRegistrationServiceTests.swift` stores a token and asserts the hex the `/register` body carries; obtaining the token from APNs is unverified |
 
 The backend's approach — run the real production code against a realistic in-memory
 double of the *stateful* dependency (KV, DO) rather than mocking the code under test — is the
 right pattern and should be extended to `weatherkit.ts` and `apns.ts` (inject a fake `fetch`,
 assert on the request built and the response parsed) rather than reached for network mocking
-libraries. The iOS side has no equivalent seam for `WeatherService` or `PushRegistrationService`
-yet; `LocationService`'s subclassed-`CLLocationManager` stub (`LocationServiceTests.swift`) is the
+libraries. The iOS side has no equivalent seam for `WeatherService` yet; `LocationService`'s
+subclassed-`CLLocationManager` stub (`LocationServiceTests.swift`) is the
 existing precedent to follow when adding one.
 
 ## 4. Regression catalog
@@ -140,7 +143,7 @@ if the bug came back; `UNGUARDED` means no such test exists today.
 | `d0f0452` Fix chart x-axis timestamps to show full h:mm format | Chart labels dropped the hour or minute component under certain timestamps | **UNGUARDED** — `RainChartView` has no tests |
 | `14611e1` Fix chart touch offset, show rain duration, fix precip type mapping | Touch-position-to-data-point mapping and precip-type mapping were both wrong | **UNGUARDED** — no `WeatherService` precip-type-mapping test (the gap noted in section 2) |
 | `01bbbf6` Fix background refresh by configuring Info.plist correctly | `BGTaskSchedulerPermittedIdentifiers` missing/wrong broke background refresh silently | `BuildProductTests.testBackgroundRefreshTaskRegistered` |
-| `28d14a2` Fix push registration timing: wait for APNs token before registering | A race could register a device before its APNs token was captured | **UNGUARDED** — no `PushRegistrationService` test (per section 3) |
+| `28d14a2` Fix push registration timing: wait for APNs token before registering | A race could register a device before its APNs token was captured | **UNGUARDED** — the wait for the token lives in `ContentView`, which has no tests; `PushRegistrationServiceTests` starts from a stored token |
 | fix: hourly fallback where WeatherKit has no minute forecast, and keep the hourly reading containing now + 1h (edge-case report finding 10) | The minute/hourly merge cut at a hard now + 1h: with no minute forecast the series began an hour out and the hole never closed (never "raining", no rain-start alert possible at any lead time, and the cron returned early on the same boundary); with minute data the hourly reading for the hour the minute data ends in was dropped (at 10:05, 11:00 fell and 12:00 was next) | `ForecastMergeTests.swift` (`testTheHourlyReadingContainingNowPlusOneHourIsKept`, `testLateInTheHourNoMinuteReadingIsLostToTheHourlyReading`, `testWithoutMinuteDataTheSeriesStartsAtTheHourContainingNow`, `testWithoutMinuteDataRainNextHourIsInsideTheLongestLeadTime`, `testALagSliverBetweenTheNowcastAndTheNextHourDoesNotConfirmIt`), `NotificationServiceTests.swift` → `testHourlyOnlyRainNextHourGoesThroughTheLeadTimeGate`, `testAWetHourTheNowcastHasNotReachedIsNotAlertedOnPollAfterPoll`, `testAWetHourFurtherOutStaysConfirmedUntilTheNowcastBordersItAndIsNeverAlertedOnUnseen`; backend `next-hour.test.ts` and `cron-alerts.test.ts` → `reach devices where WeatherKit has no minute forecast`, `end the activity at the tick after a wet hour ends` |
 | 1.1.2 (hand-port of #8) Live Activity track alignment | The rail and its segments carried `.offset(y: 6)` inside the 16pt track frame, so the track ran 6pt *below* the "now" dot and the hour dots on every card (rain included) since 1.1 | **UNGUARDED** — a view-geometry fix with no snapshot test; checked by eye in M6 via `scripts/test-live-activity.sh` ("the rail runs through the dots") |
 | 1.1.2 (hand-port of #8) Worker must send `precip` on every Live Activity push | `content-state` is a full replacement, so one push without `precip` reverts a snowing card to rain within a cron tick | `live-activity.test.ts` → `describe('the cron pushes precip on every Live Activity update')` → "never sends a Live Activity payload without precip"; TypeScript also refuses a `LiveActivityContentState` literal that omits it |
@@ -197,7 +200,7 @@ failure blocks the release.
 | M13 | Widget rendering | Add small and medium widgets to the Home Screen | Both render current forecast without truncation or placeholder data |
 | M14 | Abuse-gate symptom spot-check | Deliberately trigger one 503 (`coverage_at_capacity` or `cell_at_capacity`) against a non-production or disposable registration | Response matches the symptom table in [Appendix A section G](#appendix-a-production-ops--notification-testing-runbook); confirms the gate is live in the deployed environment, not just in `abuse.test.ts` |
 | M15 | Hourly-only forecast state | Set a custom simulator location (Features > Location > Custom Location…) in a country without next-hour precipitation on Apple's iOS feature-availability page, then background and foreground the app so it re-fetches | The line "Minute-by-minute forecast isn't available here; showing hourly" appears above the charts, there is no "Next Hour" chart section, the hourly chart starts at the hour containing now rather than an hour out, and the hero line reads off the hourly data (`ForecastMergeTests` guards the model — see the hourly-fallback row in section 4 — but nothing renders this state) |
-| M16 | Server → Live Activity push | Start scenario `BS` on a Debug build on a real device, then run `scripts/test-activity-push.sh <device-token>` with `ADMIN_TOKEN` set (its header explains how to find both tokens) | Push 1 turns the card pale with a snowflake and "Snow incoming"; push 2 turns it cyan with "Rain incoming"; push 3 (no `precip` in the payload) renders as rain **and the countdown keeps ticking** — a frozen card there means the field went non-optional |
+| M16 | Server → Live Activity push | Start scenario `BS` on a Debug build on a real device, then run `scripts/test-activity-push.sh <device-token>` with `ADMIN_TOKEN` set (its header covers the setup; the device token comes from Appendix A section B) | Push 1 turns the card pale with a snowflake and "Snow incoming"; push 2 turns it cyan with "Rain incoming"; push 3 (no `precip` in the payload) renders as rain **and the countdown keeps ticking** — a frozen card there means the field went non-optional |
 | M17 | WeatherKit summary still carries a condition | `backend/test/probe-weatherkit-summary.sh` with `ADMIN_TOKEN` (uses `/test-cron` `dryRun`, so no push and no device needed) | Every covered coordinate returns a non-null `summary` of lowercase bare nouns and a `precip`; uncovered coordinates return `summary: null`, `precip: "rain"`, no error. If `summary` ever goes absent for a covered location, snow renders as rain everywhere |
 | M18 | Live Activity token survives relaunch | Start a Live Activity, terminate and relaunch the app while the activity remains visible, then run one server activity update | The relaunch re-observes the existing activity's push-token stream and the update reaches the visible card |
 
@@ -329,7 +332,7 @@ Ordered by risk × how cheap the fix is; effort is rough.
 |---|---|---|---|
 | P0 | No unit tests for `apns.ts` (payload shaping, APNs error-code handling: 410/BadDeviceToken paths) | A regression in dead-token cleanup or payload shape ships undetected until production logs show it — this is exactly the class of bug section 4 already lists as UNGUARDED twice | S–M: inject a fake `fetch`, assert request/response handling per status code |
 | P0 | No parse tests for `weatherkit.ts` (only its JWT cache is tested) | An upstream WeatherKit schema change silently breaks forecasts; no fixture pins the expected shape | S: fixture-based parse test |
-| P1 | No `PushRegistrationService`/`WeatherService` tests on iOS (no protocol seam for `WeatherKit.WeatherService.shared` or `URLSession`) | Same class of silent breakage as above, client-side; also leaves `28d14a2`'s timing fix and `14611e1`'s precip-type mapping fix unguarded | M: introduce a protocol seam (same pattern as `LocationServiceTests.swift`'s `CLLocationManager` subclass) |
+| P1 | No `WeatherService` tests on iOS (no protocol seam for `WeatherKit.WeatherService.shared`) | Same class of silent breakage as above, client-side; also leaves `14611e1`'s precip-type mapping fix unguarded | M: introduce a protocol seam (same pattern as `LocationServiceTests.swift`'s `CLLocationManager` subclass) |
 | P1 | No test for `PrecipitationPeriod.detect(in:)` or the chart-data-point pipeline | Chart/period-detection regressions (two of which already happened: `d0f0452`, `14611e1`) have no guard | S–M |
 | P2 | No 401-without-`X-Admin-Token` test for `/test-rain`/`/test-cron` | A future refactor could accidentally leave the debug endpoints open, burning WeatherKit/APNs quota | S: add to `abuse.test.ts` |
 | P2 | No `validate.test.ts` isolating each validator | Validation bugs are only caught through full-HTTP integration tests, making failures harder to localize | S |
@@ -402,8 +405,7 @@ npx wrangler kv key list --remote --namespace-id $NS | grep '"name": "device:'
 
 # Inspect one:
 npx wrangler kv key get --remote "device:<paste-token>" --namespace-id $NS
-#   -> { token, lat, lon, leadTimeMinutes, rainStartEnabled, rainEndEnabled,
-#        registeredAt, renewedAt }
+#   -> a DeviceRegistration (backend/src/types.ts lists its fields)
 #   registeredAt is first-seen and never restamped (the cron ranks cells by it);
 #   renewedAt is the last write, i.e. when the 45-day TTL was last reset (section G).
 
@@ -416,8 +418,13 @@ npx wrangler kv key get --remote "activity:<paste-token>" --namespace-id $NS
 There are several device tokens (old reinstalls each make a new one). To find
 *your current* one:
 
-1. Run the app from Xcode on your phone and watch the console for:
-   `[Push] Stored device token: <hex>`  ← that hex is your token.
+1. Run the app from Xcode on your phone. The app never logs the token, so once
+   the console shows `[Push] Stored device token`, pause in the debugger and read
+   it from `UserDefaults`:
+   ```
+   (lldb) expr -l objc -O -- [[NSUserDefaults standardUserDefaults] stringForKey:@"pushDeviceToken"]
+   ```
+   That hex is your token.
 2. Confirm it's in KV:
    ```bash
    npx wrangler kv key get --remote "device:<that-hex>" --namespace-id $NS
@@ -454,8 +461,8 @@ curl -X POST https://will-it-rain.albertwxu.workers.dev/test-cron \
 # push — backend/test/probe-weatherkit-summary.sh wraps this (section 6, M16).
 
 # Content-state push at a running Live Activity (/test-activity): driven by
-# scripts/test-activity-push.sh, whose header covers finding both tokens
-# (section 6, M15). Its `end` event also clears the stored activity token.
+# scripts/test-activity-push.sh, whose header covers the setup (section 6, M16).
+# Its `end` event also clears the stored activity token.
 ```
 
 #### Dead token cleanup (automatic since 2026-07-27)
@@ -496,7 +503,7 @@ npx wrangler deploy
 ---
 
 ### Where the copy lives
-- **Server push:** `backend/src/apns.ts` — `sendRainAlert`, `sendRainEndAlert`.
+- **Server push:** `backend/src/apns.ts` — `sendRainAlert`, `sendRainResumeAlert`, `sendRainEndAlert`.
 - **On-device:** `WillItRain/WillItRain/Services/NotificationService.swift`.
 - Current wording preview: `screenshots/notifications/notification-copy-*.png`.
 
@@ -539,7 +546,7 @@ KV cannot count a sub-second burst.
 | `429 rate_limited` + `Retry-After` | more than 20 registrations from your IP in 10 minutes | wait out `retryAfterSeconds` |
 | `503 coverage_at_capacity` | the request would open a **new** grid cell and the service already covers `MAX_GRID_CELLS` (15) | delete junk `device:` keys from KV (section F — not `/unregister`), or re-run the subrequest arithmetic in `abuse.ts` before raising the cap |
 | `503 cell_at_capacity` | that one grid cell already holds `MAX_DEVICES_PER_CELL` (20) devices | unregister a device in that cell, or raise the cap after re-running the arithmetic |
-| `200` but `wrangler kv key get` shows the OLD lead time / toggles | a same-cell settings change inside the 5-minute rewrite cooldown | wait 5 minutes and re-send, or change the coordinates too — a cell change is never deferred |
+| `202` with `deferred: true` + `retryAfterSeconds`, and `wrangler kv key get` shows the OLD settings | a same-cell settings change inside the 5-minute rewrite cooldown (any alert it turns off is already stored) | wait out `retryAfterSeconds` and re-send — the app replays it by itself — or change the coordinates too: a cell change is never deferred |
 | `503 storage_unavailable` + `Retry-After: 60` | KV threw while reading the caller's existing record, so the write was refused rather than risk overwriting it | transient — check `wrangler tail` for the KV error; the caller's stored registration is untouched and still live |
 | `200` from `/register-activity` but the `activity:` key still shows the old `activityUpdatedAt` | the same activity token was re-submitted, and an identical token is never rewritten | expected; a new or changed token is always written immediately |
 
@@ -564,11 +571,13 @@ nothing is **not** rewritten (it would spend the Free plan's 1,000 KV writes a d
 on nothing); a record older than 7 days is rewritten regardless, which resets the
 TTL with weeks to spare.
 
-A registration that changes only *settings* (`leadTimeMinutes`, `rainStartEnabled`,
-`rainEndEnabled`) within the same grid cell is also held back for up to 5 minutes
-after the last write, for the same budget reason. It returns `200` with the grid
-key the record still has, and self-heals on the next registration — which the app
-issues after every successful weather poll. **A move to a different grid cell is
+A registration that changes only *settings* (lead time, the alert switches, the
+quiet-hours window and time zone) within the same grid cell is also held back for
+up to 5 minutes after the last write, for the same budget reason. It returns `202`
+with `deferred: true` and a `retryAfterSeconds`, which the app keeps and replays
+when it is due. Turning an alert *off* is not held back: it is written at once, and
+anything else the same request changes waits behind the `202` (`writeDecision` in
+`backend/src/index.ts` has the full order). **A move to a different grid cell is
 never held back**: it is written immediately, because a device alerted for the
 cell it left is exactly the silent break the gate exists to prevent.
 

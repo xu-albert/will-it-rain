@@ -142,8 +142,8 @@ struct PrecipitationPeriod: Identifiable {
     /// OR when rain is more likely than not (`probability >= 0.5`). Keying off amount alone made the
     /// app show "Clear" when WeatherKit reported a high chance but a low probability-weighted amount —
     /// the "says nothing's happening when it's going to rain" bug. Adding the chance gate only *adds*
-    /// detections (never removes), and 0.5 keeps marginal <50% forecasts from crying wolf. This makes
-    /// the in-app status agree with the backend, which already gates on precipitation chance.
+    /// detections (never removes), and 0.5 keeps marginal <50% forecasts from crying wolf. The Worker's
+    /// `isWet` (backend/src/index.ts) uses the same two inclusive boundaries; change them together.
     static let likelyRainProbability = 0.5
     static let minimumWetMillimetersPerHour = 0.1
 
