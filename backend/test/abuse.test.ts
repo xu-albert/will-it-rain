@@ -1127,6 +1127,40 @@ describe('registration records expire', () => {
     }
   });
 
+  it('takes the opt-out path only for a request that turns nothing on', async () => {
+    // Swapping which alert is off disables something every time. Were that
+    // enough to skip the cooldown, each swap would write, and same-cell churn
+    // would be bounded by the per-client throttle alone.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      await worker.fetch(registerRequest(1, { cell: 0, rainStartEnabled: true, rainEndEnabled: false }), env);
+      const settled = kv.puts;
+
+      for (let n = 0; n < 6; n++) {
+        vi.advanceTimersByTime(30_000);
+        const swapped = n % 2 === 0;
+        const response = await worker.fetch(
+          registerRequest(1, { cell: 0, rainStartEnabled: !swapped, rainEndEnabled: swapped }),
+          env
+        );
+        expect(response.status).toBe(swapped ? 202 : 200);
+      }
+      expect(kv.puts).toBe(settled);
+
+      // A plain opt-out still lands at once, inside the same cooldown.
+      vi.advanceTimersByTime(30_000);
+      const optOut = await worker.fetch(
+        registerRequest(1, { cell: 0, rainStartEnabled: false, rainEndEnabled: false }),
+        env
+      );
+      expect(optOut.status).toBe(200);
+      expect(kv.puts).toBe(settled + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('stores the complete timezone-aware quiet-hours policy', async () => {
     const response = await worker.fetch(
       registerRequest(1, {

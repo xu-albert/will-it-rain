@@ -130,7 +130,6 @@ final class PushRegistrationServiceTests: XCTestCase {
                     Data("{\"deferred\":true,\"retryAfterSeconds\":0}".utf8)
                 )
             }
-            retried.fulfill()
             return (
                 HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
                 Data("{\"ok\":true}".utf8)
@@ -141,7 +140,9 @@ final class PushRegistrationServiceTests: XCTestCase {
             defaults: defaults,
             session: session,
             scheduleReplay: { _ in },
-            log: { _ in }
+            log: { message in
+                if message == "[Push] Registered with backend" { retried.fulfill() }
+            }
         )
         service.storeToken(Data(repeating: 0xab, count: 32))
 
@@ -474,5 +475,114 @@ final class PushRegistrationServiceTests: XCTestCase {
         XCTAssertEqual(sent().count, 2)
         XCTAssertEqual(sent().last, sent().first)
         XCTAssertNil(relaunched.pendingRetryDate)
+    }
+
+    func testATransientServerFailureOnTheReplayLeavesThePayloadWaiting() async {
+        var now = Self.t0
+        let sent = respond(with: [
+            (202, "{\"ok\":false,\"deferred\":true,\"retryAfterSeconds\":60}"),
+            (503, "{\"error\":\"Could not read the existing registration.\",\"code\":\"storage_unavailable\"}"),
+            (200, "{\"ok\":true}"),
+        ])
+        let service = makeService(now: { now })
+        service.storeToken(Data(repeating: 0xab, count: 32))
+        _ = await service.registerLocation(lat: 37.7, lon: -122.4, leadTimeMinutes: 30, quietHoursEnabled: true)
+
+        now = Self.t0.addingTimeInterval(60)
+        let failed = await service.replayPendingRegistration()
+        XCTAssertEqual(failed, .rejected)
+        XCTAssertNotNil(service.pendingRetryDate, "A KV hiccup on the Worker is no reason to drop the change")
+
+        let relaunched = makeService(now: { now })
+        let replayed = await relaunched.replayPendingRegistration()
+
+        XCTAssertEqual(replayed, .registered)
+        XCTAssertEqual(sent().map(\.quietHoursEnabled), [true, true, true])
+        XCTAssertNil(relaunched.pendingRetryDate)
+    }
+
+    /// Holds the first registration's answer until `release` is signalled, and
+    /// answers the rest with `replies` in order.
+    private func holdFirstAnswer(
+        until release: DispatchSemaphore,
+        reached: XCTestExpectation,
+        replies: [(status: Int, body: String)]
+    ) -> () -> [RegistrationPayload] {
+        var remaining = replies
+        var sent: [RegistrationPayload] = []
+        URLProtocolStub.handler = { request in
+            sent.append(try JSONDecoder().decode(
+                RegistrationPayload.self,
+                from: try URLProtocolStub.bodyData(from: request)
+            ))
+            if sent.count == 1 {
+                reached.fulfill()
+                release.wait()
+            }
+            let next = remaining.removeFirst()
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: next.status, httpVersion: nil, headerFields: nil)!,
+                Data(next.body.utf8)
+            )
+        }
+        return { sent }
+    }
+
+    func testAnAnswerToAnEarlierIdenticalRegistrationLeavesTheNewestOneWaiting() async {
+        // A1 is slow. While it is out the user turns rain-start off (B) and back
+        // on (A2), and A2 is A1 byte for byte. B lands after A1, so only A2
+        // puts rain-start back: A1's answer must not settle it.
+        var now = Self.t0
+        let release = DispatchSemaphore(value: 0)
+        let firstOut = expectation(description: "A1 reached the network")
+        let sent = holdFirstAnswer(until: release, reached: firstOut, replies: [
+            (200, "{\"ok\":true}"),
+            (200, "{\"ok\":true}"),
+            (202, "{\"ok\":false,\"deferred\":true,\"retryAfterSeconds\":300}"),
+            (200, "{\"ok\":true}"),
+        ])
+        let service = makeService(now: { now })
+        service.storeToken(Data(repeating: 0xab, count: 32))
+
+        let a1 = Task { await service.registerLocation(lat: 37.7, lon: -122.4, leadTimeMinutes: 30) }
+        await fulfillment(of: [firstOut], timeout: 2)
+        let b = Task {
+            await service.registerLocation(lat: 37.7, lon: -122.4, leadTimeMinutes: 30, rainStartEnabled: false)
+        }
+        let a2 = Task { await service.registerLocation(lat: 37.7, lon: -122.4, leadTimeMinutes: 30) }
+        await Task.yield()
+        release.signal()
+
+        let answers = (await a1.value, await b.value, await a2.value)
+        XCTAssertEqual(answers.0, .registered)
+        XCTAssertEqual(answers.1, .registered)
+        XCTAssertEqual(answers.2, .deferred(retryAfterSeconds: 300))
+        XCTAssertEqual(service.pendingRetryDate, Self.t0.addingTimeInterval(300),
+                       "A2 must still be waiting after A1's answer")
+
+        now = Self.t0.addingTimeInterval(300)
+        let replayed = await service.replayPendingRegistration()
+
+        XCTAssertEqual(replayed, .registered)
+        XCTAssertEqual(sent().map(\.rainStartEnabled), [true, false, true, true])
+        XCTAssertNil(service.pendingRetryDate)
+    }
+
+    func testAnAnswerForAReplacedTokenDoesNotActivateTheNewOne() async {
+        let release = DispatchSemaphore(value: 0)
+        let out = expectation(description: "registration for the old token reached the network")
+        _ = holdFirstAnswer(until: release, reached: out, replies: [(200, "{\"ok\":true}")])
+        let service = makeService(now: { Self.t0 })
+        service.storeToken(Data(repeating: 0xab, count: 32))
+
+        let oldToken = Task { await service.registerLocation(lat: 37.7, lon: -122.4, leadTimeMinutes: 30) }
+        await fulfillment(of: [out], timeout: 2)
+        service.storeToken(Data(repeating: 0xcd, count: 32))
+        release.signal()
+
+        let answer = await oldToken.value
+        XCTAssertEqual(answer, .registered)
+        XCTAssertFalse(service.isRemoteRegistrationActive,
+                       "Only a registration of the stored token may hand alerts to the Worker")
     }
 }

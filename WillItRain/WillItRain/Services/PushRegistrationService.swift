@@ -113,7 +113,7 @@ final class PushRegistrationService {
                 scheduleReplay(pending.retryAt)
                 return .deferred(retryAfterSeconds: Int(wait.rounded(.up)))
             }
-            return await send(pending.payload)
+            return await send(pending.payload, settling: pending.id)
         }
     }
 
@@ -170,8 +170,8 @@ final class PushRegistrationService {
         retryTask = nil
         guard let token = defaults.string(forKey: Self.deviceTokenKey) else { return .unavailable }
         let payload = RegistrationPayload(token: token, lat: lat, lon: lon, settings: remoteSettings)
-        holdUntilConfirmed(payload)
-        return await serialized { [self] in await send(payload) }
+        let id = holdUntilConfirmed(payload)
+        return await serialized { [self] in await send(payload, settling: id) }
     }
 
     /// Registrations reach the Worker one at a time and in the order they were
@@ -187,7 +187,10 @@ final class PushRegistrationService {
         return await current.value
     }
 
-    private func send(_ payload: RegistrationPayload) async -> RegistrationResult {
+    /// Sends `payload` and settles the waiting registration `id` with the answer
+    /// — and only that one: a newer registration saved while this was in flight
+    /// stays waiting, however alike the two are.
+    private func send(_ payload: RegistrationPayload, settling id: UUID) async -> RegistrationResult {
         let url = baseURL.appendingPathComponent("register")
 
         var request = URLRequest(url: url)
@@ -198,9 +201,12 @@ final class PushRegistrationService {
         do {
             let (data, response) = try await session.data(for: request)
             let http = response as? HTTPURLResponse
+            let forStoredToken = payload.token == defaults.string(forKey: Self.deviceTokenKey)
             if http?.statusCode == 200 {
-                defaults.set(true, forKey: Self.remoteRegistrationActiveKey)
-                if pendingRegistration?.payload == payload {
+                if forStoredToken {
+                    defaults.set(true, forKey: Self.remoteRegistrationActiveKey)
+                }
+                if pendingRegistration?.id == id {
                     defaults.removeObject(forKey: Self.pendingRegistrationKey)
                 }
                 retryTask = nil
@@ -214,8 +220,8 @@ final class PushRegistrationService {
                 // payload's retry time.
                 let delay = max(0, deferred.retryAfterSeconds)
                 let retryAt = now().addingTimeInterval(TimeInterval(delay))
-                if pendingRegistration?.payload == payload {
-                    savePendingRegistration(payload, retryAt: retryAt)
+                if pendingRegistration?.id == id {
+                    savePendingRegistration(PendingRegistration(id: id, payload: payload, retryAt: retryAt))
                 }
                 scheduleRetry(after: TimeInterval(delay))
                 scheduleReplay(retryAt)
@@ -234,7 +240,8 @@ final class PushRegistrationService {
                 // verbatim, rather than letting a rejected registration look
                 // like a success.
                 let detail = String(data: data, encoding: .utf8) ?? "<no body>"
-                if let rejected = try? JSONDecoder().decode(RejectedRegistration.self, from: data),
+                if forStoredToken,
+                   let rejected = try? JSONDecoder().decode(RejectedRegistration.self, from: data),
                    rejected.code == "coverage_at_capacity" || rejected.code == "cell_at_capacity" {
                     defaults.set(false, forKey: Self.remoteRegistrationActiveKey)
                 }
@@ -248,15 +255,22 @@ final class PushRegistrationService {
     }
 
     /// Makes `payload` the one waiting, keeping any retry time the Worker gave
-    /// the one it replaces.
-    private func holdUntilConfirmed(_ payload: RegistrationPayload) {
-        savePendingRegistration(payload, retryAt: pendingRegistration?.retryAt ?? now())
+    /// the one it replaces, and returns the id its answer must settle.
+    @discardableResult
+    private func holdUntilConfirmed(_ payload: RegistrationPayload) -> UUID {
+        let pending = PendingRegistration(
+            id: UUID(),
+            payload: payload,
+            retryAt: pendingRegistration?.retryAt ?? now()
+        )
+        savePendingRegistration(pending)
+        return pending.id
     }
 
-    private func savePendingRegistration(_ payload: RegistrationPayload, retryAt: Date) {
-        guard let encoded = try? JSONEncoder().encode(PendingRegistration(payload: payload, retryAt: retryAt)) else { return }
+    private func savePendingRegistration(_ pending: PendingRegistration) {
+        guard let encoded = try? JSONEncoder().encode(pending) else { return }
         defaults.set(encoded, forKey: Self.pendingRegistrationKey)
-        defaults.set([payload.lat, payload.lon], forKey: Self.lastRegisteredLocationKey)
+        defaults.set([pending.payload.lat, pending.payload.lon], forKey: Self.lastRegisteredLocationKey)
     }
 
     private func scheduleRetry(after seconds: TimeInterval) {
@@ -356,9 +370,10 @@ extension RegistrationPayload {
 }
 
 /// The newest registration the Worker has not confirmed. It is saved before it
-/// is first sent and removed only by a 200 for that same payload, so a
+/// is first sent and removed only by a 200 for that same registration, so a
 /// suspension, a dropped connection or a refusal all leave it for the replay.
 private struct PendingRegistration: Codable {
+    let id: UUID
     let payload: RegistrationPayload
     let retryAt: Date
 }

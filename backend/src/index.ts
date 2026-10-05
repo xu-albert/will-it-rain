@@ -793,8 +793,14 @@ type WriteDecision = 'write' | 'unchanged' | 'cooling-down';
  *   4. same cell, unchanged   -> skip. The common case: the client re-registers
  *                                on cold launch, on every foreground and after
  *                                every poll, and almost all of it is a repeat.
- *   5. alert enabled -> off   -> write immediately. An explicit opt-out must
- *                                never wait behind an abuse cooldown.
+ *   5. alert enabled -> off,
+ *      nothing turned on      -> write immediately. An explicit opt-out must
+ *                                never wait behind an abuse cooldown. Only a
+ *                                request that turns nothing on qualifies, so
+ *                                each such write shrinks the set of enabled
+ *                                alerts: at most two can follow any write that
+ *                                re-enables them, which keeps the cooldown a
+ *                                bound rather than something to alternate past.
  *   6. same cell, changed,
  *      inside the cooldown    -> return an explicit 202 deferral. The client
  *                                retries after the remaining cooldown instead
@@ -832,10 +838,13 @@ function writeDecision(
     return 'write';
   }
 
+  const startWas = existing.rainStartEnabled ?? true;
+  const endWas = existing.rainEndEnabled ?? true;
   const disablesAlert =
-    ((existing.rainStartEnabled ?? true) && !settings.rainStartEnabled) ||
-    ((existing.rainEndEnabled ?? true) && !settings.rainEndEnabled);
-  if (disablesAlert) return 'write';
+    (startWas && !settings.rainStartEnabled) || (endWas && !settings.rainEndEnabled);
+  const enablesAlert =
+    (!startWas && settings.rainStartEnabled) || (!endWas && settings.rainEndEnabled);
+  if (disablesAlert && !enablesAlert) return 'write';
 
   const changed =
     existing.leadTimeMinutes !== settings.leadTimeMinutes ||
