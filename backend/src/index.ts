@@ -83,8 +83,8 @@ const ALERT_FLOOR_MINUTES = 30;
 
 // Shared with PrecipitationPeriod.detect on iOS. WeatherKit reports intensity
 // in mm/h on both APIs; the boundaries are deliberately inclusive.
-export const LIKELY_RAIN_PROBABILITY = 0.5;
-export const MINIMUM_WET_MM_PER_HOUR = 0.1;
+const LIKELY_RAIN_PROBABILITY = 0.5;
+const MINIMUM_WET_MM_PER_HOUR = 0.1;
 export const isWet = (m: { precipitationChance: number; precipitationIntensity: number }) =>
   m.precipitationIntensity >= MINIMUM_WET_MM_PER_HOUR ||
   m.precipitationChance >= LIKELY_RAIN_PROBABILITY;
