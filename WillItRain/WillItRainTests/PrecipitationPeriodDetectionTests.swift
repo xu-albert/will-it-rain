@@ -16,6 +16,7 @@ final class PrecipitationPeriodDetectionTests: XCTestCase {
         _ minute: Int,
         probability: Double = 0,
         intensity: PrecipitationIntensity = .none,
+        amount: Double? = nil,
         type: PrecipitationType = .none
     ) -> ChartDataPoint {
         ChartDataPoint(
@@ -23,7 +24,7 @@ final class PrecipitationPeriodDetectionTests: XCTestCase {
             probability: probability,
             intensity: intensity,
             type: type,
-            precipitationAmount: intensity.numericValue
+            precipitationAmount: amount ?? intensity.numericValue
         )
     }
 
@@ -83,6 +84,34 @@ final class PrecipitationPeriodDetectionTests: XCTestCase {
     func testAPredictedAmountCountsEvenWhenTheChanceIsLow() {
         let points = [point(0, probability: 0.1, intensity: .light, type: .rain), point(10)]
         XCTAssertEqual(PrecipitationPeriod.detect(in: points).count, 1)
+    }
+
+    func testWetPredicateMatchesTheWorkerBoundaryTable() {
+        let cases: [(probability: Double, amount: Double, wet: Bool)] = [
+            (0.5, 0, true),
+            (0.499, 0, false),
+            (0.4, 0.1, true),
+            (0.4, 0.099, false),
+            (0.2, 1, true),
+            (0.6, 0, true),
+        ]
+
+        for testCase in cases {
+            let points = [
+                point(
+                    0,
+                    probability: testCase.probability,
+                    intensity: PrecipitationIntensity.from(millimetersPerHour: testCase.amount),
+                    amount: testCase.amount
+                ),
+                point(1),
+            ]
+            XCTAssertEqual(
+                !PrecipitationPeriod.detect(in: points).isEmpty,
+                testCase.wet,
+                "chance=\(testCase.probability), amount=\(testCase.amount) mm/h"
+            )
+        }
     }
 
     func testRainThatOutlastsTheDataClosesAtTheLastPoint() {

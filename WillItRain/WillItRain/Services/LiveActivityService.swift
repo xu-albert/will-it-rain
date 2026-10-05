@@ -71,7 +71,7 @@ final class LiveActivityService {
         tokenObservers[activity.id] = Task {
             for await tokenData in activity.pushTokenUpdates {
                 let hex = tokenData.map { String(format: "%02x", $0) }.joined()
-                print("[LiveActivity] Push token: \(hex)")
+                print("[LiveActivity] Push token received")
                 await PushRegistrationService.shared.registerLiveActivityToken(hex)
             }
         }

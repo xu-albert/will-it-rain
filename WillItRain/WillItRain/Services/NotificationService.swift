@@ -14,9 +14,16 @@ final class NotificationService {
     private static let maximumInRainPollInterval: TimeInterval = 15 * 60
 
     private let deliver: Deliver
+    private let remoteAlertsActive: () -> Bool
 
-    init(deliver: Deliver? = nil) {
+    init(
+        deliver: Deliver? = nil,
+        remoteAlertsActive: (() -> Bool)? = nil
+    ) {
         self.deliver = deliver ?? Self.deliverImmediately
+        self.remoteAlertsActive = remoteAlertsActive ?? {
+            PushRegistrationService.shared.isRemoteRegistrationActive
+        }
     }
 
     func requestPermission() async -> Bool {
@@ -31,6 +38,10 @@ final class NotificationService {
     /// delivers them. Every decision is recorded in `settings`, so the two-pass
     /// confirmation and the duplicate suppression survive across polls and launches.
     func evaluateAndSchedule(forecast: RainForecast, settings: NotificationSettings, now: Date = Date()) {
+        // A confirmed Worker registration makes remote delivery authoritative.
+        // Keeping this gate before all local state mutation means a foreground
+        // poll cannot arm a second alert for the same event the Worker owns.
+        guard !remoteAlertsActive() else { return }
         guard !settings.isInQuietHours(at: now) else { return }
 
         let formatter = DateFormatter()

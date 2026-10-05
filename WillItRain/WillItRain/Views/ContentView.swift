@@ -93,6 +93,26 @@ struct ContentView: View {
                 Task { await renewPushRegistration() }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name.NSSystemTimeZoneDidChange)) { _ in
+            Task { await renewPushRegistration() }
+        }
+        .onChange(of: settings.remoteAlertSettings) { _, newSettings in
+            PushRegistrationService.shared.stageSettingsChange(
+                newSettings,
+                lastKnownLocation: locationService.lastKnownLocation
+            )
+        }
+        .task(id: settings.remoteAlertSettings) {
+            // Time pickers can publish several intermediate values. Cancellation
+            // from task(id:) turns those into one registration carrying the final
+            // policy instead of a burst of stale writes. The background time
+            // lets a lock straight after the edit usually still see it sent.
+            await withBackgroundTime(named: "Alert settings registration") {
+                try? await Task.sleep(for: .milliseconds(500))
+                guard !Task.isCancelled else { return }
+                await renewPushRegistration()
+            }
+        }
         .sheet(isPresented: $showSettings) {
             SettingsView(settings: settings)
                 .presentationDetents([.medium])
@@ -294,10 +314,14 @@ struct ContentView: View {
     ///
     /// Cheap and safe to repeat: it is a no-op until APNs has handed us a token,
     /// and the server's per-client throttle (20 per 10 minutes) is far above any
-    /// plausible foregrounding rate.
+    /// plausible foregrounding rate. Without a fix it sends whatever registration
+    /// is waiting instead, which is where a settings edit already stands.
     private func renewPushRegistration() async {
         guard PushRegistrationService.shared.hasStoredToken else { return }
-        guard let location = try? await locationService.currentLocation() else { return }
+        guard let location = try? await locationService.currentLocation() else {
+            await PushRegistrationService.shared.replayPendingRegistration()
+            return
+        }
         await PushRegistrationService.shared.registerLocation(location, settings: settings)
     }
 
@@ -428,6 +452,27 @@ struct ContentView: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "h:mm a"
         return formatter.string(from: Date())
+    }
+}
+
+/// Holds off suspension while `work` runs, ending early if iOS runs out of
+/// background time first rather than letting the app be killed for overrunning.
+private func withBackgroundTime(named name: String, _ work: () async -> Void) async {
+    let assertion = BackgroundTimeAssertion()
+    assertion.identifier = UIApplication.shared.beginBackgroundTask(withName: name) {
+        assertion.end()
+    }
+    await work()
+    assertion.end()
+}
+
+private final class BackgroundTimeAssertion {
+    var identifier: UIBackgroundTaskIdentifier = .invalid
+
+    func end() {
+        guard identifier != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(identifier)
+        identifier = .invalid
     }
 }
 

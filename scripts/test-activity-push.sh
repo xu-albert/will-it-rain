@@ -24,14 +24,14 @@
 #   2. Launch with the argument `-liveActivityScenario BS` (Xcode: Edit Scheme >
 #      Run > Arguments). BS is the wintry "snowing now" state.
 #   3. Watch the Xcode console for:
-#           [LiveActivity] Push token: <hex>
-#      That line is the whole point. Until it appears the server literally
+#           [LiveActivity] Push token received
+#           [Push] Live Activity token registered
+#      Those lines are the whole point. Until they appear the server literally
 #      cannot reach the activity — an activity started with `pushType: nil` has
 #      no token at all, which is why the harness now requests `.token`.
-#   4. Find the device token in the same console:
-#           [Push] Stored device token: <hex>
-#      That hex is this script's argument. (The Worker is keyed by device token
-#      and looks the activity token up from it.)
+#   4. Read the device token as TESTING.md Appendix A section B describes (the
+#      app never logs it). That hex is this script's argument. (The Worker is
+#      keyed by device token and looks the activity token up from it.)
 #   5. Lock the phone so the card is visible.
 # ---------------------------------------------------------------------------
 
@@ -48,7 +48,7 @@ info() { printf '\033[2m      %s\033[0m\n' "$1"; }
 if [ -z "$DEVICE_TOKEN" ]; then
   echo "usage: $0 <device-token> [rain|wintry|legacy|end]"
   echo
-  echo "Get the device token from the Xcode console: '[Push] Stored device token: <hex>'"
+  echo "Get the device token as TESTING.md Appendix A section B describes."
   exit 1
 fi
 if [ -z "${ADMIN_TOKEN:-}" ]; then

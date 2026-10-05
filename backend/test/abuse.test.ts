@@ -46,7 +46,19 @@ function device(n: number, registeredAt: string): DeviceRegistration {
 
 function registerRequest(
   n: number,
-  options: { ip?: string; contentType?: string; cell?: number; jitter?: number } = {}
+  options: {
+    ip?: string;
+    contentType?: string;
+    cell?: number;
+    jitter?: number;
+    leadTimeMinutes?: number;
+    rainStartEnabled?: boolean;
+    rainEndEnabled?: boolean;
+    quietHoursEnabled?: boolean;
+    quietHoursStartMinutes?: number;
+    quietHoursEndMinutes?: number;
+    timeZoneIdentifier?: string;
+  } = {}
 ): Request {
   const base = coordsForCell(options.cell ?? n);
   const lat = base.lat + (options.jitter ?? 0);
@@ -57,7 +69,18 @@ function registerRequest(
       'Content-Type': options.contentType ?? 'application/json',
       'CF-Connecting-IP': options.ip ?? '198.51.100.7',
     },
-    body: JSON.stringify({ token: fakeToken(n), lat, lon, leadTimeMinutes: 20 }),
+    body: JSON.stringify({
+      token: fakeToken(n),
+      lat,
+      lon,
+      leadTimeMinutes: options.leadTimeMinutes ?? 20,
+      rainStartEnabled: options.rainStartEnabled,
+      rainEndEnabled: options.rainEndEnabled,
+      quietHoursEnabled: options.quietHoursEnabled,
+      quietHoursStartMinutes: options.quietHoursStartMinutes,
+      quietHoursEndMinutes: options.quietHoursEndMinutes,
+      timeZoneIdentifier: options.timeZoneIdentifier,
+    }),
   });
 }
 
@@ -1037,7 +1060,7 @@ describe('registration records expire', () => {
     );
   });
 
-  it('defers a same-cell settings change inside the cooldown, and takes it after', async () => {
+  it('returns an explicit deferral for a cooled setting change, and takes it after', async () => {
     // Flipping a setting back and forth is a genuine change every time, so the
     // skip-when-unchanged check cannot see it, and it adds no cell and no
     // record, so neither cap sees it either. Unbounded that is 20 x 144 = 2,880
@@ -1058,7 +1081,12 @@ describe('registration records expire', () => {
       for (let n = 0; n < 8; n++) {
         vi.setSystemTime(Date.now() + 30_000);
         const res = await worker.fetch(settingsChange(n % 2 === 0 ? 45 : 20), env);
-        expect(res.status).toBe(200);
+        if (n % 2 === 0) {
+          expect(res.status).toBe(202);
+          expect(await res.json()).toMatchObject({ deferred: true, retryAfterSeconds: expect.any(Number) });
+        } else {
+          expect(res.status).toBe(200);
+        }
       }
       expect(kv.puts).toBe(settled);
 
@@ -1071,6 +1099,115 @@ describe('registration records expire', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('persists an enabled-to-disabled opt-out immediately inside the cooldown', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      await worker.fetch(registerRequest(1, { cell: 0, rainStartEnabled: true, rainEndEnabled: true }), env);
+      const settled = kv.puts;
+
+      vi.advanceTimersByTime(30_000);
+      const response = await worker.fetch(
+        registerRequest(1, { cell: 0, rainStartEnabled: false, rainEndEnabled: false }),
+        env
+      );
+
+      expect(response.status).toBe(200);
+      expect(kv.puts).toBe(settled + 1);
+      const stored = JSON.parse(kv.raw(`device:${fakeToken(1)}`)!) as {
+        rainStartEnabled: boolean;
+        rainEndEnabled: boolean;
+      };
+      expect(stored.rainStartEnabled).toBe(false);
+      expect(stored.rainEndEnabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('applies an opt-out at once even when the same request carries a cooled re-enable', async () => {
+    // The client sends its whole policy every time. Turning rain-end off, back
+    // on, and then rain-start off inside one cooldown arrives last as {start
+    // off, end on}: the opt-out has to land now, the re-enable has to wait.
+    const policy = (rainStartEnabled: boolean, rainEndEnabled: boolean) =>
+      registerRequest(1, { cell: 0, rainStartEnabled, rainEndEnabled });
+    const stored = () =>
+      JSON.parse(kv.raw(`device:${fakeToken(1)}`)!) as { rainStartEnabled: boolean; rainEndEnabled: boolean };
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      await worker.fetch(policy(true, true), env);
+
+      vi.advanceTimersByTime(30_000);
+      expect((await worker.fetch(policy(true, false), env)).status).toBe(200);
+      vi.advanceTimersByTime(60_000);
+      expect((await worker.fetch(policy(true, true), env)).status).toBe(202);
+      const settled = kv.puts;
+
+      vi.advanceTimersByTime(30_000);
+      const mixed = await worker.fetch(policy(false, true), env);
+      expect(mixed.status).toBe(202);
+      expect(await mixed.json()).toMatchObject({
+        deferred: true,
+        retryAfterSeconds: DEVICE_REWRITE_COOLDOWN_SECONDS,
+      });
+      expect(kv.puts).toBe(settled + 1);
+      expect(stored()).toMatchObject({ rainStartEnabled: false, rainEndEnabled: false });
+
+      // Swapping which alert is off writes nothing more: an immediate write can
+      // only turn alerts off, and none is left on.
+      for (let n = 0; n < 4; n++) {
+        vi.advanceTimersByTime(30_000);
+        const swapped = n % 2 === 0;
+        expect((await worker.fetch(policy(swapped, !swapped), env)).status).toBe(202);
+      }
+      expect(kv.puts).toBe(settled + 1);
+
+      // Once the cooldown is up, the replayed policy lands whole.
+      vi.advanceTimersByTime(DEVICE_REWRITE_COOLDOWN_SECONDS * 1000);
+      expect((await worker.fetch(policy(false, true), env)).status).toBe(200);
+      expect(stored()).toMatchObject({ rainStartEnabled: false, rainEndEnabled: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stores the complete timezone-aware quiet-hours policy', async () => {
+    const response = await worker.fetch(
+      registerRequest(1, {
+        quietHoursEnabled: true,
+        quietHoursStartMinutes: 21 * 60 + 30,
+        quietHoursEndMinutes: 6 * 60 + 15,
+        timeZoneIdentifier: 'America/Los_Angeles',
+      }),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    expect(JSON.parse(kv.raw(`device:${fakeToken(1)}`)!)).toMatchObject({
+      quietHoursEnabled: true,
+      quietHoursStartMinutes: 21 * 60 + 30,
+      quietHoursEndMinutes: 6 * 60 + 15,
+      timeZoneIdentifier: 'America/Los_Angeles',
+    });
+  });
+
+  it('rejects an enabled quiet-hours policy without a valid IANA timezone', async () => {
+    const response = await worker.fetch(
+      registerRequest(1, {
+        quietHoursEnabled: true,
+        quietHoursStartMinutes: 22 * 60,
+        quietHoursEndMinutes: 7 * 60,
+        timeZoneIdentifier: 'Not/A_Timezone',
+      }),
+      env
+    );
+
+    expect(response.status).toBe(400);
+    expect(kv.raw(`device:${fakeToken(1)}`)).toBeUndefined();
   });
 
   it('never lets an active device expire, however long it re-registers unchanged', async () => {

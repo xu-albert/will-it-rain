@@ -1,17 +1,56 @@
 import CoreLocation
 import Foundation
 
+@MainActor
 final class PushRegistrationService {
     static let shared = PushRegistrationService()
 
-    // TODO: Replace with your deployed Worker URL
-    private let baseURL = "https://will-it-rain.albertwxu.workers.dev"
+    enum RegistrationResult: Equatable {
+        case registered
+        case deferred(retryAfterSeconds: Int)
+        case rejected
+        case unavailable
+    }
+
+    private static let deviceTokenKey = "pushDeviceToken"
+    private static let remoteRegistrationActiveKey = "remoteRegistrationActive"
+    private static let pendingRegistrationKey = "pendingRegistration"
+    private static let lastRegisteredLocationKey = "lastRegisteredLocation"
+
+    private let baseURL: URL
+    private let defaults: UserDefaults
+    private let session: URLSession
+    private let now: () -> Date
+    private let scheduleReplay: @MainActor (Date) -> Void
+    private let log: (String) -> Void
+    private var retryTask: Task<Void, Never>?
+    private var registrationChain: Task<Void, Never>?
+
+    init(
+        baseURL: URL = URL(string: "https://will-it-rain.albertwxu.workers.dev")!,
+        defaults: UserDefaults = .standard,
+        session: URLSession = .shared,
+        now: @escaping () -> Date = Date.init,
+        scheduleReplay: @escaping @MainActor (Date) -> Void = { BackgroundRefresh.schedule(at: $0) },
+        log: @escaping (String) -> Void = { print($0) }
+    ) {
+        self.baseURL = baseURL
+        self.defaults = defaults
+        self.session = session
+        self.now = now
+        self.scheduleReplay = scheduleReplay
+        self.log = log
+    }
 
     /// Called from AppDelegate when APNs returns a device token
     func storeToken(_ deviceToken: Data) {
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
-        UserDefaults.standard.set(hex, forKey: "pushDeviceToken")
-        print("[Push] Stored device token: \(hex)")
+        if defaults.string(forKey: Self.deviceTokenKey) != hex {
+            defaults.set(false, forKey: Self.remoteRegistrationActiveKey)
+            defaults.removeObject(forKey: Self.pendingRegistrationKey)
+        }
+        defaults.set(hex, forKey: Self.deviceTokenKey)
+        log("[Push] Stored device token")
     }
 
     /// Whether APNs has handed us a device token yet.
@@ -19,56 +58,178 @@ final class PushRegistrationService {
     /// Every call below bails without one, so a caller that would have to do work
     /// of its own first — a CoreLocation fix, say — can check this and skip it.
     var hasStoredToken: Bool {
-        UserDefaults.standard.string(forKey: "pushDeviceToken") != nil
+        defaults.string(forKey: Self.deviceTokenKey) != nil
+    }
+
+    /// True only after this exact APNs token received a confirmed registration.
+    /// While true, the Worker is the sole ordinary-alert engine and the app's
+    /// local evaluator is an explicit fallback rather than a second sender.
+    var isRemoteRegistrationActive: Bool {
+        defaults.bool(forKey: Self.remoteRegistrationActiveKey)
+    }
+
+    /// When the registration the Worker has not yet confirmed may be sent
+    /// again, if one is waiting.
+    var pendingRetryDate: Date? {
+        pendingRegistration?.retryAt
+    }
+
+    private var pendingRegistration: PendingRegistration? {
+        defaults.data(forKey: Self.pendingRegistrationKey)
+            .flatMap { try? JSONDecoder().decode(PendingRegistration.self, from: $0) }
+    }
+
+    /// Where this device's newest registration placed it.
+    private var lastRegisteredLocation: (lat: Double, lon: Double)? {
+        guard let pair = defaults.array(forKey: Self.lastRegisteredLocationKey) as? [Double],
+              pair.count == 2 else { return nil }
+        return (pair[0], pair[1])
+    }
+
+    /// Saves an alert-settings change as the waiting registration the moment it
+    /// is made — before any debounce or location fix — so locking the phone
+    /// straight after an edit cannot lose it. It stands at the last registered
+    /// location, or at `lastKnownLocation` when there is none; a registration
+    /// with a fresh fix later replaces it, carrying the same settings.
+    func stageSettingsChange(_ remoteSettings: RemoteAlertSettings, lastKnownLocation: CLLocation?) {
+        guard let token = defaults.string(forKey: Self.deviceTokenKey),
+              let location = lastRegisteredLocation
+                ?? lastKnownLocation.map({ (lat: $0.coordinate.latitude, lon: $0.coordinate.longitude) })
+        else { return }
+        holdUntilConfirmed(RegistrationPayload(token: token, lat: location.lat, lon: location.lon, settings: remoteSettings))
+    }
+
+    /// Sends the waiting registration once its retry time has come. Called at
+    /// launch and from the background refresh as well as by the in-process
+    /// timer, so a settings change made just before the app was suspended still
+    /// reaches the Worker. Returns nil when nothing is waiting.
+    @discardableResult
+    func replayPendingRegistration() async -> RegistrationResult? {
+        await serialized { [self] in
+            guard let pending = pendingRegistration else { return nil }
+            let wait = pending.retryAt.timeIntervalSince(now())
+            guard wait <= 0 else {
+                scheduleRetry(after: wait)
+                scheduleReplay(pending.retryAt)
+                return .deferred(retryAfterSeconds: Int(wait.rounded(.up)))
+            }
+            return await send(pending.payload, settling: pending.id)
+        }
     }
 
     /// Register or update this device's location and alert settings — the form
     /// every caller has in hand. Adding a field to the payload means changing this
     /// one place, not each caller.
-    func registerLocation(_ location: CLLocation, settings: NotificationSettings) async {
-        await registerLocation(
+    @discardableResult
+    func registerLocation(
+        _ location: CLLocation,
+        settings: NotificationSettings
+    ) async -> RegistrationResult {
+        let remote = settings.remoteAlertSettings
+        return await registerLocation(
             lat: location.coordinate.latitude,
             lon: location.coordinate.longitude,
-            leadTimeMinutes: settings.leadTime,
-            rainStartEnabled: settings.rainStartEnabled,
-            rainEndEnabled: settings.rainEndEnabled
+            remoteSettings: remote
         )
     }
 
     /// Register or update location with the backend
+    @discardableResult
     func registerLocation(
         lat: Double,
         lon: Double,
         leadTimeMinutes: Int,
         rainStartEnabled: Bool = true,
-        rainEndEnabled: Bool = true
-    ) async {
-        guard let token = UserDefaults.standard.string(forKey: "pushDeviceToken"),
-              let url = URL(string: "\(baseURL)/register") else { return }
+        rainEndEnabled: Bool = true,
+        quietHoursEnabled: Bool = false,
+        quietHoursStartMinutes: Int = 22 * 60,
+        quietHoursEndMinutes: Int = 7 * 60,
+        timeZoneIdentifier: String = TimeZone.autoupdatingCurrent.identifier
+    ) async -> RegistrationResult {
+        await registerLocation(
+            lat: lat,
+            lon: lon,
+            remoteSettings: RemoteAlertSettings(
+                leadTimeMinutes: leadTimeMinutes,
+                rainStartEnabled: rainStartEnabled,
+                rainEndEnabled: rainEndEnabled,
+                quietHoursEnabled: quietHoursEnabled,
+                quietHoursStartMinutes: quietHoursStartMinutes,
+                quietHoursEndMinutes: quietHoursEndMinutes,
+                timeZoneIdentifier: timeZoneIdentifier
+            )
+        )
+    }
+
+    private func registerLocation(
+        lat: Double,
+        lon: Double,
+        remoteSettings: RemoteAlertSettings
+    ) async -> RegistrationResult {
+        retryTask?.cancel()
+        retryTask = nil
+        guard let token = defaults.string(forKey: Self.deviceTokenKey) else { return .unavailable }
+        let payload = RegistrationPayload(token: token, lat: lat, lon: lon, settings: remoteSettings)
+        let id = holdUntilConfirmed(payload)
+        return await serialized { [self] in await send(payload, settling: id) }
+    }
+
+    /// Registrations reach the Worker one at a time and in the order they were
+    /// made, and a replay reads what is waiting only when its turn comes — so an
+    /// older payload can never land after a newer one, or be left waiting over it.
+    private func serialized<T: Sendable>(_ work: @escaping () async -> T) async -> T {
+        let previous = registrationChain
+        let current = Task {
+            _ = await previous?.value
+            return await work()
+        }
+        registrationChain = Task { _ = await current.value }
+        return await current.value
+    }
+
+    /// Sends `payload` and settles the waiting registration `id` with the answer
+    /// — and only that one: a newer registration saved while this was in flight
+    /// stays waiting, however alike the two are.
+    private func send(_ payload: RegistrationPayload, settling id: UUID) async -> RegistrationResult {
+        let url = baseURL.appendingPathComponent("register")
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONEncoder().encode(
-            RegistrationPayload(
-                token: token,
-                lat: lat,
-                lon: lon,
-                leadTimeMinutes: leadTimeMinutes,
-                rainStartEnabled: rainStartEnabled,
-                rainEndEnabled: rainEndEnabled
-            )
-        )
+        request.httpBody = try? JSONEncoder().encode(payload)
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
             let http = response as? HTTPURLResponse
+            let forStoredToken = payload.token == defaults.string(forKey: Self.deviceTokenKey)
             if http?.statusCode == 200 {
-                print("[Push] Registered with backend")
+                if forStoredToken {
+                    defaults.set(true, forKey: Self.remoteRegistrationActiveKey)
+                }
+                if pendingRegistration?.id == id {
+                    defaults.removeObject(forKey: Self.pendingRegistrationKey)
+                }
+                retryTask = nil
+                log("[Push] Registered with backend")
+                return .registered
+            } else if let status = http?.statusCode, status == 202 || status == 429,
+                      let deferred = try? JSONDecoder().decode(DeferredRegistration.self, from: data) {
+                // 202: a same-cell settings change inside the Worker's rewrite
+                // cooldown. 429: this network has registered too often. Both
+                // say when to come back, and that becomes the waiting
+                // payload's retry time.
+                let delay = max(0, deferred.retryAfterSeconds)
+                let retryAt = now().addingTimeInterval(TimeInterval(delay))
+                if pendingRegistration?.id == id {
+                    savePendingRegistration(PendingRegistration(id: id, payload: payload, retryAt: retryAt))
+                }
+                scheduleRetry(after: TimeInterval(delay))
+                scheduleReplay(retryAt)
+                log("[Push] Registration deferred for \(delay)s (HTTP \(status))")
+                return .deferred(retryAfterSeconds: delay)
             } else {
-                // The backend refuses registrations it cannot afford: 429 when
-                // this network has registered too often, and three distinct
-                // 503s — `coverage_at_capacity` (at its grid-cell limit),
+                // The backend refuses registrations it cannot afford: three
+                // distinct 503s — `coverage_at_capacity` (at its grid-cell limit),
                 // `cell_at_capacity` (this area already holds as many devices
                 // as it can notify), and `storage_unavailable` (KV threw while
                 // reading the existing record). All are recoverable and all
@@ -79,18 +240,57 @@ final class PushRegistrationService {
                 // verbatim, rather than letting a rejected registration look
                 // like a success.
                 let detail = String(data: data, encoding: .utf8) ?? "<no body>"
-                print("[Push] Registration rejected (HTTP \(http?.statusCode ?? -1)): \(detail)")
+                if forStoredToken,
+                   let rejected = try? JSONDecoder().decode(RejectedRegistration.self, from: data),
+                   rejected.code == "coverage_at_capacity" || rejected.code == "cell_at_capacity" {
+                    defaults.set(false, forKey: Self.remoteRegistrationActiveKey)
+                }
+                log("[Push] Registration rejected (HTTP \(http?.statusCode ?? -1)): \(detail)")
+                return .rejected
             }
         } catch {
-            print("[Push] Registration failed: \(error)")
+            log("[Push] Registration failed: \(error)")
+            return .unavailable
+        }
+    }
+
+    /// Makes `payload` the one waiting, keeping any retry time the Worker gave
+    /// the one it replaces, and returns the id its answer must settle.
+    @discardableResult
+    private func holdUntilConfirmed(_ payload: RegistrationPayload) -> UUID {
+        let pending = PendingRegistration(
+            id: UUID(),
+            payload: payload,
+            retryAt: pendingRegistration?.retryAt ?? now()
+        )
+        savePendingRegistration(pending)
+        return pending.id
+    }
+
+    private func savePendingRegistration(_ pending: PendingRegistration) {
+        guard let encoded = try? JSONEncoder().encode(pending) else { return }
+        defaults.set(encoded, forKey: Self.pendingRegistrationKey)
+        defaults.set([pending.payload.lat, pending.payload.lon], forKey: Self.lastRegisteredLocationKey)
+    }
+
+    private func scheduleRetry(after seconds: TimeInterval) {
+        retryTask?.cancel()
+        retryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(seconds))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+            await self.replayPendingRegistration()
         }
     }
 
     /// Send a Live Activity push token to the backend so it can push
     /// content-state updates (apns-push-type: liveactivity).
     func registerLiveActivityToken(_ activityToken: String) async {
-        guard let token = UserDefaults.standard.string(forKey: "pushDeviceToken"),
-              let url = URL(string: "\(baseURL)/register-activity") else { return }
+        guard let token = defaults.string(forKey: Self.deviceTokenKey) else { return }
+        let url = baseURL.appendingPathComponent("register-activity")
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -100,48 +300,88 @@ final class PushRegistrationService {
         )
 
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await session.data(for: request)
             if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                print("[Push] Live Activity token registered")
+                log("[Push] Live Activity token registered")
             } else {
-                print("[Push] Live Activity token registration returned non-200")
+                log("[Push] Live Activity token registration returned non-200")
             }
         } catch {
-            print("[Push] Live Activity token registration failed: \(error)")
+            log("[Push] Live Activity token registration failed: \(error)")
         }
     }
 
     /// Tell the backend the current Live Activity ended.
     func unregisterLiveActivity() async {
-        guard let token = UserDefaults.standard.string(forKey: "pushDeviceToken"),
-              let url = URL(string: "\(baseURL)/unregister-activity") else { return }
+        guard let token = defaults.string(forKey: Self.deviceTokenKey) else { return }
+        let url = baseURL.appendingPathComponent("unregister-activity")
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONEncoder().encode(["token": token])
-        _ = try? await URLSession.shared.data(for: request)
+        _ = try? await session.data(for: request)
     }
 
     func unregister() async {
-        guard let token = UserDefaults.standard.string(forKey: "pushDeviceToken"),
-              let url = URL(string: "\(baseURL)/unregister") else { return }
+        guard let token = defaults.string(forKey: Self.deviceTokenKey) else { return }
+        let url = baseURL.appendingPathComponent("unregister")
 
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONEncoder().encode(["token": token])
 
-        _ = try? await URLSession.shared.data(for: request)
-        UserDefaults.standard.removeObject(forKey: "pushDeviceToken")
+        _ = try? await session.data(for: request)
+        defaults.removeObject(forKey: Self.deviceTokenKey)
+        defaults.set(false, forKey: Self.remoteRegistrationActiveKey)
+        defaults.removeObject(forKey: Self.pendingRegistrationKey)
     }
 }
 
-private struct RegistrationPayload: Encodable {
+struct RegistrationPayload: Codable, Equatable {
     let token: String
     let lat: Double
     let lon: Double
     let leadTimeMinutes: Int
     let rainStartEnabled: Bool
     let rainEndEnabled: Bool
+    let quietHoursEnabled: Bool
+    let quietHoursStartMinutes: Int
+    let quietHoursEndMinutes: Int
+    let timeZoneIdentifier: String
+}
+
+extension RegistrationPayload {
+    init(token: String, lat: Double, lon: Double, settings: RemoteAlertSettings) {
+        self.init(
+            token: token,
+            lat: lat,
+            lon: lon,
+            leadTimeMinutes: settings.leadTimeMinutes,
+            rainStartEnabled: settings.rainStartEnabled,
+            rainEndEnabled: settings.rainEndEnabled,
+            quietHoursEnabled: settings.quietHoursEnabled,
+            quietHoursStartMinutes: settings.quietHoursStartMinutes,
+            quietHoursEndMinutes: settings.quietHoursEndMinutes,
+            timeZoneIdentifier: settings.timeZoneIdentifier
+        )
+    }
+}
+
+/// The newest registration the Worker has not confirmed. It is saved before it
+/// is first sent and removed only by a 200 for that same registration, so a
+/// suspension, a dropped connection or a refusal all leave it for the replay.
+private struct PendingRegistration: Codable {
+    let id: UUID
+    let payload: RegistrationPayload
+    let retryAt: Date
+}
+
+private struct DeferredRegistration: Decodable {
+    let retryAfterSeconds: Int
+}
+
+private struct RejectedRegistration: Decodable {
+    let code: String
 }

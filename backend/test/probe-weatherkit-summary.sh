@@ -23,7 +23,7 @@
 #   dry locations         -> summary ["clear"]          precip=rain (default)
 #   Belfast, light rain   -> summary ["clear"]          precip=rain
 #     ...while `minutes` DID show precipitation (chance 0.31). Apple's summary
-#     applies a higher confidence bar than our own `chance > 0.3` isWet test.
+#     applies a higher confidence bar than our own shared chance/amount isWet test.
 #     Consequence: very light snow may be detected minute-wise but summarised
 #     as "clear", and would then render as rain. Known limitation, not a bug —
 #     the fallback is deliberately 'rain'.

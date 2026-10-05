@@ -63,6 +63,20 @@ export function asBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
 }
 
+export function isValidMinuteOfDay(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < 24 * 60;
+}
+
+export function isValidTimeZoneIdentifier(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 64) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Compares in time independent of how many characters match, so a caller can't
 // discover the admin token one byte at a time by timing responses.
 export function secureEquals(a: string, b: string): boolean {

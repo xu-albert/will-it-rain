@@ -35,9 +35,12 @@ final class NotificationServiceTests: XCTestCase {
         settings = NotificationSettings(defaults: defaults)
         settings.lastRainEndTime = longAgo
         delivered = []
-        service = NotificationService { [weak self] title, body, identifier in
-            self?.delivered.append(Delivered(title: title, body: body, identifier: identifier))
-        }
+        service = NotificationService(
+            deliver: { [weak self] title, body, identifier in
+                self?.delivered.append(Delivered(title: title, body: body, identifier: identifier))
+            },
+            remoteAlertsActive: { false }
+        )
     }
 
     override func tearDown() {
@@ -153,6 +156,23 @@ final class NotificationServiceTests: XCTestCase {
         XCTAssertEqual(delivered.first?.title, "Rain in ~10 min")
         XCTAssertEqual(settings.lastNotifiedPrecipStart, minutes(15))
         XCTAssertNil(settings.pendingPrecipStart)
+    }
+
+    func testConfirmedRemoteRegistrationMakesLocalAlertsAFallbackOnly() {
+        service = NotificationService(
+            deliver: { [weak self] title, body, identifier in
+                self?.delivered.append(Delivered(title: title, body: body, identifier: identifier))
+            },
+            remoteAlertsActive: { true }
+        )
+        let rainAt15 = forecast([(15, 45)])
+
+        evaluate(rainAt15, at: t0)
+        evaluate(rainAt15, at: minutes(5))
+
+        XCTAssertEqual(delivered, [])
+        XCTAssertNil(settings.pendingPrecipStart,
+                     "The fallback must not arm local state while the Worker owns alerts")
     }
 
     func testFreshInstallDoesNotTreatFirstDryForecastAsRainEnd() {

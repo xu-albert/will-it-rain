@@ -9,7 +9,8 @@
 // stubbed APNs, so the arithmetic inside the tick is what is under test.
 
 import { describe, expect, it, beforeAll, beforeEach, vi } from 'vitest';
-import worker from '../src/index';
+import worker, { isInQuietHours, isWet } from '../src/index';
+import { DeviceRegistration } from '../src/types';
 import { DEVICE_RECORD_TTL_SECONDS } from '../src/abuse';
 import { Harness, coordsForCell, fakeToken, generateSigningKey, makeHarness } from './harness';
 
@@ -60,6 +61,10 @@ interface Planted {
   leadTimeMinutes?: number;
   rainStartEnabled?: boolean;
   rainEndEnabled?: boolean;
+  quietHoursEnabled?: boolean;
+  quietHoursStartMinutes?: number;
+  quietHoursEndMinutes?: number;
+  timeZoneIdentifier?: string;
 }
 
 /** Puts every device straight into KV, all in the same grid cell. */
@@ -75,6 +80,10 @@ async function plant(harness: Harness, devices: Planted[], now: number): Promise
         leadTimeMinutes: d.leadTimeMinutes ?? 20,
         rainStartEnabled: d.rainStartEnabled,
         rainEndEnabled: d.rainEndEnabled,
+        quietHoursEnabled: d.quietHoursEnabled,
+        quietHoursStartMinutes: d.quietHoursStartMinutes,
+        quietHoursEndMinutes: d.quietHoursEndMinutes,
+        timeZoneIdentifier: d.timeZoneIdentifier,
         registeredAt: new Date(now - d.n * 1000).toISOString(),
         renewedAt: new Date(now).toISOString(),
       }),
@@ -152,6 +161,79 @@ async function tick(
 function alerted(alerts: AlertPush[]): string[] {
   return alerts.map((a) => a.token).sort();
 }
+
+describe('shared alert contract', () => {
+  it.each([
+    { chance: 0.5, intensity: 0, wet: true },
+    { chance: 0.499, intensity: 0, wet: false },
+    { chance: 0.4, intensity: 0.1, wet: true },
+    { chance: 0.4, intensity: 0.099, wet: false },
+    { chance: 0.2, intensity: 1, wet: true },
+    { chance: 0.6, intensity: 0, wet: true },
+  ])('classifies chance=$chance intensity=$intensity as wet=$wet', ({ chance, intensity, wet }) => {
+    expect(isWet({ precipitationChance: chance, precipitationIntensity: intensity })).toBe(wet);
+  });
+
+  const device = (overrides: Partial<DeviceRegistration>): DeviceRegistration => ({
+    token: fakeToken(1),
+    lat: 0,
+    lon: 0,
+    leadTimeMinutes: 20,
+    registeredAt: '2026-01-01T00:00:00.000Z',
+    quietHoursEnabled: true,
+    quietHoursStartMinutes: 22 * 60,
+    quietHoursEndMinutes: 7 * 60,
+    timeZoneIdentifier: 'America/Los_Angeles',
+    ...overrides,
+  });
+
+  it('handles overnight and same-day windows at inclusive/exclusive boundaries', () => {
+    const overnight = device({});
+    expect(isInQuietHours(overnight, new Date('2026-01-01T06:00:00.000Z'))).toBe(true); // 22:00
+    expect(isInQuietHours(overnight, new Date('2026-01-01T15:00:00.000Z'))).toBe(false); // 07:00
+
+    const daytime = device({ quietHoursStartMinutes: 9 * 60, quietHoursEndMinutes: 17 * 60 });
+    expect(isInQuietHours(daytime, new Date('2026-01-01T17:00:00.000Z'))).toBe(true); // 09:00
+    expect(isInQuietHours(daytime, new Date('2026-01-02T01:00:00.000Z'))).toBe(false); // 17:00
+  });
+
+  it('uses IANA timezone rules across DST and timezone changes', () => {
+    const losAngeles = device({ quietHoursStartMinutes: 22 * 60, quietHoursEndMinutes: 3 * 60 });
+    expect(isInQuietHours(losAngeles, new Date('2026-03-08T09:30:00.000Z'))).toBe(true); // 01:30 PST
+    expect(isInQuietHours(losAngeles, new Date('2026-03-08T10:30:00.000Z'))).toBe(false); // 03:30 PDT
+
+    const morning = { quietHoursStartMinutes: 8 * 60, quietHoursEndMinutes: 9 * 60 };
+    const instant = new Date('2026-01-01T16:30:00.000Z');
+    expect(isInQuietHours(device({ ...morning, timeZoneIdentifier: 'America/Los_Angeles' }), instant)).toBe(true);
+    expect(isInQuietHours(device({ ...morning, timeZoneIdentifier: 'America/New_York' }), instant)).toBe(false);
+  });
+
+  it('fails closed when an enabled quiet-hours record is incomplete', () => {
+    expect(isInQuietHours(device({ timeZoneIdentifier: undefined }), new Date())).toBe(true);
+  });
+
+  it('suppresses both rain-start and rain-end alert pushes while quiet', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T12:00:00.000Z'));
+      const policy = {
+        quietHoursEnabled: true,
+        quietHoursStartMinutes: 11 * 60,
+        quietHoursEndMinutes: 13 * 60,
+        timeZoneIdentifier: 'UTC',
+      };
+      const starting = makeHarness({ signingKey });
+      await plant(starting, [{ n: 1, ...policy }], Date.now());
+      expect((await tick(starting, (t) => forecast(t, (i) => i >= 10))).alerts).toEqual([]);
+
+      const ending = makeHarness({ signingKey });
+      await plant(ending, [{ n: 2, ...policy }], Date.now());
+      expect((await tick(ending, (t) => forecast(t, (i) => i < 20))).alerts).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe('rain-start alerts', () => {
   it('reach a device only once the rain is inside its own lead time', async () => {
@@ -558,6 +640,186 @@ describe('rain-end alerts', () => {
   });
 });
 
+describe('rain-resume alerts', () => {
+  // The server's half of the app's "More rain coming": a break in the rain with
+  // more behind it inside the hour. Registered devices get no local alerts at
+  // all, so without this a short break went unannounced — the next start alert
+  // fell inside the 30-minute floor of the one before it.
+
+  /**
+   * A minute series that is wet inside each [from, to) window, given as UTC
+   * clock times, whose first minute lags the tick by `lagMinutes`.
+   */
+  const showers =
+    (windows: Array<[string, string]>, lagMinutes = 0) =>
+    (t: number) => {
+      const first = t - lagMinutes * 60_000;
+      return forecast(first, (i) =>
+        windows.some(
+          ([from, to]) =>
+            first + i * 60_000 >= Date.parse(`2026-01-01T${from}:00.000Z`) &&
+            first + i * 60_000 < Date.parse(`2026-01-01T${to}:00.000Z`)
+        )
+      );
+    };
+  const at = (clock: string) => vi.setSystemTime(new Date(`2026-01-01T${clock}:00.000Z`));
+
+  it('announce rain coming back after a short break, inside the floor of the start alert', async () => {
+    vi.useFakeTimers();
+    try {
+      at('12:00');
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 20 }], Date.now());
+      const weather = showers([['12:02', '12:12'], ['12:25', '12:45']]);
+
+      const first = await tick(harness, weather);
+      expect(first.alerts.map((a) => a.title)).toEqual(['Rain in a few minutes']);
+
+      // Ten minutes after that alert: it is raining, the break opens before the
+      // next tick, and the rain behind it is announced in place of the end.
+      at('12:10');
+      const breaking = await tick(harness, weather);
+      expect(breaking.alerts).toEqual([{ token: fakeToken(1), title: 'More rain coming' }]);
+
+      // The next tick sees the same rain as an ordinary start: already told.
+      at('12:20');
+      expect((await tick(harness, weather)).alerts).toEqual([]);
+
+      // Once it is falling again, the last break of the hour is an ordinary end.
+      at('12:30');
+      expect((await tick(harness, weather)).alerts.map((a) => a.title)).toEqual(['Rain ending soon']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('are floored like any start alert when rain flickers off and on every tick', async () => {
+    // Each tick sees a one-minute dip just ahead with rain right behind it. The
+    // first resume is news; the ones after it, inside the floor, are a push
+    // every ten minutes about the same rain.
+    vi.useFakeTimers();
+    try {
+      at('12:00');
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 20 }], Date.now());
+      const weather = showers([
+        ['12:00', '12:08'],
+        ['12:09', '12:18'],
+        ['12:19', '12:28'],
+        ['12:29', '12:40'],
+      ]);
+
+      const first = await tick(harness, weather);
+      expect(first.alerts.map((a) => a.title)).toEqual(['More rain coming']);
+
+      for (const clock of ['12:10', '12:20']) {
+        at(clock);
+        expect((await tick(harness, weather)).alerts).toEqual([]);
+      }
+
+      at('12:30');
+      expect((await tick(harness, weather)).alerts.map((a) => a.title)).toEqual(['Rain ending soon']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('wait for a break that opens before the next tick, ending as usual until then', async () => {
+    vi.useFakeTimers();
+    try {
+      at('12:00');
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 20 }], Date.now());
+      const weather = showers([['11:30', '12:20'], ['12:35', '13:30']]);
+
+      const early = await tick(harness, weather);
+      expect(early.alerts.map((a) => a.title)).toEqual(['Rain ending soon']);
+
+      at('12:10');
+      const opening = await tick(harness, weather);
+      expect(opening.alerts.map((a) => a.title)).toEqual(['More rain coming']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('are sent once per break, however many ticks still see it', async () => {
+    // The minute feed lags the tick, so the tick after a break opens can still
+    // start on the wet side of it and read the same break a second time.
+    vi.useFakeTimers();
+    try {
+      at('12:10');
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 10 }], Date.now());
+      const windows: Array<[string, string]> = [['12:00', '12:15'], ['12:30', '13:00']];
+
+      const first = await tick(harness, showers(windows));
+      expect(first.alerts.map((a) => a.title)).toEqual(['More rain coming']);
+
+      at('12:20');
+      const again = await tick(harness, showers(windows, 8));
+      expect(again.alerts).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('are not followed by a start alert for the same rain, even when it is due past an hour out', async () => {
+    // A resume can announce rain further out than the lead time, so its dedup
+    // record has to last until that rain arrives — plus the drift one onset
+    // is allowed — rather than the hour a start alert's would.
+    vi.useFakeTimers();
+    try {
+      at('12:10');
+      const harness = makeHarness({ signingKey });
+      await plant(harness, [{ n: 1, leadTimeMinutes: 10 }], Date.now());
+
+      const resumed = await tick(harness, showers([['12:00', '12:15'], ['13:08', '14:00']]));
+      expect(resumed.alerts.map((a) => a.title)).toEqual(['More rain coming']);
+
+      // The onset has drifted 12 minutes later by the time it is inside the
+      // start window, and the alert that announced it is an hour old.
+      at('13:10');
+      const due = await tick(harness, showers([['13:20', '14:00']]));
+      expect(due.alerts).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('respect quiet hours and the rain-start opt-out, which leaves the end alert in place', async () => {
+    vi.useFakeTimers();
+    try {
+      at('12:10');
+      const harness = makeHarness({ signingKey });
+      await plant(
+        harness,
+        [
+          { n: 1 },
+          { n: 2, rainStartEnabled: false },
+          {
+            n: 3,
+            quietHoursEnabled: true,
+            quietHoursStartMinutes: 12 * 60,
+            quietHoursEndMinutes: 13 * 60,
+            timeZoneIdentifier: 'UTC',
+          },
+          { n: 4, rainStartEnabled: false, rainEndEnabled: false },
+        ],
+        Date.now()
+      );
+
+      const { alerts } = await tick(harness, showers([['12:00', '12:12'], ['12:25', '12:45']]));
+      expect(alerts.sort((a, b) => a.token.localeCompare(b.token))).toEqual([
+        { token: fakeToken(1), title: 'More rain coming' },
+        { token: fakeToken(2), title: 'Rain ending soon' },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('Live Activity updates where WeatherKit has no minute forecast', () => {
   it('end the activity at the tick after a wet hour ends', async () => {
     // Hour 10 wet, hour 11 dry, one device with a Live Activity. The terminal
@@ -615,28 +877,23 @@ describe('Live Activity updates where WeatherKit has no minute forecast', () => 
 });
 
 describe('what counts as a wet minute', () => {
-  // The cron's own threshold, not WeatherKit's: chance strictly above 30% AND
-  // some predicted intensity. Either half alone is not rain.
+  // This is the same OR predicate used by iOS: an actual amount or at least a
+  // 50% chance is rain. These exercise it through the complete cron path.
   const rainAt10 = (options: { chance: number; intensity: number }) => (t: number) =>
     forecast(t, (i) => i >= 10, options);
 
-  it('needs the chance to be above 30%, not at it', async () => {
+  it('accepts a predicted amount even when chance is low', async () => {
     const harness = makeHarness({ signingKey });
     await plant(harness, [{ n: 1, leadTimeMinutes: 30 }], Date.now());
-    const at = await tick(harness, rainAt10({ chance: 0.3, intensity: 2 }));
-    expect(at.alerts).toEqual([]);
-
-    const above = makeHarness({ signingKey });
-    await plant(above, [{ n: 1, leadTimeMinutes: 30 }], Date.now());
-    const over = await tick(above, rainAt10({ chance: 0.31, intensity: 2 }));
-    expect(alerted(over.alerts)).toEqual([fakeToken(1)]);
+    const { alerts } = await tick(harness, rainAt10({ chance: 0.2, intensity: 0.1 }));
+    expect(alerted(alerts)).toEqual([fakeToken(1)]);
   });
 
-  it('needs some predicted intensity, however likely the rain', async () => {
+  it('accepts likely rain even when the predicted amount is zero', async () => {
     const harness = makeHarness({ signingKey });
     await plant(harness, [{ n: 1, leadTimeMinutes: 30 }], Date.now());
     const { alerts } = await tick(harness, rainAt10({ chance: 0.95, intensity: 0 }));
-    expect(alerts).toEqual([]);
+    expect(alerted(alerts)).toEqual([fakeToken(1)]);
   });
 
   it('sends nothing at all for a dry hour', async () => {

@@ -11,6 +11,9 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
     ) -> Bool {
         UNUserNotificationCenter.current().delegate = self
         locationService.startMonitoringSignificantLocationChanges()
+        // Every launch, background ones included: a registration the Worker
+        // deferred or throttled before the app was last suspended still lands.
+        Task { await PushRegistrationService.shared.replayPendingRegistration() }
         return true
     }
 

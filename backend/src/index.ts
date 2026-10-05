@@ -17,6 +17,7 @@ import {
   APNsError,
   sendRainAlert,
   sendRainEndAlert,
+  sendRainResumeAlert,
   sendLiveActivityUpdate,
   encodeActivityDate,
   intensityFromMmPerHr,
@@ -28,6 +29,8 @@ import {
   isValidLongitude,
   isValidActivityToken,
   isValidDeviceToken,
+  isValidMinuteOfDay,
+  isValidTimeZoneIdentifier,
   secureEquals,
 } from './validate';
 import {
@@ -78,9 +81,40 @@ const SAME_ONSET_DRIFT_MINUTES = CRON_PERIOD_MINUTES + START_SLACK_MINUTES;
 // push every tick.
 const ALERT_FLOOR_MINUTES = 30;
 
-// The per-minute precipitation test behind rain-start and rain-end detection.
-const isWet = (m: { precipitationChance: number; precipitationIntensity: number }) =>
-  m.precipitationChance > 0.3 && m.precipitationIntensity > 0;
+// Shared with PrecipitationPeriod.detect on iOS. WeatherKit reports intensity
+// in mm/h on both APIs; the boundaries are deliberately inclusive.
+const LIKELY_RAIN_PROBABILITY = 0.5;
+const MINIMUM_WET_MM_PER_HOUR = 0.1;
+export const isWet = (m: { precipitationChance: number; precipitationIntensity: number }) =>
+  m.precipitationIntensity >= MINIMUM_WET_MM_PER_HOUR ||
+  m.precipitationChance >= LIKELY_RAIN_PROBABILITY;
+
+/** Whether ordinary alerts are currently silenced in the device's local time. */
+export function isInQuietHours(device: DeviceRegistration, at: Date): boolean {
+  if (device.quietHoursEnabled !== true) return false;
+  const start = device.quietHoursStartMinutes;
+  const end = device.quietHoursEndMinutes;
+  const timeZone = device.timeZoneIdentifier;
+  if (start === undefined || end === undefined || timeZone === undefined) return true;
+
+  let parts: Intl.DateTimeFormatPart[];
+  try {
+    parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hourCycle: 'h23',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).formatToParts(at);
+  } catch {
+    return true;
+  }
+  const hour = Number(parts.find((part) => part.type === 'hour')?.value);
+  const minute = Number(parts.find((part) => part.type === 'minute')?.value);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return true;
+  const localMinutes = hour * 60 + minute;
+  if (start <= end) return localMinutes >= start && localMinutes < end;
+  return localMinutes >= start || localMinutes < end;
+}
 
 // WeatherKit condition strings that should render with the wintry treatment.
 // The WeatherKit REST API documents forecastHourly.summary[].condition as
@@ -391,6 +425,19 @@ export default {
         const rainStart = rainingNow ? undefined : minutes.find(isWet);
         // Rain END: if it's raining now, the first upcoming dry minute (rain tapering off).
         const rainEnd = rainingNow ? minutes.find((m) => !isWet(m)) : undefined;
+        // Rain RESUMING: the break rainEnd opens begins before the next tick, and
+        // more rain follows it inside the hour — the server's half of the app's
+        // "More rain coming" alert. It is announced as the break opens because
+        // the next tick's start alert is exactly what the 30-minute floor
+        // swallows after a short shower.
+        const afterBreak = rainEnd ? minutes.slice(minutes.indexOf(rainEnd)).find(isWet) : undefined;
+        const rainResume =
+          rainEnd &&
+          afterBreak &&
+          Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000) <= CRON_PERIOD_MINUTES &&
+          new Date(afterBreak.startTime).getTime() > now
+            ? afterBreak
+            : undefined;
 
         if (!rainStart && !rainEnd) return;
 
@@ -415,25 +462,40 @@ export default {
         // A record with no onset in it was written before that keying and stands
         // for whatever rain the device was last told about, so it goes on
         // suppressing until it expires rather than repeating an alert on deploy.
+        //
+        // A resume shares the start record, so whichever announces an onset
+        // first, the other stays silent for it. The one difference: to a resume,
+        // a record a start alert wrote whose onset has already begun is spent —
+        // that is the rain now breaking, and the rain after the break is a
+        // different event however soon after the last alert it comes. A record
+        // a resume wrote is never spent, so in flickering rain one resume holds
+        // the next ones to the floor. The record names its kind for that.
         const notifyOnce = async (
           device: DeviceRegistration,
-          kind: 'start' | 'end',
+          kind: 'start' | 'resume' | 'end',
           onsetTime: string | undefined,
           send: () => Promise<void>
         ) => {
           const onsetMinute =
             onsetTime === undefined ? undefined : Math.round(new Date(onsetTime).getTime() / 60_000);
-          const metaKey = `notified-${kind}:${device.token}`;
+          const metaKey = `notified-${kind === 'end' ? 'end' : 'start'}:${device.token}`;
           const recorded = await env.DEVICES.get(metaKey);
           if (recorded !== null) {
-            const [notifiedAt, notifiedOnset] = recorded.split(':');
-            if (now - parseInt(notifiedAt) <= ALERT_FLOOR_MINUTES * 60 * 1000) return;
-            if (
-              onsetMinute !== undefined &&
-              (notifiedOnset === undefined ||
-                Math.abs(parseInt(notifiedOnset) - onsetMinute) <= SAME_ONSET_DRIFT_MINUTES)
-            ) {
-              return;
+            const [notifiedAt, notifiedOnset, notifiedKind] = recorded.split(':');
+            const spent =
+              kind === 'resume' &&
+              notifiedKind !== 'resume' &&
+              notifiedOnset !== undefined &&
+              parseInt(notifiedOnset) * 60_000 <= now;
+            if (!spent) {
+              if (now - parseInt(notifiedAt) <= ALERT_FLOOR_MINUTES * 60 * 1000) return;
+              if (
+                onsetMinute !== undefined &&
+                (notifiedOnset === undefined ||
+                  Math.abs(parseInt(notifiedOnset) - onsetMinute) <= SAME_ONSET_DRIFT_MINUTES)
+              ) {
+                return;
+              }
             }
           }
           // Claimed after the dedup check, so a push we were never going to
@@ -441,15 +503,21 @@ export default {
           if (!budget.spend()) return;
           try {
             await send();
-            // The record has to outlive the span it suppresses.
+            // The record has to outlive the span it suppresses. A resume can
+            // announce rain further out than the lead time, so its span runs
+            // to its own onset.
+            const spanMinutes =
+              kind === 'resume' && onsetMinute !== undefined
+                ? onsetMinute - Math.floor(now / 60_000)
+                : device.leadTimeMinutes;
             await env.DEVICES.put(
               metaKey,
-              onsetMinute === undefined ? now.toString() : `${now}:${onsetMinute}`,
+              onsetMinute === undefined ? now.toString() : `${now}:${onsetMinute}:${kind}`,
               {
                 expirationTtl:
                   onsetMinute === undefined
                     ? 3600
-                    : Math.max(3600, (device.leadTimeMinutes + SAME_ONSET_DRIFT_MINUTES) * 60),
+                    : Math.max(3600, (spanMinutes + SAME_ONSET_DRIFT_MINUTES) * 60),
               }
             );
           } catch (err) {
@@ -461,6 +529,7 @@ export default {
         for (const device of grid.devices) {
           if (pendingReaps.has(device.token)) continue;
           const activityToken = activityTokens.get(device.token);
+          const alertsQuiet = isInQuietHours(device, new Date(now));
           if (rainStart && device.rainStartEnabled !== false) {
             const minutesUntilRain = Math.round((new Date(rainStart.startTime).getTime() - now) / 60000);
             // Widened by one cron period: at a 10-minute lead time the alert window
@@ -476,15 +545,17 @@ export default {
               minutesUntilRain <= device.leadTimeMinutes + CRON_PERIOD_MINUTES &&
               minutesUntilRain >= -START_SLACK_MINUTES
             ) {
-              await notifyOnce(device, 'start', rainStart.startTime, () =>
-                sendRainAlert(
-                  device.token,
-                  minutesUntilRain,
-                  env,
-                  intensityFromMmPerHr(rainStart.precipitationIntensity)
-                )
-              );
-              console.log(`[Cron] Rain-start grid ${grid.gridKey}, in ${minutesUntilRain}m`);
+              if (!alertsQuiet) {
+                await notifyOnce(device, 'start', rainStart.startTime, () =>
+                  sendRainAlert(
+                    device.token,
+                    minutesUntilRain,
+                    env,
+                    intensityFromMmPerHr(rainStart.precipitationIntensity)
+                  )
+                );
+                console.log(`[Cron] Rain-start grid ${grid.gridKey}, in ${minutesUntilRain}m`);
+              }
 
               // Live Activity: rain incoming (State A). Only relevant within the same
               // lead-time window as the alert above; a push failure here must never
@@ -519,9 +590,21 @@ export default {
               }
             }
           }
+          // A resume is a start-kind alert, so it follows the rain-start opt-out.
+          const resume = device.rainStartEnabled !== false ? rainResume : undefined;
+          if (resume && !alertsQuiet) {
+            const minutesUntilResume = Math.round((new Date(resume.startTime).getTime() - now) / 60000);
+            await notifyOnce(device, 'resume', resume.startTime, () =>
+              sendRainResumeAlert(device.token, minutesUntilResume, env)
+            );
+            console.log(`[Cron] Rain-resume grid ${grid.gridKey}, in ${minutesUntilResume}m`);
+          }
           if (rainEnd && device.rainEndEnabled !== false) {
             const minutesUntilEnd = Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000);
-            if (minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
+            // The resume above speaks for this break. Saying "Rain ending soon"
+            // as well would read as the end of it, and a second `notified-*`
+            // read would break the one-per-device count in abuse.ts.
+            if (!resume && !alertsQuiet && minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
               await notifyOnce(device, 'end', undefined, () =>
                 sendRainEndAlert(device.token, env, minutesUntilEnd)
               );
@@ -681,9 +764,13 @@ interface RegistrationSettings {
   leadTimeMinutes: number;
   rainStartEnabled: boolean;
   rainEndEnabled: boolean;
+  quietHoursEnabled: boolean;
+  quietHoursStartMinutes: number;
+  quietHoursEndMinutes: number;
+  timeZoneIdentifier: string;
 }
 
-type WriteDecision = 'write' | 'unchanged' | 'cooling-down';
+type WriteDecision = 'write' | 'unchanged' | 'cooling-down' | 'opt-outs-only';
 
 /**
  * Whether this registration is persisted now, and if not, why not.
@@ -706,23 +793,29 @@ type WriteDecision = 'write' | 'unchanged' | 'cooling-down';
  *   4. same cell, unchanged   -> skip. The common case: the client re-registers
  *                                on cold launch, on every foreground and after
  *                                every poll, and almost all of it is a repeat.
- *   5. same cell, changed,
- *      inside the cooldown    -> defer. Only settings can reach here
- *                                (leadTimeMinutes, rainStartEnabled,
- *                                rainEndEnabled), and it self-heals on the next
- *                                registration, which the client issues after
- *                                every successful poll.
+ *   5. alert enabled -> off,
+ *      nothing turned on      -> write immediately. An explicit opt-out must
+ *                                never wait behind an abuse cooldown.
+ *   6. same cell, changed,
+ *      inside the cooldown    -> return an explicit 202 deferral. The client
+ *                                retries after the remaining cooldown instead
+ *                                of mistaking stale settings for success. If
+ *                                the request also turns an alert off, that
+ *                                opt-out alone is written first ('opt-outs-only')
+ *                                and the 202 covers the rest: the client sends
+ *                                its whole policy, so an opt-out often travels
+ *                                with a re-enable still waiting out the cooldown.
+ *
+ * Steps 5 and 6 write inside the cooldown only to turn alerts off, so each such
+ * write shrinks the set of enabled alerts: at most two can follow any write that
+ * re-enables them, which keeps the cooldown a bound rather than something to
+ * alternate past.
  *
  * A record with no `renewedAt` counts as refresh-due: it predates the field, so
  * there is no evidence of when it was last written and guessing young would risk
  * the very expiry step 2 exists to prevent.
  *
- * If the adversarial rewrite drain ever shows up in real traffic, the fix that
- * was deliberately NOT taken here is an explicit deferral protocol — 202 with
- * `deferred: true` and a `retryAfterSeconds`, plus a client that records a
- * location only once the server confirms it stored it. That keeps a deferred
- * move retryable instead of silently dropped, which is what made deferring a
- * cell change unacceptable in the first place.
+ * Cell changes remain immediate and are never part of the deferral protocol.
  */
 function writeDecision(
   existing: DeviceRegistration,
@@ -750,13 +843,33 @@ function writeDecision(
     return 'write';
   }
 
+  const startWas = existing.rainStartEnabled ?? true;
+  const endWas = existing.rainEndEnabled ?? true;
+  const disablesAlert =
+    (startWas && !settings.rainStartEnabled) || (endWas && !settings.rainEndEnabled);
+  const enablesAlert =
+    (!startWas && settings.rainStartEnabled) || (!endWas && settings.rainEndEnabled);
+  if (disablesAlert && !enablesAlert) return 'write';
+
   const changed =
     existing.leadTimeMinutes !== settings.leadTimeMinutes ||
     (existing.rainStartEnabled ?? true) !== settings.rainStartEnabled ||
-    (existing.rainEndEnabled ?? true) !== settings.rainEndEnabled;
+    (existing.rainEndEnabled ?? true) !== settings.rainEndEnabled ||
+    (existing.quietHoursEnabled ?? false) !== settings.quietHoursEnabled ||
+    (existing.quietHoursStartMinutes ?? 22 * 60) !== settings.quietHoursStartMinutes ||
+    (existing.quietHoursEndMinutes ?? 7 * 60) !== settings.quietHoursEndMinutes ||
+    (existing.timeZoneIdentifier ?? 'UTC') !== settings.timeZoneIdentifier;
   if (!changed) return 'unchanged';
 
-  return sinceWrite >= DEVICE_REWRITE_COOLDOWN_SECONDS * 1000 ? 'write' : 'cooling-down';
+  if (sinceWrite >= DEVICE_REWRITE_COOLDOWN_SECONDS * 1000) return 'write';
+  return disablesAlert ? 'opt-outs-only' : 'cooling-down';
+}
+
+function rewriteCooldownRemainingSeconds(existing: DeviceRegistration): number {
+  const renewedAt = existing.renewedAt ? Date.parse(existing.renewedAt) : Number.NaN;
+  if (Number.isNaN(renewedAt)) return 0;
+  const elapsed = Math.max(0, Date.now() - renewedAt);
+  return Math.max(1, Math.ceil(DEVICE_REWRITE_COOLDOWN_SECONDS - elapsed / 1000));
 }
 
 // Every write of a `device:` record goes through here so none can silently
@@ -1040,6 +1153,10 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     leadTimeMinutes?: unknown;
     rainStartEnabled?: unknown;
     rainEndEnabled?: unknown;
+    quietHoursEnabled?: unknown;
+    quietHoursStartMinutes?: unknown;
+    quietHoursEndMinutes?: unknown;
+    timeZoneIdentifier?: unknown;
   }>(request);
   if (!body) return json({ error: 'Malformed JSON body' }, 400);
 
@@ -1048,6 +1165,18 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   }
   if (!isValidLatitude(body.lat) || !isValidLongitude(body.lon)) {
     return json({ error: 'Invalid or missing lat/lon' }, 400);
+  }
+  const quietHoursEnabled = asBoolean(body.quietHoursEnabled, false);
+  if (
+    (body.quietHoursStartMinutes !== undefined && !isValidMinuteOfDay(body.quietHoursStartMinutes)) ||
+    (body.quietHoursEndMinutes !== undefined && !isValidMinuteOfDay(body.quietHoursEndMinutes)) ||
+    (body.timeZoneIdentifier !== undefined && !isValidTimeZoneIdentifier(body.timeZoneIdentifier)) ||
+    (quietHoursEnabled &&
+      (!isValidMinuteOfDay(body.quietHoursStartMinutes) ||
+        !isValidMinuteOfDay(body.quietHoursEndMinutes) ||
+        !isValidTimeZoneIdentifier(body.timeZoneIdentifier)))
+  ) {
+    return json({ error: 'Invalid quiet-hours policy' }, 400);
   }
 
   const gridKey = toGridKey(body.lat, body.lon);
@@ -1086,6 +1215,16 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     leadTimeMinutes: clampLeadTimeMinutes(body.leadTimeMinutes),
     rainStartEnabled: asBoolean(body.rainStartEnabled, true),
     rainEndEnabled: asBoolean(body.rainEndEnabled, true),
+    quietHoursEnabled,
+    quietHoursStartMinutes: isValidMinuteOfDay(body.quietHoursStartMinutes)
+      ? body.quietHoursStartMinutes
+      : 22 * 60,
+    quietHoursEndMinutes: isValidMinuteOfDay(body.quietHoursEndMinutes)
+      ? body.quietHoursEndMinutes
+      : 7 * 60,
+    timeZoneIdentifier: isValidTimeZoneIdentifier(body.timeZoneIdentifier)
+      ? body.timeZoneIdentifier
+      : 'UTC',
   };
 
   // Opening a *new* grid cell is the expensive act: it adds ~4,383 WeatherKit
@@ -1163,12 +1302,41 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   // gridKey reported back is always the one now stored.
   if (existing) {
     const decision = writeDecision(existing, settings);
+    if (decision === 'opt-outs-only') {
+      try {
+        await putDeviceRecord(
+          body.token,
+          {
+            ...existing,
+            rainStartEnabled: (existing.rainStartEnabled ?? true) && settings.rainStartEnabled,
+            rainEndEnabled: (existing.rainEndEnabled ?? true) && settings.rainEndEnabled,
+          },
+          env
+        );
+      } catch (err) {
+        console.error(`[Register] KV write failed: ${err}`);
+        return json({ error: 'KV write failed' }, 500);
+      }
+    }
     if (decision !== 'write') {
       console.log(
         decision === 'unchanged'
           ? `[Register] Unchanged and still fresh, skipped the write for grid ${gridKey}`
-          : `[Register] Same-cell settings change cooling down, kept grid ${gridKey} for now`
+          : decision === 'opt-outs-only'
+            ? `[Register] Stored the opt-outs for grid ${gridKey}; the rest is cooling down`
+            : `[Register] Same-cell settings change cooling down, kept grid ${gridKey} for now`
       );
+      if (decision !== 'unchanged') {
+        const retryAfterSeconds =
+          decision === 'opt-outs-only'
+            ? DEVICE_REWRITE_COOLDOWN_SECONDS
+            : rewriteCooldownRemainingSeconds(existing);
+        return json(
+          { ok: false, deferred: true, retryAfterSeconds, gridKey },
+          202,
+          { 'Retry-After': String(retryAfterSeconds) }
+        );
+      }
       return json({ ok: true, gridKey });
     }
   }

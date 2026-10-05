@@ -56,6 +56,11 @@ final class LocationService: NSObject, ObservableObject {
         manager.authorizationStatus == .authorizedAlways
     }
 
+    /// The most recent fix CoreLocation has, without asking for a new one.
+    var lastKnownLocation: CLLocation? {
+        manager.location
+    }
+
     func requestPermission() {
         manager.requestWhenInUseAuthorization()
     }
