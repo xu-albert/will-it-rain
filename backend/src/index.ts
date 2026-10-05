@@ -770,7 +770,7 @@ interface RegistrationSettings {
   timeZoneIdentifier: string;
 }
 
-type WriteDecision = 'write' | 'unchanged' | 'cooling-down';
+type WriteDecision = 'write' | 'unchanged' | 'cooling-down' | 'opt-outs-only';
 
 /**
  * Whether this registration is persisted now, and if not, why not.
@@ -795,16 +795,21 @@ type WriteDecision = 'write' | 'unchanged' | 'cooling-down';
  *                                every poll, and almost all of it is a repeat.
  *   5. alert enabled -> off,
  *      nothing turned on      -> write immediately. An explicit opt-out must
- *                                never wait behind an abuse cooldown. Only a
- *                                request that turns nothing on qualifies, so
- *                                each such write shrinks the set of enabled
- *                                alerts: at most two can follow any write that
- *                                re-enables them, which keeps the cooldown a
- *                                bound rather than something to alternate past.
+ *                                never wait behind an abuse cooldown.
  *   6. same cell, changed,
  *      inside the cooldown    -> return an explicit 202 deferral. The client
  *                                retries after the remaining cooldown instead
- *                                of mistaking stale settings for success.
+ *                                of mistaking stale settings for success. If
+ *                                the request also turns an alert off, that
+ *                                opt-out alone is written first ('opt-outs-only')
+ *                                and the 202 covers the rest: the client sends
+ *                                its whole policy, so an opt-out often travels
+ *                                with a re-enable still waiting out the cooldown.
+ *
+ * Steps 5 and 6 write inside the cooldown only to turn alerts off, so each such
+ * write shrinks the set of enabled alerts: at most two can follow any write that
+ * re-enables them, which keeps the cooldown a bound rather than something to
+ * alternate past.
  *
  * A record with no `renewedAt` counts as refresh-due: it predates the field, so
  * there is no evidence of when it was last written and guessing young would risk
@@ -856,7 +861,8 @@ function writeDecision(
     (existing.timeZoneIdentifier ?? 'UTC') !== settings.timeZoneIdentifier;
   if (!changed) return 'unchanged';
 
-  return sinceWrite >= DEVICE_REWRITE_COOLDOWN_SECONDS * 1000 ? 'write' : 'cooling-down';
+  if (sinceWrite >= DEVICE_REWRITE_COOLDOWN_SECONDS * 1000) return 'write';
+  return disablesAlert ? 'opt-outs-only' : 'cooling-down';
 }
 
 function rewriteCooldownRemainingSeconds(existing: DeviceRegistration): number {
@@ -1296,14 +1302,35 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   // gridKey reported back is always the one now stored.
   if (existing) {
     const decision = writeDecision(existing, settings);
+    if (decision === 'opt-outs-only') {
+      try {
+        await putDeviceRecord(
+          body.token,
+          {
+            ...existing,
+            rainStartEnabled: (existing.rainStartEnabled ?? true) && settings.rainStartEnabled,
+            rainEndEnabled: (existing.rainEndEnabled ?? true) && settings.rainEndEnabled,
+          },
+          env
+        );
+      } catch (err) {
+        console.error(`[Register] KV write failed: ${err}`);
+        return json({ error: 'KV write failed' }, 500);
+      }
+    }
     if (decision !== 'write') {
       console.log(
         decision === 'unchanged'
           ? `[Register] Unchanged and still fresh, skipped the write for grid ${gridKey}`
-          : `[Register] Same-cell settings change cooling down, kept grid ${gridKey} for now`
+          : decision === 'opt-outs-only'
+            ? `[Register] Stored the opt-outs for grid ${gridKey}; the rest is cooling down`
+            : `[Register] Same-cell settings change cooling down, kept grid ${gridKey} for now`
       );
-      if (decision === 'cooling-down') {
-        const retryAfterSeconds = rewriteCooldownRemainingSeconds(existing);
+      if (decision !== 'unchanged') {
+        const retryAfterSeconds =
+          decision === 'opt-outs-only'
+            ? DEVICE_REWRITE_COOLDOWN_SECONDS
+            : rewriteCooldownRemainingSeconds(existing);
         return json(
           { ok: false, deferred: true, retryAfterSeconds, gridKey },
           202,

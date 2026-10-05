@@ -1127,35 +1127,49 @@ describe('registration records expire', () => {
     }
   });
 
-  it('takes the opt-out path only for a request that turns nothing on', async () => {
-    // Swapping which alert is off disables something every time. Were that
-    // enough to skip the cooldown, each swap would write, and same-cell churn
-    // would be bounded by the per-client throttle alone.
+  it('applies an opt-out at once even when the same request carries a cooled re-enable', async () => {
+    // The client sends its whole policy every time. Turning rain-end off, back
+    // on, and then rain-start off inside one cooldown arrives last as {start
+    // off, end on}: the opt-out has to land now, the re-enable has to wait.
+    const policy = (rainStartEnabled: boolean, rainEndEnabled: boolean) =>
+      registerRequest(1, { cell: 0, rainStartEnabled, rainEndEnabled });
+    const stored = () =>
+      JSON.parse(kv.raw(`device:${fakeToken(1)}`)!) as { rainStartEnabled: boolean; rainEndEnabled: boolean };
+
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
-      await worker.fetch(registerRequest(1, { cell: 0, rainStartEnabled: true, rainEndEnabled: false }), env);
+      await worker.fetch(policy(true, true), env);
+
+      vi.advanceTimersByTime(30_000);
+      expect((await worker.fetch(policy(true, false), env)).status).toBe(200);
+      vi.advanceTimersByTime(60_000);
+      expect((await worker.fetch(policy(true, true), env)).status).toBe(202);
       const settled = kv.puts;
 
-      for (let n = 0; n < 6; n++) {
+      vi.advanceTimersByTime(30_000);
+      const mixed = await worker.fetch(policy(false, true), env);
+      expect(mixed.status).toBe(202);
+      expect(await mixed.json()).toMatchObject({
+        deferred: true,
+        retryAfterSeconds: DEVICE_REWRITE_COOLDOWN_SECONDS,
+      });
+      expect(kv.puts).toBe(settled + 1);
+      expect(stored()).toMatchObject({ rainStartEnabled: false, rainEndEnabled: false });
+
+      // Swapping which alert is off writes nothing more: an immediate write can
+      // only turn alerts off, and none is left on.
+      for (let n = 0; n < 4; n++) {
         vi.advanceTimersByTime(30_000);
         const swapped = n % 2 === 0;
-        const response = await worker.fetch(
-          registerRequest(1, { cell: 0, rainStartEnabled: !swapped, rainEndEnabled: swapped }),
-          env
-        );
-        expect(response.status).toBe(swapped ? 202 : 200);
+        expect((await worker.fetch(policy(swapped, !swapped), env)).status).toBe(202);
       }
-      expect(kv.puts).toBe(settled);
-
-      // A plain opt-out still lands at once, inside the same cooldown.
-      vi.advanceTimersByTime(30_000);
-      const optOut = await worker.fetch(
-        registerRequest(1, { cell: 0, rainStartEnabled: false, rainEndEnabled: false }),
-        env
-      );
-      expect(optOut.status).toBe(200);
       expect(kv.puts).toBe(settled + 1);
+
+      // Once the cooldown is up, the replayed policy lands whole.
+      vi.advanceTimersByTime(DEVICE_REWRITE_COOLDOWN_SECONDS * 1000);
+      expect((await worker.fetch(policy(false, true), env)).status).toBe(200);
+      expect(stored()).toMatchObject({ rainStartEnabled: false, rainEndEnabled: true });
     } finally {
       vi.useRealTimers();
     }
