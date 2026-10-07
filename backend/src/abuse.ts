@@ -242,11 +242,12 @@ export const DEVICE_RECORD_REFRESH_SECONDS = 7 * 24 * 60 * 60; // 7 days
 // this does bound is same-cell settings churn — lead time, the two alert
 // switches, and the quiet-hours window and time zone. A change inside the
 // cooldown gets a 202 with `retryAfterSeconds`, which the client persists and
-// replays. The one exemption is an opt-out, written at once — on its own when
-// the same request also turns something on, the rest of which still waits; each
-// such write can only shrink the set of enabled alerts, so at most two follow
-// any cooled write, and the ceiling is 3 x 1,440/5 = 864 writes a day per device
-// rather than an unbounded alternation.
+// replays. The one exemption is an opt-out — an alert switched off, or quiet
+// hours switched on — written at once, on its own when the same request also
+// turns something on, the rest of which still waits; each such write can only
+// shrink the set of enabled alerts, so at most three follow any cooled write,
+// and the ceiling is 4 x 1,440/5 = 1,152 writes a day per device rather than an
+// unbounded alternation.
 //
 // Cell changes are still never deferred, even though the client could now
 // replay a 202: the wrong-area window that would open is the break described
@@ -379,7 +380,7 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //                                 deliberate, because deferring a real move
 //                                 silently alerts the user for the wrong area.
 //                                 The cooldown bounds only same-cell settings
-//                                 churn, at 864/day per device counting the
+//                                 churn, at 1,152/day per device counting the
 //                                 opt-outs it lets through. This term is why
 //                                 the header above no longer calls registration
 //                                 bounded.

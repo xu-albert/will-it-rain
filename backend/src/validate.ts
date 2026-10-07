@@ -8,12 +8,16 @@
 
 const HEX_ONLY = /^[0-9a-f]+$/i;
 
-// Every APNs device token in production today is 32 bytes (64 hex chars), but
-// Apple has explicitly reserved the right to change that, so allow headroom
-// rather than pinning the exact size. This one is strict-ish because the device
-// token becomes part of a KV key.
+// Every APNs device token on a phone today is 32 bytes (64 hex chars), but Apple
+// has explicitly reserved the right to change that, and the iOS 26 simulator
+// already issues 80-byte (160 hex) tokens. A cap at 128 turned every one of
+// those away with a 400, which is exactly how a lengthened production token
+// would fail: silently, on every new install. 256 (128 bytes) leaves room for
+// that. The bound still matters because the token becomes part of a KV key:
+// the longest one built from it, `notified-start:<token>`, stays near half of
+// KV's 512-byte key limit.
 const MIN_TOKEN_LENGTH = 64;
-const MAX_DEVICE_TOKEN_LENGTH = 128;
+const MAX_DEVICE_TOKEN_LENGTH = 256;
 
 // ActivityKit push tokens are a different, longer format than device tokens and
 // Apple documents no fixed size. This value is only ever stored inside a record,
