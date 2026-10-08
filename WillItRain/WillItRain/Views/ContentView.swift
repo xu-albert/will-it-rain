@@ -5,6 +5,7 @@ import Combine
 
 enum AppError {
     case locationDenied
+    case noLocationFix
     case network(String)
 }
 
@@ -122,7 +123,9 @@ struct ContentView: View {
                 locationService.requestAlwaysPermission()
                 locationService.startMonitoringSignificantLocationChanges()
             }
-            Button("Not Now", role: .cancel) { }
+            Button("Not Now", role: .cancel) {
+                locationService.dismissAlwaysPermissionPrompt()
+            }
         } message: {
             Text("Consider allowing background location so you get rain notifications everywhere, even if you don't open the app to update your location.")
         }
@@ -244,6 +247,7 @@ struct ContentView: View {
                     .font(.system(size: 18))
                     .foregroundColor(.white.opacity(0.85))
             }
+            .accessibilityLabel("Settings")
         }
         .padding(.horizontal, 20)
         .padding(.top, 8)
@@ -276,27 +280,39 @@ struct ContentView: View {
                 .padding(.vertical, 10)
                 .background(Capsule().fill(.white.opacity(0.2)))
 
+            case .noLocationFix:
+                retryableError(
+                    icon: "location.slash",
+                    title: "Location Unavailable",
+                    message: LocationError.noFix.localizedDescription
+                )
+
             case .network(let message):
-                Image(systemName: "wifi.slash")
-                    .font(.system(size: 40))
-                    .foregroundColor(.white.opacity(0.7))
-                Text("Connection Issue")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(.white)
-                Text(message)
-                    .foregroundColor(.white.opacity(0.7))
-                    .font(.system(size: 15))
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 40)
-                Button("Try Again") {
-                    Task { await fetchWeather() }
-                }
-                .foregroundColor(.white)
-                .padding(.horizontal, 24)
-                .padding(.vertical, 10)
-                .background(Capsule().fill(.white.opacity(0.2)))
+                retryableError(icon: "wifi.slash", title: "Connection Issue", message: message)
             }
         }
+    }
+
+    @ViewBuilder
+    private func retryableError(icon: String, title: String, message: String) -> some View {
+        Image(systemName: icon)
+            .font(.system(size: 40))
+            .foregroundColor(.white.opacity(0.7))
+        Text(title)
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundColor(.white)
+        Text(message)
+            .foregroundColor(.white.opacity(0.7))
+            .font(.system(size: 15))
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 40)
+        Button("Try Again") {
+            Task { await fetchWeather() }
+        }
+        .foregroundColor(.white)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 10)
+        .background(Capsule().fill(.white.opacity(0.2)))
     }
 
     // MARK: - Data Fetching
@@ -340,13 +356,16 @@ struct ContentView: View {
             NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: settings)
             LiveActivityService.shared.sync(forecast: forecast, settings: settings)
 
-            // Check if user has traveled — prompt for "Always" location if so
-            if locationService.hasUserTraveled(from: location) {
+            // Register for remote push notifications
+            let granted = await NotificationService.shared.requestPermission()
+
+            // Check if user has traveled — prompt for "Always" location if so.
+            // The prompt promises rain alerts, so it is only for someone who
+            // gets them.
+            if granted, locationService.hasUserTraveled(from: location) {
                 showTravelLocationPrompt = true
             }
 
-            // Register for remote push notifications
-            let granted = await NotificationService.shared.requestPermission()
             if granted {
                 await MainActor.run { UIApplication.shared.registerForRemoteNotifications() }
                 // Wait briefly for APNs to deliver the device token
@@ -362,6 +381,11 @@ struct ContentView: View {
         } catch LocationError.permissionDenied {
             appState = .error(.locationDenied)
             return
+        } catch LocationError.noFix {
+            appState = .error(.noLocationFix)
+            weatherPoller.schedule(after: 60) {
+                Task { await fetchWeather() }
+            }
         } catch {
             appState = .error(.network(error.localizedDescription))
             weatherPoller.schedule(after: 60) {

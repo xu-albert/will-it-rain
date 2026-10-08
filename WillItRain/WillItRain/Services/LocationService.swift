@@ -36,6 +36,13 @@ final class LocationService: NSObject, ObservableObject {
     // of the delegate clears this by resuming the waiters.
     private var requestInFlight = false
 
+    // Every caller waiting for the user to answer the location prompt. A fix
+    // must not be asked for before then: `requestLocation()` issued while the
+    // status is still `.notDetermined` fails at once with kCLErrorDenied, which
+    // is how a fresh install's first screen became "Connection Issue —
+    // kCLErrorDomain error 1" right after the user tapped Allow.
+    private var authorizationWaiters: [CheckedContinuation<CLAuthorizationStatus, Never>] = []
+
     @Published var locationName: String = ""
 
     init(manager: CLLocationManager = CLLocationManager()) {
@@ -67,6 +74,12 @@ final class LocationService: NSObject, ObservableObject {
 
     func requestAlwaysPermission() {
         manager.requestAlwaysAuthorization()
+        UserDefaults.standard.set(true, forKey: Self.alwaysPromptShownKey)
+    }
+
+    /// "Not Now" on the travel prompt is an answer too: without recording it the
+    /// prompt came back on every fetch for as long as the user stayed away.
+    func dismissAlwaysPermissionPrompt() {
         UserDefaults.standard.set(true, forKey: Self.alwaysPromptShownKey)
     }
 
@@ -117,13 +130,9 @@ final class LocationService: NSObject, ObservableObject {
     }
 
     func currentLocation() async throws -> CLLocation {
-        let status = manager.authorizationStatus
+        let status = await resolvedAuthorizationStatus()
         if status == .denied || status == .restricted {
             throw LocationError.permissionDenied
-        }
-
-        if status == .notDetermined {
-            manager.requestWhenInUseAuthorization()
         }
 
         return try await withCheckedThrowingContinuation { continuation in
@@ -138,6 +147,46 @@ final class LocationService: NSObject, ObservableObject {
                 self.manager.requestLocation()
             }
         }
+    }
+
+    /// The authorization status once the user has answered the prompt, asking
+    /// for When In Use first if nobody has asked yet. Callers arriving while the
+    /// prompt is up share the one request.
+    private func resolvedAuthorizationStatus() async -> CLAuthorizationStatus {
+        let status = manager.authorizationStatus
+        guard status == .notDetermined else { return status }
+        return await withCheckedContinuation { continuation in
+            authorizationWaiters.append(continuation)
+            manager.delegate = self
+            if authorizationWaiters.count == 1 {
+                manager.requestWhenInUseAuthorization()
+            }
+        }
+    }
+
+    private func authorizationDidChange() {
+        let status = manager.authorizationStatus
+        // CoreLocation also reports the initial `.notDetermined` as soon as a
+        // delegate is set; only an answer ends the wait.
+        guard status != .notDetermined else { return }
+        let pending = authorizationWaiters
+        authorizationWaiters.removeAll()
+        for continuation in pending {
+            continuation.resume(returning: status)
+        }
+    }
+
+    /// What a CoreLocation failure means to the user. A raw CLError reached the
+    /// screen as "kCLErrorDomain error 0/1" under a "Connection Issue" heading.
+    private func mapped(_ error: Error) -> Error {
+        guard let clError = error as? CLError else { return error }
+        if clError.code == .denied {
+            let status = manager.authorizationStatus
+            if status == .denied || status == .restricted {
+                return LocationError.permissionDenied
+            }
+        }
+        return LocationError.noFix
     }
 
     /// Hands one location fix — or one failure — to everyone waiting on it.
@@ -190,7 +239,13 @@ extension LocationService: CLLocationManagerDelegate {
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         Task { @MainActor in
-            self.resumeWaiters(with: .failure(error))
+            self.resumeWaiters(with: .failure(self.mapped(error)))
+        }
+    }
+
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        Task { @MainActor in
+            self.authorizationDidChange()
         }
     }
 }
