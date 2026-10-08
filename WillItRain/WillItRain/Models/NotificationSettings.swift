@@ -10,11 +10,25 @@ class NotificationSettings: ObservableObject {
     @Published var quietHoursEnabled: Bool {
         didSet { defaults.set(quietHoursEnabled, forKey: "quietHoursEnabled") }
     }
-    @Published var quietHoursStart: Date {
-        didSet { persist(quietHoursStart, forKey: "quietHoursStart") }
+    /// Quiet hours are a time of day, kept as minutes since local midnight.
+    /// They used to be absolute `Date`s whose hour and minute were re-read in
+    /// whatever zone the device was in, so a window picked in Los Angeles as
+    /// 22:00 became 01:00 in New York, and the Worker silenced the wrong hours.
+    @Published var quietHoursStartMinutes: Int {
+        didSet { defaults.set(quietHoursStartMinutes, forKey: Self.quietHoursStartMinutesKey) }
     }
-    @Published var quietHoursEnd: Date {
-        didSet { persist(quietHoursEnd, forKey: "quietHoursEnd") }
+    @Published var quietHoursEndMinutes: Int {
+        didSet { defaults.set(quietHoursEndMinutes, forKey: Self.quietHoursEndMinutesKey) }
+    }
+
+    /// The time pickers' view of `quietHoursStartMinutes`: today at that time.
+    var quietHoursStart: Date {
+        get { Self.today(at: quietHoursStartMinutes) }
+        set { quietHoursStartMinutes = Self.minutesSinceMidnight(newValue) }
+    }
+    var quietHoursEnd: Date {
+        get { Self.today(at: quietHoursEndMinutes) }
+        set { quietHoursEndMinutes = Self.minutesSinceMidnight(newValue) }
     }
     @Published var rainStartEnabled: Bool {
         didSet { defaults.set(rainStartEnabled, forKey: "rainStartEnabled") }
@@ -73,11 +87,12 @@ class NotificationSettings: ObservableObject {
         self.chartHours = d.object(forKey: "chartHours") as? Int ?? 12
         self.useCelsius = d.bool(forKey: "useCelsius")
 
-        let calendar = Calendar.current
-        self.quietHoursStart = Self.storedDate(forKey: "quietHoursStart", in: d)
-            ?? calendar.date(from: DateComponents(hour: 22, minute: 0)) ?? Date()
-        self.quietHoursEnd = Self.storedDate(forKey: "quietHoursEnd", in: d)
-            ?? calendar.date(from: DateComponents(hour: 7, minute: 0)) ?? Date()
+        self.quietHoursStartMinutes = Self.storedMinutes(
+            forKey: Self.quietHoursStartMinutesKey, legacyDateKey: "quietHoursStart", in: d
+        ) ?? 22 * 60
+        self.quietHoursEndMinutes = Self.storedMinutes(
+            forKey: Self.quietHoursEndMinutesKey, legacyDateKey: "quietHoursEnd", in: d
+        ) ?? 7 * 60
 
         self.lastNotifiedPrecipStart = Self.storedDate(forKey: "lastNotifiedPrecipStart", in: d)
         self.lastNotifiedPrecipEnd = Self.storedDate(forKey: "lastNotifiedPrecipEnd", in: d)
@@ -102,12 +117,37 @@ class NotificationSettings: ObservableObject {
         return Date(timeIntervalSinceReferenceDate: defaults.double(forKey: key))
     }
 
+    private static let quietHoursStartMinutesKey = "quietHoursStartMinutes"
+    private static let quietHoursEndMinutesKey = "quietHoursEndMinutes"
+
+    /// Reads a time of day, converting a value an older build stored as an
+    /// absolute `Date` once, in the zone the device is in at the upgrade, and
+    /// storing the result so it never moves again.
+    private static func storedMinutes(forKey key: String, legacyDateKey: String, in defaults: UserDefaults) -> Int? {
+        if defaults.object(forKey: key) != nil {
+            let minutes = defaults.integer(forKey: key)
+            return (0..<24 * 60).contains(minutes) ? minutes : nil
+        }
+        guard let legacy = storedDate(forKey: legacyDateKey, in: defaults) else { return nil }
+        let minutes = minutesSinceMidnight(legacy)
+        defaults.set(minutes, forKey: key)
+        defaults.removeObject(forKey: legacyDateKey)
+        return minutes
+    }
+
+    static func minutesSinceMidnight(_ date: Date, calendar: Calendar = .current) -> Int {
+        calendar.component(.hour, from: date) * 60 + calendar.component(.minute, from: date)
+    }
+
+    private static func today(at minutes: Int, calendar: Calendar = .current) -> Date {
+        calendar.date(bySettingHour: minutes / 60, minute: minutes % 60, second: 0, of: Date()) ?? Date()
+    }
+
     func isInQuietHours(at date: Date = Date()) -> Bool {
         guard quietHoursEnabled else { return false }
-        let calendar = Calendar.current
-        let nowMinutes = calendar.component(.hour, from: date) * 60 + calendar.component(.minute, from: date)
-        let startMinutes = calendar.component(.hour, from: quietHoursStart) * 60 + calendar.component(.minute, from: quietHoursStart)
-        let endMinutes = calendar.component(.hour, from: quietHoursEnd) * 60 + calendar.component(.minute, from: quietHoursEnd)
+        let nowMinutes = Self.minutesSinceMidnight(date)
+        let startMinutes = quietHoursStartMinutes
+        let endMinutes = quietHoursEndMinutes
 
         if startMinutes <= endMinutes {
             return nowMinutes >= startMinutes && nowMinutes < endMinutes
@@ -152,23 +192,15 @@ struct RemoteAlertSettings: Hashable {
         self.timeZoneIdentifier = timeZoneIdentifier
     }
 
-    init(
-        settings: NotificationSettings,
-        calendar: Calendar = .autoupdatingCurrent,
-        timeZone: TimeZone = .autoupdatingCurrent
-    ) {
-        var localCalendar = calendar
-        localCalendar.timeZone = timeZone
+    /// The window is sent as the time of day the user picked; `timeZone` only
+    /// tells the Worker which zone that time of day is in.
+    init(settings: NotificationSettings, timeZone: TimeZone = .autoupdatingCurrent) {
         leadTimeMinutes = settings.leadTime
         rainStartEnabled = settings.rainStartEnabled
         rainEndEnabled = settings.rainEndEnabled
         quietHoursEnabled = settings.quietHoursEnabled
-        quietHoursStartMinutes = Self.minutesSinceMidnight(settings.quietHoursStart, calendar: localCalendar)
-        quietHoursEndMinutes = Self.minutesSinceMidnight(settings.quietHoursEnd, calendar: localCalendar)
+        quietHoursStartMinutes = settings.quietHoursStartMinutes
+        quietHoursEndMinutes = settings.quietHoursEndMinutes
         timeZoneIdentifier = timeZone.identifier
-    }
-
-    private static func minutesSinceMidnight(_ date: Date, calendar: Calendar) -> Int {
-        calendar.component(.hour, from: date) * 60 + calendar.component(.minute, from: date)
     }
 }

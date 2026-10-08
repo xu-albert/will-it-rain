@@ -7,8 +7,11 @@ import CoreLocation
 /// delegate can be driven deterministically and headlessly.
 private final class StubLocationManager: CLLocationManager {
     var requests = 0
-    override var authorizationStatus: CLAuthorizationStatus { .authorizedWhenInUse }
+    var authorizationRequests = 0
+    var status: CLAuthorizationStatus = .authorizedWhenInUse
+    override var authorizationStatus: CLAuthorizationStatus { status }
     override func requestLocation() { requests += 1 }
+    override func requestWhenInUseAuthorization() { authorizationRequests += 1 }
 }
 
 /// Holds a `currentLocation()` call's result so the test can poll for it. Polling
@@ -110,7 +113,110 @@ final class LocationServiceTests: XCTestCase {
         }
     }
 
+    // MARK: - First launch
+
+    func testAFixIsNotRequestedUntilTheUserAnswersThePrompt() async {
+        // Asking for a fix while the status is still .notDetermined fails at
+        // once with kCLErrorDenied: a fresh install's first screen was
+        // "Connection Issue - kCLErrorDomain error 1" right after Allow.
+        let manager = StubLocationManager()
+        manager.status = .notDetermined
+        let service = LocationService(manager: manager)
+
+        let outcome = start(service)
+        await waitUntil { manager.authorizationRequests == 1 }
+        XCTAssertEqual(manager.requests, 0, "No fix may be requested before the prompt is answered")
+
+        // CoreLocation reports the initial .notDetermined as soon as a delegate
+        // is set; that is not an answer.
+        service.locationManagerDidChangeAuthorization(manager)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(manager.requests, 0)
+
+        manager.status = .authorizedWhenInUse
+        service.locationManagerDidChangeAuthorization(manager)
+        await waitForRequests(on: manager, count: 1)
+        service.locationManager(manager, didUpdateLocations: [fix])
+
+        guard let result = await settle(outcome), case .success = result else {
+            return XCTFail("The first fix after Allow must reach the caller")
+        }
+    }
+
+    func testCallersWaitingOnThePromptShareOneRequest() async {
+        let manager = StubLocationManager()
+        manager.status = .notDetermined
+        let service = LocationService(manager: manager)
+
+        let first = start(service)
+        let second = start(service)
+        await waitUntil { manager.authorizationRequests >= 1 }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(manager.authorizationRequests, 1)
+
+        manager.status = .authorizedWhenInUse
+        service.locationManagerDidChangeAuthorization(manager)
+        await waitForRequests(on: manager, count: 1)
+        service.locationManager(manager, didUpdateLocations: [fix])
+
+        for outcome in [first, second] {
+            guard let result = await settle(outcome), case .success = result else {
+                return XCTFail("Every caller waiting on the prompt must get the fix")
+            }
+        }
+    }
+
+    func testDenyingThePromptFailsAsPermissionDenied() async {
+        let manager = StubLocationManager()
+        manager.status = .notDetermined
+        let service = LocationService(manager: manager)
+
+        let outcome = start(service)
+        await waitUntil { manager.authorizationRequests == 1 }
+        manager.status = .denied
+        service.locationManagerDidChangeAuthorization(manager)
+
+        guard let result = await settle(outcome),
+              case .failure(let error) = result,
+              case LocationError.permissionDenied = error else {
+            return XCTFail("Denying the prompt must read as permission denied")
+        }
+        XCTAssertEqual(manager.requests, 0)
+    }
+
+    func testCoreLocationErrorsReachCallersAsLocationErrors() async {
+        // A raw CLError reached the screen as "kCLErrorDomain error 0".
+        let manager = StubLocationManager()
+        let service = LocationService(manager: manager)
+
+        let attempt = start(service)
+        await waitForRequests(on: manager, count: 1)
+        service.locationManager(manager, didFailWithError: CLError(.locationUnknown))
+        guard let result = await settle(attempt),
+              case .failure(let error) = result,
+              case LocationError.noFix = error else {
+            return XCTFail("locationUnknown must surface as .noFix")
+        }
+
+        // kCLErrorDenied while authorized is a transient refusal, not a denial.
+        let retry = start(service)
+        await waitForRequests(on: manager, count: 2)
+        service.locationManager(manager, didFailWithError: CLError(.denied))
+        guard let retried = await settle(retry),
+              case .failure(let retryError) = retried,
+              case LocationError.noFix = retryError else {
+            return XCTFail("kCLErrorDenied while authorized must surface as .noFix")
+        }
+    }
+
     // MARK: - Helpers
+
+    private func waitUntil(_ condition: () -> Bool) async {
+        for _ in 0..<200 where !condition() {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertTrue(condition(), "Condition never became true")
+    }
 
     private func start(_ service: LocationService) -> Outcome {
         let outcome = Outcome()
