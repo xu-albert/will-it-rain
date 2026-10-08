@@ -1,5 +1,6 @@
 import XCTest
 import CoreLocation
+import UIKit
 @testable import WillItRain
 
 /// A CLLocationManager that reports a usable authorization status and records
@@ -121,7 +122,7 @@ final class LocationServiceTests: XCTestCase {
         // "Connection Issue - kCLErrorDomain error 1" right after Allow.
         let manager = StubLocationManager()
         manager.status = .notDetermined
-        let service = LocationService(manager: manager)
+        let service = LocationService(manager: manager, notificationCenter: NotificationCenter())
 
         let outcome = start(service)
         await waitUntil { manager.authorizationRequests == 1 }
@@ -146,7 +147,7 @@ final class LocationServiceTests: XCTestCase {
     func testCallersWaitingOnThePromptShareOneRequest() async {
         let manager = StubLocationManager()
         manager.status = .notDetermined
-        let service = LocationService(manager: manager)
+        let service = LocationService(manager: manager, notificationCenter: NotificationCenter())
 
         let first = start(service)
         let second = start(service)
@@ -166,10 +167,40 @@ final class LocationServiceTests: XCTestCase {
         }
     }
 
+    func testAPromptStillUnansweredWhenTheAppBecomesActiveIsAskedForAgain() async {
+        // A request made on the way back from the background may never become a
+        // prompt; with nothing asking again, every caller would wait forever.
+        let manager = StubLocationManager()
+        manager.status = .notDetermined
+        let center = NotificationCenter()
+        let service = LocationService(manager: manager, notificationCenter: center)
+
+        // Nobody waiting: becoming active asks for nothing.
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertEqual(manager.authorizationRequests, 0)
+
+        let outcome = start(service)
+        await waitUntil { manager.authorizationRequests == 1 }
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertEqual(manager.authorizationRequests, 2)
+
+        manager.status = .authorizedWhenInUse
+        service.locationManagerDidChangeAuthorization(manager)
+        await waitForRequests(on: manager, count: 1)
+        service.locationManager(manager, didUpdateLocations: [fix])
+        guard let result = await settle(outcome), case .success = result else {
+            return XCTFail("The answer to the repeated request must reach the caller")
+        }
+
+        // Answered: becoming active again asks for nothing.
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertEqual(manager.authorizationRequests, 2)
+    }
+
     func testDenyingThePromptFailsAsPermissionDenied() async {
         let manager = StubLocationManager()
         manager.status = .notDetermined
-        let service = LocationService(manager: manager)
+        let service = LocationService(manager: manager, notificationCenter: NotificationCenter())
 
         let outcome = start(service)
         await waitUntil { manager.authorizationRequests == 1 }

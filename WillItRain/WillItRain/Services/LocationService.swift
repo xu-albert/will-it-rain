@@ -1,5 +1,6 @@
 import CoreLocation
 import Combine
+import UIKit
 
 enum LocationError: LocalizedError {
     case permissionDenied
@@ -51,11 +52,21 @@ final class LocationService: NSObject, ObservableObject {
 
     @Published var locationName: String = ""
 
-    init(manager: CLLocationManager = CLLocationManager(), asksForPermission: Bool = true) {
+    init(
+        manager: CLLocationManager = CLLocationManager(),
+        asksForPermission: Bool = true,
+        notificationCenter: NotificationCenter = .default
+    ) {
         self.manager = manager
         self.asksForPermission = asksForPermission
         super.init()
         manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
     }
 
     private static let lastRegisteredLatKey = "lastRegisteredLat"
@@ -171,6 +182,16 @@ final class LocationService: NSObject, ObservableObject {
                 manager.requestWhenInUseAuthorization()
             }
         }
+    }
+
+    /// Asks again for an answer callers are still waiting on. The first request
+    /// can go out before the app is active — on the way back from the
+    /// background, say — and if no prompt came of it, nothing else would ask
+    /// again and every caller would wait forever. A repeat while the prompt is
+    /// up is ignored.
+    @objc private func applicationDidBecomeActive() {
+        guard !authorizationWaiters.isEmpty, manager.authorizationStatus == .notDetermined else { return }
+        manager.requestWhenInUseAuthorization()
     }
 
     private func authorizationDidChange() {
