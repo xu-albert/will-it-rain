@@ -186,4 +186,26 @@ final class RainForecastTests: XCTestCase {
     func testPollIntervalRelaxesWhenNothingIsComing() {
         XCTAssertEqual(forecast(periods: []).nextPollInterval(at: now), 60 * 60)
     }
+
+    // MARK: - 7-day labels
+
+    func testWeekdayLabelIsReadInTheForecastLocationsZone() {
+        // A device on Los Angeles time showing Tokyo. WeatherKit starts Tokyo's
+        // Wednesday at midnight there, which is Tuesday 08:00 in Los Angeles, so
+        // read in the device's zone every label was a day early.
+        let deviceZone = NSTimeZone.default
+        NSTimeZone.default = TimeZone(identifier: "America/Los_Angeles")!
+        defer { NSTimeZone.default = deviceZone }
+
+        let wednesdayInTokyo = ISO8601DateFormatter().date(from: "2026-10-06T15:00:00Z")!
+        let tokyo = DaySummary(
+            date: wednesdayInTokyo, precipChance: 0, type: .none, highTemp: nil, lowTemp: nil,
+            timeZone: TimeZone(identifier: "Asia/Tokyo")!
+        )
+        XCTAssertEqual(tokyo.dayAbbreviation, "Wed")
+
+        // With no zone from the reverse geocode, the device's stands in.
+        let unplaced = DaySummary(date: wednesdayInTokyo, precipChance: 0, type: .none, highTemp: nil, lowTemp: nil)
+        XCTAssertEqual(unplaced.dayAbbreviation, "Tue")
+    }
 }

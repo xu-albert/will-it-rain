@@ -77,25 +77,35 @@ export function intensityFromMmPerHr(mmPerHr: number): Intensity {
   return 'heavy';
 }
 
+// The noun every alert names, matching `precip`. The Live Activity has said
+// "Snow incoming" since the wintry port; the alert pushed in the same tick has
+// to agree with it, and since the Worker is the only alert sender this is the
+// only place a snow alert's wording comes from.
+function precipNoun(precip: Precip): string {
+  return precip === 'wintry' ? 'Snow' : 'Rain';
+}
+
 export async function sendRainAlert(
   deviceToken: string,
   minutesUntilRain: number,
   env: Env,
-  intensity: Intensity = 'light'
+  intensity: Intensity = 'light',
+  precip: Precip = 'rain'
 ): Promise<void> {
-  const rain = intensity === 'light' ? 'Rain' : `${intensity[0].toUpperCase()}${intensity.slice(1)} rain`;
+  const noun = precipNoun(precip);
+  const lead = intensity === 'light' ? noun : `${intensity[0].toUpperCase()}${intensity.slice(1)} ${noun.toLowerCase()}`;
 
   let title: string;
   let body: string;
   if (minutesUntilRain <= 0) {
-    title = 'Rain starting now';
-    body = `${rain} is beginning in your area.`;
+    title = `${noun} starting now`;
+    body = `${lead} is beginning in your area.`;
   } else if (minutesUntilRain <= 5) {
-    title = 'Rain in a few minutes';
-    body = `${rain} starts in the next few minutes.`;
+    title = `${noun} in a few minutes`;
+    body = `${lead} starts in the next few minutes.`;
   } else {
-    title = `Rain in ~${minutesUntilRain} min`;
-    body = `${rain} expected in about ${minutesUntilRain} minutes.`;
+    title = `${noun} in ~${minutesUntilRain} min`;
+    body = `${lead} expected in about ${minutesUntilRain} minutes.`;
   }
   await sendNotification(deviceToken, { title, body }, 1, env);
 }
@@ -104,22 +114,26 @@ export async function sendRainAlert(
 export async function sendRainResumeAlert(
   deviceToken: string,
   minutesUntilRain: number,
-  env: Env
+  env: Env,
+  precip: Precip = 'rain'
 ): Promise<void> {
-  const body = `Rain returns in about ${Math.max(1, minutesUntilRain)} min.`;
-  await sendNotification(deviceToken, { title: 'More rain coming', body }, 1, env);
+  const noun = precipNoun(precip);
+  const body = `${noun} returns in about ${Math.max(1, minutesUntilRain)} min.`;
+  await sendNotification(deviceToken, { title: `More ${noun.toLowerCase()} coming`, body }, 1, env);
 }
 
 export async function sendRainEndAlert(
   deviceToken: string,
   env: Env,
-  minutesUntilEnd = 0
+  minutesUntilEnd = 0,
+  precip: Precip = 'rain'
 ): Promise<void> {
+  const noun = precipNoun(precip);
   const body =
     minutesUntilEnd <= 5
-      ? 'The rain should stop in the next few minutes.'
-      : `The rain should stop in about ${minutesUntilEnd} minutes.`;
-  await sendNotification(deviceToken, { title: 'Rain ending soon', body }, 0, env);
+      ? `The ${noun.toLowerCase()} should stop in the next few minutes.`
+      : `The ${noun.toLowerCase()} should stop in about ${minutesUntilEnd} minutes.`;
+  await sendNotification(deviceToken, { title: `${noun} ending soon`, body }, 0, env);
 }
 
 async function sendNotification(

@@ -7,7 +7,7 @@ final class WeatherService {
 
     private static let weatherKitService = WeatherKit.WeatherService.shared
 
-    func fetch(location: CLLocation, locationName: String) async throws -> RainForecast {
+    func fetch(location: CLLocation, locationName: String, timeZone: TimeZone) async throws -> RainForecast {
         let weather = try await Self.weatherKitService.weather(
             for: location,
             including: .minute, .hourly, .current, .daily
@@ -55,7 +55,8 @@ final class WeatherService {
                 precipChance: day.precipitationChance,
                 type: precipitationType(from: day.precipitation),
                 highTemp: day.highTemperature.converted(to: .celsius).value,
-                lowTemp: day.lowTemperature.converted(to: .celsius).value
+                lowTemp: day.lowTemperature.converted(to: .celsius).value,
+                timeZone: timeZone
             )
         }
 

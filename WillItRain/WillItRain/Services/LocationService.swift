@@ -1,5 +1,6 @@
 import CoreLocation
 import Combine
+import UIKit
 
 enum LocationError: LocalizedError {
     case permissionDenied
@@ -36,12 +37,36 @@ final class LocationService: NSObject, ObservableObject {
     // of the delegate clears this by resuming the waiters.
     private var requestInFlight = false
 
+    // Every caller waiting for the user to answer the location prompt. A fix
+    // must not be asked for before then: `requestLocation()` issued while the
+    // status is still `.notDetermined` fails at once with kCLErrorDenied, which
+    // is how a fresh install's first screen became "Connection Issue —
+    // kCLErrorDomain error 1" right after the user tapped Allow.
+    private var authorizationWaiters: [CheckedContinuation<CLAuthorizationStatus, Never>] = []
+
+    // Whether this service may ask the user for location access. Only the UI
+    // can: no prompt appears for a background refresh, so one that asked after
+    // "Allow Once" lapsed waited for an answer that never came and never
+    // completed its task. A service that may not ask fails at once instead.
+    private let asksForPermission: Bool
+
     @Published var locationName: String = ""
 
-    init(manager: CLLocationManager = CLLocationManager()) {
+    init(
+        manager: CLLocationManager = CLLocationManager(),
+        asksForPermission: Bool = true,
+        notificationCenter: NotificationCenter = .default
+    ) {
         self.manager = manager
+        self.asksForPermission = asksForPermission
         super.init()
         manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
     }
 
     private static let lastRegisteredLatKey = "lastRegisteredLat"
@@ -67,6 +92,12 @@ final class LocationService: NSObject, ObservableObject {
 
     func requestAlwaysPermission() {
         manager.requestAlwaysAuthorization()
+        UserDefaults.standard.set(true, forKey: Self.alwaysPromptShownKey)
+    }
+
+    /// "Not Now" on the travel prompt is an answer too: without recording it the
+    /// prompt came back on every fetch for as long as the user stayed away.
+    func dismissAlwaysPermissionPrompt() {
         UserDefaults.standard.set(true, forKey: Self.alwaysPromptShownKey)
     }
 
@@ -117,13 +148,10 @@ final class LocationService: NSObject, ObservableObject {
     }
 
     func currentLocation() async throws -> CLLocation {
-        let status = manager.authorizationStatus
-        if status == .denied || status == .restricted {
+        let status = await resolvedAuthorizationStatus()
+        // Still `.notDetermined` only when this service may not ask.
+        if status == .denied || status == .restricted || status == .notDetermined {
             throw LocationError.permissionDenied
-        }
-
-        if status == .notDetermined {
-            manager.requestWhenInUseAuthorization()
         }
 
         return try await withCheckedThrowingContinuation { continuation in
@@ -140,6 +168,57 @@ final class LocationService: NSObject, ObservableObject {
         }
     }
 
+    /// The authorization status once the user has answered the prompt, asking
+    /// for When In Use first if nobody has asked yet. Callers arriving while the
+    /// prompt is up share the one request. A service that may not ask returns
+    /// the status as it stands.
+    private func resolvedAuthorizationStatus() async -> CLAuthorizationStatus {
+        let status = manager.authorizationStatus
+        guard status == .notDetermined, asksForPermission else { return status }
+        return await withCheckedContinuation { continuation in
+            authorizationWaiters.append(continuation)
+            manager.delegate = self
+            if authorizationWaiters.count == 1 {
+                manager.requestWhenInUseAuthorization()
+            }
+        }
+    }
+
+    /// Asks again for an answer callers are still waiting on. The first request
+    /// can go out before the app is active — on the way back from the
+    /// background, say — and if no prompt came of it, nothing else would ask
+    /// again and every caller would wait forever. A repeat while the prompt is
+    /// up is ignored.
+    @objc private func applicationDidBecomeActive() {
+        guard !authorizationWaiters.isEmpty, manager.authorizationStatus == .notDetermined else { return }
+        manager.requestWhenInUseAuthorization()
+    }
+
+    private func authorizationDidChange() {
+        let status = manager.authorizationStatus
+        // CoreLocation also reports the initial `.notDetermined` as soon as a
+        // delegate is set; only an answer ends the wait.
+        guard status != .notDetermined else { return }
+        let pending = authorizationWaiters
+        authorizationWaiters.removeAll()
+        for continuation in pending {
+            continuation.resume(returning: status)
+        }
+    }
+
+    /// What a CoreLocation failure means to the user. A raw CLError reached the
+    /// screen as "kCLErrorDomain error 0/1" under a "Connection Issue" heading.
+    private func mapped(_ error: Error) -> Error {
+        guard let clError = error as? CLError else { return error }
+        if clError.code == .denied {
+            let status = manager.authorizationStatus
+            if status == .denied || status == .restricted {
+                return LocationError.permissionDenied
+            }
+        }
+        return LocationError.noFix
+    }
+
     /// Hands one location fix — or one failure — to everyone waiting on it.
     ///
     /// Also ends the in-flight request, so this is what every delegate path has
@@ -154,13 +233,15 @@ final class LocationService: NSObject, ObservableObject {
         }
     }
 
-    func reverseGeocode(_ location: CLLocation) async -> String {
+    /// The place's name, and the time zone its days are counted in, falling
+    /// back to the device's when the place has none.
+    func reverseGeocode(_ location: CLLocation) async -> (name: String, timeZone: TimeZone) {
         let geocoder = CLGeocoder()
         do {
-            let placemarks = try await geocoder.reverseGeocodeLocation(location)
-            return placemarks.first?.locality ?? "Current Location"
+            let placemark = try await geocoder.reverseGeocodeLocation(location).first
+            return (placemark?.locality ?? "Current Location", placemark?.timeZone ?? .current)
         } catch {
-            return "Current Location"
+            return ("Current Location", .current)
         }
     }
 }
@@ -190,7 +271,13 @@ extension LocationService: CLLocationManagerDelegate {
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         Task { @MainActor in
-            self.resumeWaiters(with: .failure(error))
+            self.resumeWaiters(with: .failure(self.mapped(error)))
+        }
+    }
+
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        Task { @MainActor in
+            self.authorizationDidChange()
         }
     }
 }

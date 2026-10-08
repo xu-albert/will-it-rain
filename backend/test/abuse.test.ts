@@ -1175,6 +1175,187 @@ describe('registration records expire', () => {
     }
   });
 
+  it('writes quiet hours turned on inside the cooldown at once, and holds turning them off', async () => {
+    // Turning quiet hours on silences alerts, so it is an opt-out: deferring it
+    // let the next tick push an alert into the hours the user had just asked
+    // to keep quiet. Turning them off again is the matching re-enable.
+    const quiet = (quietHoursEnabled: boolean) =>
+      registerRequest(1, {
+        cell: 0,
+        quietHoursEnabled,
+        quietHoursStartMinutes: 22 * 60,
+        quietHoursEndMinutes: 7 * 60,
+        timeZoneIdentifier: 'America/Los_Angeles',
+      });
+    const stored = () => JSON.parse(kv.raw(`device:${fakeToken(1)}`)!) as DeviceRegistration;
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T08:53:00.000Z')); // 00:53 in Los Angeles
+      await worker.fetch(quiet(false), env);
+      const settled = kv.puts;
+
+      vi.advanceTimersByTime(30_000);
+      expect((await worker.fetch(quiet(true), env)).status).toBe(200);
+      expect(kv.puts).toBe(settled + 1);
+      expect(stored()).toMatchObject({
+        quietHoursEnabled: true,
+        quietHoursStartMinutes: 22 * 60,
+        quietHoursEndMinutes: 7 * 60,
+        timeZoneIdentifier: 'America/Los_Angeles',
+      });
+
+      vi.advanceTimersByTime(30_000);
+      expect((await worker.fetch(quiet(false), env)).status).toBe(202);
+      expect(kv.puts).toBe(settled + 1);
+      expect(stored().quietHoursEnabled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('writes quiet hours turned on even when the same request carries a cooled re-enable', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      await worker.fetch(registerRequest(1, { cell: 0, rainStartEnabled: false }), env);
+      const settled = kv.puts;
+
+      vi.advanceTimersByTime(30_000);
+      const mixed = await worker.fetch(
+        registerRequest(1, {
+          cell: 0,
+          rainStartEnabled: true,
+          quietHoursEnabled: true,
+          quietHoursStartMinutes: 23 * 60,
+          quietHoursEndMinutes: 6 * 60,
+          timeZoneIdentifier: 'Europe/London',
+        }),
+        env
+      );
+      expect(mixed.status).toBe(202);
+      expect(kv.puts).toBe(settled + 1);
+      expect(JSON.parse(kv.raw(`device:${fakeToken(1)}`)!)).toMatchObject({
+        rainStartEnabled: false,
+        quietHoursEnabled: true,
+        quietHoursStartMinutes: 23 * 60,
+        quietHoursEndMinutes: 6 * 60,
+        timeZoneIdentifier: 'Europe/London',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not defer a time-zone change for a device with quiet hours off', async () => {
+    // The time zone decides nothing on the server unless quiet hours are on,
+    // and the client sends it on every registration: crossing a zone line
+    // with quiet hours off drew a 202 for a change that changes nothing.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      await worker.fetch(registerRequest(1, { cell: 0, timeZoneIdentifier: 'America/Los_Angeles' }), env);
+      const settled = kv.puts;
+
+      vi.advanceTimersByTime(30_000);
+      const moved = await worker.fetch(
+        registerRequest(1, { cell: 0, timeZoneIdentifier: 'America/New_York' }),
+        env
+      );
+      expect(moved.status).toBe(200);
+      expect(kv.puts).toBe(settled);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  describe('a quiet-hours window or time-zone change while quiet hours stay on', () => {
+    const policy = (
+      n: number,
+      timeZoneIdentifier: string,
+      quietHoursStartMinutes = 22 * 60,
+      rainStartEnabled = true
+    ) =>
+      registerRequest(n, {
+        cell: 0,
+        rainStartEnabled,
+        quietHoursEnabled: true,
+        quietHoursStartMinutes,
+        quietHoursEndMinutes: 7 * 60,
+        timeZoneIdentifier,
+      });
+    const stored = (n: number) => JSON.parse(kv.raw(`device:${fakeToken(n)}`)!) as DeviceRegistration;
+
+    it('is written at once when it silences the current local time', async () => {
+      // At 21:15 the user moves Start from 22:00 to 21:00 just after turning
+      // quiet hours on. Deferring that left the stored 22:00 start in place,
+      // and the next tick pushed an alert into the hour they had just silenced.
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-01-02T05:15:00.000Z')); // 21:15 in Los Angeles
+        await worker.fetch(policy(1, 'America/Los_Angeles'), env);
+        const settled = kv.puts;
+
+        vi.advanceTimersByTime(30_000);
+        expect((await worker.fetch(policy(1, 'America/Los_Angeles', 21 * 60), env)).status).toBe(200);
+        expect(kv.puts).toBe(settled + 1);
+        expect(stored(1).quietHoursStartMinutes).toBe(21 * 60);
+
+        // 21:20 in Los Angeles is 00:20 in New York.
+        vi.setSystemTime(new Date('2026-01-02T05:20:00.000Z'));
+        await worker.fetch(policy(2, 'America/Los_Angeles'), env);
+        vi.advanceTimersByTime(30_000);
+        expect((await worker.fetch(policy(2, 'America/New_York'), env)).status).toBe(200);
+        expect(stored(2).timeZoneIdentifier).toBe('America/New_York');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('carries the silencing window alone when the request also re-enables an alert', async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-01-02T05:15:00.000Z')); // 21:15 in Los Angeles
+        await worker.fetch(policy(1, 'America/Los_Angeles', 22 * 60, false), env);
+        const settled = kv.puts;
+
+        vi.advanceTimersByTime(30_000);
+        const mixed = await worker.fetch(policy(1, 'America/Los_Angeles', 21 * 60, true), env);
+        expect(mixed.status).toBe(202);
+        expect(kv.puts).toBe(settled + 1);
+        expect(stored(1)).toMatchObject({ rainStartEnabled: false, quietHoursStartMinutes: 21 * 60 });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('still cools when it releases the current local time or leaves it as it was', async () => {
+      // Only silencing now is urgent. A change that lets now through, or moves
+      // quiet hours without covering now, waits like any other change.
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-01-02T07:00:00.000Z')); // 23:00 in Los Angeles
+        await worker.fetch(policy(1, 'America/Los_Angeles'), env);
+        // 16:00 in Tokyo, 12:30 in Kolkata: outside 22:00-07:00 in both.
+        await worker.fetch(policy(2, 'Asia/Tokyo'), env);
+        const settled = kv.puts;
+
+        vi.advanceTimersByTime(30_000);
+        expect((await worker.fetch(policy(1, 'Asia/Tokyo'), env)).status).toBe(202);
+        expect((await worker.fetch(policy(1, 'America/Los_Angeles', 23 * 60 + 30), env)).status).toBe(202);
+        expect((await worker.fetch(policy(2, 'Asia/Kolkata'), env)).status).toBe(202);
+        expect(kv.puts).toBe(settled);
+        expect(stored(1)).toMatchObject({
+          quietHoursStartMinutes: 22 * 60,
+          timeZoneIdentifier: 'America/Los_Angeles',
+        });
+        expect(stored(2).timeZoneIdentifier).toBe('Asia/Tokyo');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   it('stores the complete timezone-aware quiet-hours policy', async () => {
     const response = await worker.fetch(
       registerRequest(1, {

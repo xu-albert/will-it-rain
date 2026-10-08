@@ -551,7 +551,8 @@ export default {
                     device.token,
                     minutesUntilRain,
                     env,
-                    intensityFromMmPerHr(rainStart.precipitationIntensity)
+                    intensityFromMmPerHr(rainStart.precipitationIntensity),
+                    precip
                   )
                 );
                 console.log(`[Cron] Rain-start grid ${grid.gridKey}, in ${minutesUntilRain}m`);
@@ -595,7 +596,8 @@ export default {
           if (resume && !alertsQuiet) {
             const minutesUntilResume = Math.round((new Date(resume.startTime).getTime() - now) / 60000);
             await notifyOnce(device, 'resume', resume.startTime, () =>
-              sendRainResumeAlert(device.token, minutesUntilResume, env)
+              // Typed at the minute the rain comes back, as the start path is.
+              sendRainResumeAlert(device.token, minutesUntilResume, env, precipFromForecast(forecast, resume.startTime))
             );
             console.log(`[Cron] Rain-resume grid ${grid.gridKey}, in ${minutesUntilResume}m`);
           }
@@ -606,7 +608,7 @@ export default {
             // read would break the one-per-device count in abuse.ts.
             if (!resume && !alertsQuiet && minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
               await notifyOnce(device, 'end', undefined, () =>
-                sendRainEndAlert(device.token, env, minutesUntilEnd)
+                sendRainEndAlert(device.token, env, minutesUntilEnd, precip)
               );
               console.log(`[Cron] Rain-end grid ${grid.gridKey}, in ${minutesUntilEnd}m`);
             }
@@ -795,21 +797,42 @@ type WriteDecision = 'write' | 'unchanged' | 'cooling-down' | 'opt-outs-only';
  *                                every poll, and almost all of it is a repeat.
  *   5. alert enabled -> off,
  *      nothing turned on      -> write immediately. An explicit opt-out must
- *                                never wait behind an abuse cooldown.
+ *                                never wait behind an abuse cooldown. Turning
+ *                                quiet hours on is an opt-out too, whatever the
+ *                                window: it goes from silencing nothing to
+ *                                silencing something, and a deferral let the
+ *                                very next tick push an alert into the hours
+ *                                the user had just asked to keep quiet.
+ *                                So is keeping quiet hours on with a window or
+ *                                time zone that covers the current local time
+ *                                where the stored one does not: deferring it
+ *                                let the same tick through. Turning quiet hours
+ *                                off is the matching re-enable, and waits like
+ *                                one, as does any other window or zone change.
  *   6. same cell, changed,
  *      inside the cooldown    -> return an explicit 202 deferral. The client
  *                                retries after the remaining cooldown instead
  *                                of mistaking stale settings for success. If
- *                                the request also turns an alert off, that
- *                                opt-out alone is written first ('opt-outs-only')
+ *                                the request also carries an opt-out from step
+ *                                5, that opt-out alone is written first
+ *                                ('opt-outs-only')
  *                                and the 202 covers the rest: the client sends
  *                                its whole policy, so an opt-out often travels
  *                                with a re-enable still waiting out the cooldown.
  *
- * Steps 5 and 6 write inside the cooldown only to turn alerts off, so each such
- * write shrinks the set of enabled alerts: at most two can follow any write that
- * re-enables them, which keeps the cooldown a bound rather than something to
- * alternate past.
+ * Steps 5 and 6 write inside the cooldown only for an opt-out. Rain start off,
+ * rain end off and quiet hours on each shrink the set of enabled alerts, so at
+ * most three of those can follow any write that re-enables them. A window or
+ * zone that newly silences now does not shrink anything, and it recurs: once
+ * the stored window ends, the same change silences now again. What bounds it
+ * is the clock: the write leaves the stored window covering the current local
+ * minute, so the next one has to wait for that minute to pass. See abuse.ts for
+ * the daily ceiling both make.
+ *
+ * The quiet-hours window and time zone count as a change only while quiet
+ * hours are on, before or after: they decide nothing else on the server, and
+ * the client sends both on every registration, so a user who has never turned
+ * quiet hours on would otherwise draw a 202 for crossing a time-zone line.
  *
  * A record with no `renewedAt` counts as refresh-due: it predates the field, so
  * there is no evidence of when it was last written and guessing young would risk
@@ -819,7 +842,8 @@ type WriteDecision = 'write' | 'unchanged' | 'cooling-down' | 'opt-outs-only';
  */
 function writeDecision(
   existing: DeviceRegistration,
-  settings: RegistrationSettings
+  settings: RegistrationSettings,
+  now: Date
 ): WriteDecision {
   // Coordinates are compared at grid precision, not as raw doubles. Every
   // registration the app sends carries a fresh CoreLocation fix, and two fixes
@@ -835,7 +859,7 @@ function writeDecision(
   const renewedAt = existing.renewedAt ? Date.parse(existing.renewedAt) : Number.NaN;
   const sinceWrite = Number.isNaN(renewedAt)
     ? Number.POSITIVE_INFINITY
-    : Date.now() - renewedAt;
+    : now.getTime() - renewedAt;
 
   if (sinceWrite >= DEVICE_RECORD_REFRESH_SECONDS * 1000) return 'write';
 
@@ -845,24 +869,78 @@ function writeDecision(
 
   const startWas = existing.rainStartEnabled ?? true;
   const endWas = existing.rainEndEnabled ?? true;
+  const quietWas = existing.quietHoursEnabled ?? false;
   const disablesAlert =
-    (startWas && !settings.rainStartEnabled) || (endWas && !settings.rainEndEnabled);
+    (startWas && !settings.rainStartEnabled) ||
+    (endWas && !settings.rainEndEnabled) ||
+    quietHoursOptOut(existing, settings, now);
   const enablesAlert =
-    (!startWas && settings.rainStartEnabled) || (!endWas && settings.rainEndEnabled);
+    (!startWas && settings.rainStartEnabled) ||
+    (!endWas && settings.rainEndEnabled) ||
+    (quietWas && !settings.quietHoursEnabled);
   if (disablesAlert && !enablesAlert) return 'write';
 
+  const quietPolicyMatters = quietWas || settings.quietHoursEnabled;
   const changed =
     existing.leadTimeMinutes !== settings.leadTimeMinutes ||
-    (existing.rainStartEnabled ?? true) !== settings.rainStartEnabled ||
-    (existing.rainEndEnabled ?? true) !== settings.rainEndEnabled ||
-    (existing.quietHoursEnabled ?? false) !== settings.quietHoursEnabled ||
-    (existing.quietHoursStartMinutes ?? 22 * 60) !== settings.quietHoursStartMinutes ||
-    (existing.quietHoursEndMinutes ?? 7 * 60) !== settings.quietHoursEndMinutes ||
-    (existing.timeZoneIdentifier ?? 'UTC') !== settings.timeZoneIdentifier;
+    startWas !== settings.rainStartEnabled ||
+    endWas !== settings.rainEndEnabled ||
+    quietWas !== settings.quietHoursEnabled ||
+    (quietPolicyMatters &&
+      ((existing.quietHoursStartMinutes ?? 22 * 60) !== settings.quietHoursStartMinutes ||
+        (existing.quietHoursEndMinutes ?? 7 * 60) !== settings.quietHoursEndMinutes ||
+        (existing.timeZoneIdentifier ?? 'UTC') !== settings.timeZoneIdentifier));
   if (!changed) return 'unchanged';
 
   if (sinceWrite >= DEVICE_REWRITE_COOLDOWN_SECONDS * 1000) return 'write';
   return disablesAlert ? 'opt-outs-only' : 'cooling-down';
+}
+
+/**
+ * Whether the request's quiet hours are an opt-out: turning them on, whatever
+ * the window, or keeping them on with a window or time zone that silences the
+ * current local time where the stored one does not.
+ */
+function quietHoursOptOut(
+  existing: DeviceRegistration,
+  settings: RegistrationSettings,
+  now: Date
+): boolean {
+  if (!settings.quietHoursEnabled) return false;
+  if (!(existing.quietHoursEnabled ?? false)) return true;
+  const requested: DeviceRegistration = {
+    ...existing,
+    quietHoursStartMinutes: settings.quietHoursStartMinutes,
+    quietHoursEndMinutes: settings.quietHoursEndMinutes,
+    timeZoneIdentifier: settings.timeZoneIdentifier,
+  };
+  return !isInQuietHours(existing, now) && isInQuietHours(requested, now);
+}
+
+/**
+ * The stored record with only the request's opt-outs applied: alerts it turns
+ * off, and its quiet hours if they are an opt-out (see `quietHoursOptOut`),
+ * carrying their window and time zone: that is what silences the hours the
+ * user just asked for. Everything else in the request waits out the cooldown.
+ */
+function withOptOutsOnly(
+  existing: DeviceRegistration,
+  settings: RegistrationSettings,
+  now: Date
+): DeviceRegistration {
+  return {
+    ...existing,
+    rainStartEnabled: (existing.rainStartEnabled ?? true) && settings.rainStartEnabled,
+    rainEndEnabled: (existing.rainEndEnabled ?? true) && settings.rainEndEnabled,
+    ...(quietHoursOptOut(existing, settings, now)
+      ? {
+          quietHoursEnabled: true,
+          quietHoursStartMinutes: settings.quietHoursStartMinutes,
+          quietHoursEndMinutes: settings.quietHoursEndMinutes,
+          timeZoneIdentifier: settings.timeZoneIdentifier,
+        }
+      : {}),
+  };
 }
 
 function rewriteCooldownRemainingSeconds(existing: DeviceRegistration): number {
@@ -1130,7 +1208,7 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
     const minutesUntilRain = Math.round((rainStartTime - now) / 60000);
 
     if (!dryRun) {
-      await sendRainAlert(body.token, minutesUntilRain, env);
+      await sendRainAlert(body.token, minutesUntilRain, env, 'light', diagnostics.precip);
     }
     return json({
       ok: true,
@@ -1301,18 +1379,11 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   // A first registration has no stored record, so it is never deferred, and the
   // gridKey reported back is always the one now stored.
   if (existing) {
-    const decision = writeDecision(existing, settings);
+    const now = new Date();
+    const decision = writeDecision(existing, settings, now);
     if (decision === 'opt-outs-only') {
       try {
-        await putDeviceRecord(
-          body.token,
-          {
-            ...existing,
-            rainStartEnabled: (existing.rainStartEnabled ?? true) && settings.rainStartEnabled,
-            rainEndEnabled: (existing.rainEndEnabled ?? true) && settings.rainEndEnabled,
-          },
-          env
-        );
+        await putDeviceRecord(body.token, withOptOutsOnly(existing, settings, now), env);
       } catch (err) {
         console.error(`[Register] KV write failed: ${err}`);
         return json({ error: 'KV write failed' }, 500);

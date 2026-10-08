@@ -640,6 +640,48 @@ describe('rain-end alerts', () => {
   });
 });
 
+describe('snow alert copy', () => {
+  // The Live Activity has said "Snow incoming" since the wintry port, but the
+  // alert pushed in the same tick still said "Rain". The Worker is the only
+  // alert sender, so its copy is the only copy a user sees.
+  const snowing = (wet: (i: number) => boolean) => (t: number) => ({
+    ...forecast(t, wet),
+    forecastHourly: { hours: [], summary: [{ condition: 'snow' }] },
+  });
+
+  it('names snow on the start alert', async () => {
+    const harness = makeHarness({ signingKey });
+    await plant(harness, [{ n: 1, leadTimeMinutes: 30 }], Date.now());
+    const { alerts } = await tick(harness, snowing((i) => i >= 25));
+    expect(alerts.map((a) => a.title)).toEqual(['Snow in ~25 min']);
+  });
+
+  it('names snow on the end alert', async () => {
+    const harness = makeHarness({ signingKey });
+    await plant(harness, [{ n: 1 }], Date.now());
+    const { alerts } = await tick(harness, snowing((i) => i < 20));
+    expect(alerts.map((a) => a.title)).toEqual(['Snow ending soon']);
+  });
+
+  it('names snow on the resume alert', async () => {
+    const harness = makeHarness({ signingKey });
+    await plant(harness, [{ n: 1 }], Date.now());
+    // Falling now, a break opening before the next tick, then more behind it.
+    const { alerts } = await tick(harness, snowing((i) => i < 5 || i >= 20));
+    expect(alerts.map((a) => a.title)).toEqual(['More snow coming']);
+  });
+
+  it('keeps saying rain when the summary is rain', async () => {
+    const harness = makeHarness({ signingKey });
+    await plant(harness, [{ n: 1, leadTimeMinutes: 30 }], Date.now());
+    const { alerts } = await tick(harness, (t) => ({
+      ...forecast(t, (i) => i >= 25),
+      forecastHourly: { hours: [], summary: [{ condition: 'rain' }] },
+    }));
+    expect(alerts.map((a) => a.title)).toEqual(['Rain in ~25 min']);
+  });
+});
+
 describe('rain-resume alerts', () => {
   // The server's half of the app's "More rain coming": a break in the rain with
   // more behind it inside the hour. Registered devices get no local alerts at

@@ -158,6 +158,13 @@ if the bug came back; `UNGUARDED` means no such test exists today.
 | same change (WIR-03) | The app counted a minute wet at ≥ 0.1 mm/h *or* ≥ 50% chance; the Worker required chance > 0.3 *and* a nonzero amount, so the in-app status and the server's alerts could disagree about the same minute. Both now use the app's predicate, inclusive at both boundaries | `PrecipitationPeriodDetectionTests.testWetPredicateMatchesTheWorkerBoundaryTable`; `cron-alerts.test.ts` → `describe('shared alert contract')` → `classifies chance=$chance intensity=$intensity as wet=$wet`, and `describe('what counts as a wet minute')` |
 | same change (WIR-04) | A settings edit reached the Worker only at the next re-registration, and one made inside the same-cell rewrite cooldown — an opt-out included — was skipped while the app treated it as stored. An edit is now staged durably at once and sent after a 500 ms debounce; a cooled change gets a `202` with `retryAfterSeconds` that the app replays (on launch, on foreground and from BGAppRefresh) until a `200` answers that same registration; an opt-out is written at once even inside the cooldown | `abuse.test.ts` → `describe('registration records expire')` → `returns an explicit deferral for a cooled setting change, and takes it after`, `persists an enabled-to-disabled opt-out immediately inside the cooldown`, `applies an opt-out at once even when the same request carries a cooled re-enable`; `PushRegistrationServiceTests` (every deferral, replay and settle-by-id case, e.g. `testDeferredSettingsChangeSurvivesSuspensionAndIsReplayedWhenDue`, `testEditsLockedAwayBeforeAnyRequestLeavesAreSentFromTheLastRegisteredLocation`, `testAnAnswerToAnEarlierIdenticalRegistrationLeavesTheNewestOneWaiting`). The debounce and background-time assertion live in `ContentView` and are **UNGUARDED** |
 | same change (2026-08-18 security review WIR-08) | Release builds printed the full APNs device token and Live Activity push token to the console. Both lines now log the event without the token | `PushRegistrationServiceTests.testConfirmedRegistrationActivatesRemoteOwnershipAndCarriesTheWholePolicy` (no log line contains the device token); the Live Activity token line in `LiveActivityService` is **UNGUARDED** (no ActivityKit seam, section 2) |
+| fix: 2026-10-07 end-to-end report (fresh install) | `LocationService.currentLocation()` asked for a fix straight after `requestWhenInUseAuthorization()`, while the status was still `.notDetermined`; CoreLocation failed it with kCLErrorDenied, and a fresh install's first screen read "Connection Issue — kCLErrorDomain error 1" right after Allow. It now waits for the answer (callers share one request, re-asked when the app becomes active) and maps a CLError to `LocationError`. The background refresh, `AppDelegate` and the widget use a service that may not ask, so they fail at once instead of waiting on a prompt that cannot appear | `LocationServiceTests.testAFixIsNotRequestedUntilTheUserAnswersThePrompt`, `testCallersWaitingOnThePromptShareOneRequest`, `testAPromptStillUnansweredWhenTheAppBecomesActiveIsAskedForAgain`, `testDenyingThePromptFailsAsPermissionDenied`, `testAServiceThatMayNotAskFailsAtOnceInsteadOfWaitingOnThePrompt`, `testCoreLocationErrorsReachCallersAsLocationErrors`; the "Location Unavailable" screen in `ContentView` is **UNGUARDED** |
+| same change (80-byte tokens) | `validate.ts` capped device tokens at 128 hex, so the 160-hex tokens the iOS 26 simulator issues got `400 Invalid or missing token` on every `/register`, as a lengthened production token would. The cap is now 256 | `validate.test.ts` → `describe('device tokens')` → `accepts the 80-byte token the iOS 26 simulator issues`, `accepts a token up to 128 bytes`, `rejects an over-long token` |
+| same change (quiet-hours drift) | The quiet-hours window was stored as absolute `Date`s whose hour and minute were re-read in the current zone, so a window picked in one zone moved when the device changed zone, at the Worker too. It is now stored as minutes since midnight, an older build's `Date`s migrated once | `NotificationSettingsTests.testQuietHoursAreStoredAsMinutesSinceMidnight`, `testAWindowPickedInOneZoneIsTheSameTimeOfDayInAnother`, `testAnOlderBuildsQuietHoursDatesMigrateOnceToTheirTimeOfDay` |
+| same change (quiet hours behind the cooldown) | `writeDecision` counted only an alert switched off as an opt-out, so quiet hours turned on inside the rewrite cooldown got a `202` and the next tick still pushed into them; a time-zone change drew a `202` even with quiet hours off. Quiet hours turned on, or a window or zone that newly covers the current local time, is now an opt-out written at once, and the window and zone count as a change only while quiet hours are on | `abuse.test.ts` → `describe('registration records expire')` → `writes quiet hours turned on inside the cooldown at once, and holds turning them off`, `writes quiet hours turned on even when the same request carries a cooled re-enable`, `does not defer a time-zone change for a device with quiet hours off`, and `describe('a quiet-hours window or time-zone change while quiet hours stay on')` |
+| same change (snow alert copy) | `sendRainAlert`, `sendRainResumeAlert` and `sendRainEndAlert` took no `precip`, so a snow forecast pushed "Rain in ~11 min" while the Live Activity in the same tick said "Snow incoming" | `cron-alerts.test.ts` → `describe('snow alert copy')` |
+| same change (weekday labels) | `DaySummary` named the day in the device's zone, so the 7-day list shifted a day when the device and the forecast location were in different zones. It now uses the location's zone from the reverse geocode | `RainForecastTests.testWeekdayLabelIsReadInTheForecastLocationsZone`; the geocoded zone reaching `DaySummary` through `WeatherService` is **UNGUARDED** (no `WeatherService` seam, section 3) |
+| same change (travel prompt, Settings label) | "Not Now" on the "Get rain alerts everywhere?" prompt was never recorded, so it came back on every fetch, and it showed with notifications denied; the settings gear's VoiceOver label was "gearshape". The dismissal is now recorded, the prompt needs notification permission, and the gear is labelled "Settings" | **UNGUARDED** — the prompt's gate and the label live in `ContentView`, which has no tests; the label is left to the VoiceOver pass in section 9 |
 
 **Rule for future fixes:** every commit whose message starts `fix:`/`fix(...)` or is tagged
 `hotfix` must add or extend a test in the same PR that fails on the pre-fix code, named for the
@@ -202,7 +209,7 @@ failure blocks the release.
 | M10 | Attribution persistence | View every screen/state that shows weather data | Apple Weather attribution (`apple.logo`) is visible and legible in all states, per guideline 5.2.5 (guards `a4f6392` — currently the only guard for that fix, see section 4) |
 | M11 | Notification copy review | Trigger a rain-start and a rain-end notification | Copy matches the reviewed strings in `screenshots/notifications/notification-copy-*.png` |
 | M12 | Accessibility pass | See section 9 | — |
-| M13 | Widget rendering | Add small and medium widgets to the Home Screen | Both render current forecast without truncation or placeholder data |
+| M13 | Widget rendering | **Not applicable until Home Screen widgets ship.** `WillItRainWidgetsBundle` registers only `RainLiveActivity`; the small and medium widgets are dormant in the app target (`WillItRain/Widget/`), so the widget gallery has nothing to add. When they move into the bundle: add small and medium widgets to the Home Screen | Both render current forecast without truncation or placeholder data |
 | M14 | Abuse-gate symptom spot-check | Deliberately trigger one 503 (`coverage_at_capacity` or `cell_at_capacity`) against a non-production or disposable registration | Response matches the symptom table in [Appendix A section G](#appendix-a-production-ops--notification-testing-runbook); confirms the gate is live in the deployed environment, not just in `abuse.test.ts` |
 | M15 | Hourly-only forecast state | Set a custom simulator location (Features > Location > Custom Location…) in a country without next-hour precipitation on Apple's iOS feature-availability page, then background and foreground the app so it re-fetches | The line "Minute-by-minute forecast isn't available here; showing hourly" appears above the charts, there is no "Next Hour" chart section, the hourly chart starts at the hour containing now rather than an hour out, and the hero line reads off the hourly data (`ForecastMergeTests` guards the model — see the hourly-fallback row in section 4 — but nothing renders this state) |
 | M16 | Server → Live Activity push | Start scenario `BS` on a Debug build on a real device, then run `scripts/test-activity-push.sh <device-token>` with `ADMIN_TOKEN` set (its header covers the setup; the device token comes from Appendix A section B) | Push 1 turns the card pale with a snowflake and "Snow incoming"; push 2 turns it cyan with "Rain incoming"; push 3 (no `precip` in the payload) renders as rain **and the countdown keeps ticking** — a frozen card there means the field went non-optional |
@@ -258,7 +265,7 @@ protect.
 | `/test-rain`, `/test-cron`, `/test-activity` (real-push, real-WeatherKit-quota debug endpoints) | Gated by `X-Admin-Token` against the `ADMIN_TOKEN` Worker secret | [Appendix A section C](#appendix-a-production-ops--notification-testing-runbook); `live-activity.test.ts` → `describe('/test-activity')` asserts all three return 401 on a missing or wrong header and fail closed when no `ADMIN_TOKEN` is configured |
 | Secrets at rest | `APNS_ENV`, `ADMIN_TOKEN` are Wrangler secrets, not env vars or committed config; never written to this file (Appendix A explicitly says "never in this file") | `wrangler secret put` per Appendix A sections C, E |
 | Device data at rest | KV stores lat/lon/token/settings with a 45-day TTL (`DEVICE_RECORD_TTL_SECONDS`); no PII beyond coordinates and an opaque device token | `backend/src/types.ts` `DeviceRegistration`; TTL behavior covered by `abuse.test.ts` → `describe('registration records expire')` |
-| Input validation | `validate.ts` checks token format (64–128 hex), content-type | `abuse.test.ts` → `describe('content type')`; each validator in isolation in `validate.test.ts` (section 2) |
+| Input validation | `validate.ts` checks token format (64–256 hex), content-type | `abuse.test.ts` → `describe('content type')`; each validator in isolation in `validate.test.ts` (section 2) |
 | Abuse limits (flood, per-client, per-cell) | Covered — see sections 4, 7 | `abuse.test.ts` |
 | iOS location data | Only sent to this project's own Worker over HTTPS; no third-party analytics/tracking SDK present in `Package.swift`/project deps (confirm on any dependency addition) | Verify manually if dependencies change — not currently automated |
 | App Transport Security | Default ATS (no exceptions found in Info.plist build settings) | Spot-check `INFOPLIST_KEY_*` in the pbxproj on release |
@@ -521,10 +528,11 @@ the oldest records in KV the cron ranks their cells ahead of every real user's
 (`selectCellsWithinCap`), so at `MAX_GRID_CELLS` = 15 they can hold up to 7 of
 the 15 slots.
 
-**Delete them straight from KV — `/unregister` cannot.** That endpoint validates
-with `isValidDeviceToken` (64–128 hex characters), so all seven are rejected with
-`400 Invalid or missing token`: the placeholders are 8 characters and non-hex,
-and the simulator tokens are 160 hex characters, over the maximum.
+**Delete the placeholders straight from KV — `/unregister` cannot.** That endpoint
+validates with `isValidDeviceToken` (64–256 hex characters), so all five are
+rejected with `400 Invalid or missing token`: they are 8 characters and non-hex.
+The two 160-hex simulator tokens are within the maximum, so `/unregister`
+removes those too.
 
 ```bash
 NS=142615e17bc84dc7adbd9e64d0b29410
@@ -536,7 +544,7 @@ npx wrangler kv key list --remote --namespace-id $NS | grep '"name": "device:'
 npx wrangler kv key delete --remote --namespace-id $NS "device:realtest"
 ```
 
-`/unregister` remains the right tool for a real 64-hex device token.
+`/unregister` remains the right tool for any well-formed device token.
 
 ### G. Registration limits (the abuse gate)
 
@@ -551,7 +559,7 @@ KV cannot count a sub-second burst.
 | `429 rate_limited` + `Retry-After` | more than 20 registrations from your IP in 10 minutes | wait out `retryAfterSeconds` |
 | `503 coverage_at_capacity` | the request would open a **new** grid cell and the service already covers `MAX_GRID_CELLS` (15) | delete junk `device:` keys from KV (section F — not `/unregister`), or re-run the subrequest arithmetic in `abuse.ts` before raising the cap |
 | `503 cell_at_capacity` | that one grid cell already holds `MAX_DEVICES_PER_CELL` (20) devices | unregister a device in that cell, or raise the cap after re-running the arithmetic |
-| `202` with `deferred: true` + `retryAfterSeconds`, and `wrangler kv key get` shows the OLD settings | a same-cell settings change inside the 5-minute rewrite cooldown (any alert it turns off is already stored) | wait out `retryAfterSeconds` and re-send — the app replays it by itself — or change the coordinates too: a cell change is never deferred |
+| `202` with `deferred: true` + `retryAfterSeconds`, and `wrangler kv key get` shows the OLD settings | a same-cell settings change inside the 5-minute rewrite cooldown (any opt-out it carries is already stored, see below) | wait out `retryAfterSeconds` and re-send — the app replays it by itself — or change the coordinates too: a cell change is never deferred |
 | `503 storage_unavailable` + `Retry-After: 60` | KV threw while reading the caller's existing record, so the write was refused rather than risk overwriting it | transient — check `wrangler tail` for the KV error; the caller's stored registration is untouched and still live |
 | `200` from `/register-activity` but the `activity:` key still shows the old `activityUpdatedAt` | the same activity token was re-submitted, and an identical token is never rewritten | expected; a new or changed token is always written immediately |
 
@@ -576,12 +584,14 @@ nothing is **not** rewritten (it would spend the Free plan's 1,000 KV writes a d
 on nothing); a record older than 7 days is rewritten regardless, which resets the
 TTL with weeks to spare.
 
-A registration that changes only *settings* (lead time, the alert switches, the
-quiet-hours window and time zone) within the same grid cell is also held back for
-up to 5 minutes after the last write, for the same budget reason. It returns `202`
-with `deferred: true` and a `retryAfterSeconds`, which the app keeps and replays
-when it is due. Turning an alert *off* is not held back: it is written at once, and
-anything else the same request changes waits behind the `202` (`writeDecision` in
+A registration that changes only *settings* (lead time, the alert switches, quiet
+hours, and their window and time zone while quiet hours are on) within the same
+grid cell is also held back for up to 5 minutes after the last write, for the same
+budget reason. It returns `202` with `deferred: true` and a `retryAfterSeconds`,
+which the app keeps and replays when it is due. An opt-out is not held back: an
+alert turned *off*, quiet hours turned *on*, or a quiet-hours window or time zone
+that newly covers the current local time is written at once, and anything else the
+same request changes waits behind the `202` (`writeDecision` in
 `backend/src/index.ts` has the full order). **A move to a different grid cell is
 never held back**: it is written immediately, because a device alerted for the
 cell it left is exactly the silent break the gate exists to prevent.

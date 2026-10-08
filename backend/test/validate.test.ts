@@ -43,8 +43,18 @@ describe('device tokens', () => {
     expect(isValidDeviceToken('A'.repeat(64))).toBe(true);
   });
 
+  it('accepts the 80-byte token the iOS 26 simulator issues', () => {
+    // 160 hex chars. The old 128 cap turned every one of these away, which is
+    // how a lengthened production token would fail too.
+    expect(isValidDeviceToken('c3'.repeat(80))).toBe(true);
+  });
+
+  it('accepts a token up to 128 bytes', () => {
+    expect(isValidDeviceToken('a'.repeat(256))).toBe(true);
+  });
+
   it('rejects an over-long token', () => {
-    expect(isValidDeviceToken('a'.repeat(129))).toBe(false);
+    expect(isValidDeviceToken('a'.repeat(257))).toBe(false);
   });
 
   it('rejects a too-short token', () => {

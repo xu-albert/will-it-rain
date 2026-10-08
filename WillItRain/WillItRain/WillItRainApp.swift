@@ -55,11 +55,15 @@ struct WillItRainApp: App {
             // Needs no location fix, so it runs even when the weather work below fails.
             await PushRegistrationService.shared.replayPendingRegistration()
             do {
-                let locationService = LocationService()
+                let locationService = LocationService(asksForPermission: false)
                 let weatherService = WeatherService()
                 let location = try await locationService.currentLocation()
-                let name = await locationService.reverseGeocode(location)
-                let forecast = try await weatherService.fetch(location: location, locationName: name)
+                let place = await locationService.reverseGeocode(location)
+                let forecast = try await weatherService.fetch(
+                    location: location,
+                    locationName: place.name,
+                    timeZone: place.timeZone
+                )
 
                 let settings = NotificationSettings()
                 NotificationService.shared.evaluateAndSchedule(forecast: forecast, settings: settings)

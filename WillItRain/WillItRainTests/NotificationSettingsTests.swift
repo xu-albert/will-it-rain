@@ -36,6 +36,8 @@ final class NotificationSettingsTests: XCTestCase {
         XCTAssertNil(settings.lastRainEndTime)
         XCTAssertNil(settings.lastPrecipitatingTime)
 
+        XCTAssertEqual(settings.quietHoursStartMinutes, 22 * 60)
+        XCTAssertEqual(settings.quietHoursEndMinutes, 7 * 60)
         let calendar = Calendar.current
         XCTAssertEqual(calendar.component(.hour, from: settings.quietHoursStart), 22)
         XCTAssertEqual(calendar.component(.hour, from: settings.quietHoursEnd), 7)
@@ -50,8 +52,8 @@ final class NotificationSettingsTests: XCTestCase {
         first.rainEndEnabled = false
         first.chartHours = 6
         first.useCelsius = true
-        first.quietHoursStart = stamp
-        first.quietHoursEnd = stamp.addingTimeInterval(3600)
+        first.quietHoursStartMinutes = 21 * 60 + 30
+        first.quietHoursEndMinutes = 6 * 60 + 15
         first.lastNotifiedPrecipStart = stamp.addingTimeInterval(60)
         first.lastNotifiedPrecipEnd = stamp.addingTimeInterval(120)
         first.pendingPrecipStart = stamp.addingTimeInterval(180)
@@ -66,8 +68,8 @@ final class NotificationSettingsTests: XCTestCase {
         XCTAssertFalse(second.rainEndEnabled)
         XCTAssertEqual(second.chartHours, 6)
         XCTAssertTrue(second.useCelsius)
-        XCTAssertEqual(second.quietHoursStart, stamp)
-        XCTAssertEqual(second.quietHoursEnd, stamp.addingTimeInterval(3600))
+        XCTAssertEqual(second.quietHoursStartMinutes, 21 * 60 + 30)
+        XCTAssertEqual(second.quietHoursEndMinutes, 6 * 60 + 15)
         XCTAssertEqual(second.lastNotifiedPrecipStart, stamp.addingTimeInterval(60))
         XCTAssertEqual(second.lastNotifiedPrecipEnd, stamp.addingTimeInterval(120))
         XCTAssertEqual(second.pendingPrecipStart, stamp.addingTimeInterval(180))
@@ -89,15 +91,63 @@ final class NotificationSettingsTests: XCTestCase {
         // after an update must read them back unchanged.
         let stamp = Date(timeIntervalSince1970: 1_700_000_000)
         let settings = NotificationSettings(defaults: defaults)
-        XCTAssertNil(defaults.object(forKey: "quietHoursStart"),
+        XCTAssertNil(defaults.object(forKey: "quietHoursStartMinutes"),
                      "Built-in defaults are not written until the user changes them")
         settings.pendingPrecipStart = stamp
         settings.lastRainEndTime = stamp
-        settings.quietHoursStart = stamp
 
         XCTAssertEqual(defaults.double(forKey: "pendingPrecipStart"), stamp.timeIntervalSinceReferenceDate)
         XCTAssertEqual(defaults.double(forKey: "lastRainEndTime"), stamp.timeIntervalSinceReferenceDate)
-        XCTAssertEqual(defaults.double(forKey: "quietHoursStart"), stamp.timeIntervalSinceReferenceDate)
+    }
+
+    // MARK: - Quiet hours as a time of day
+
+    func testQuietHoursAreStoredAsMinutesSinceMidnight() {
+        let settings = NotificationSettings(defaults: defaults)
+        settings.quietHoursStart = Calendar.current.date(bySettingHour: 22, minute: 15, second: 0, of: Date())!
+
+        XCTAssertEqual(settings.quietHoursStartMinutes, 22 * 60 + 15)
+        XCTAssertEqual(defaults.integer(forKey: "quietHoursStartMinutes"), 22 * 60 + 15)
+        XCTAssertNil(defaults.object(forKey: "quietHoursStart"), "The absolute-date key is no longer written")
+    }
+
+    func testAWindowPickedInOneZoneIsTheSameTimeOfDayInAnother() {
+        // The e2e repro: 22:00-07:00 picked in Los Angeles reached the Worker as
+        // 00:59-07:00 after a relaunch in New York.
+        let settings = NotificationSettings(defaults: defaults)
+        settings.quietHoursEnabled = true
+        settings.quietHoursStartMinutes = 22 * 60
+        settings.quietHoursEndMinutes = 7 * 60
+
+        for zone in ["America/Los_Angeles", "America/New_York", "Asia/Tokyo"] {
+            let remote = RemoteAlertSettings(
+                settings: NotificationSettings(defaults: defaults),
+                timeZone: TimeZone(identifier: zone)!
+            )
+            XCTAssertEqual(remote.quietHoursStartMinutes, 22 * 60, zone)
+            XCTAssertEqual(remote.quietHoursEndMinutes, 7 * 60, zone)
+            XCTAssertEqual(remote.timeZoneIdentifier, zone)
+        }
+    }
+
+    func testAnOlderBuildsQuietHoursDatesMigrateOnceToTheirTimeOfDay() {
+        // Installed devices hold the window as reference seconds under the old
+        // keys. It is read once, in the zone the device is in at the upgrade,
+        // and from then on is a fixed time of day.
+        let calendar = Calendar.current
+        let start = calendar.date(bySettingHour: 21, minute: 45, second: 0, of: Date())!
+        let end = calendar.date(bySettingHour: 6, minute: 30, second: 0, of: Date())!
+        defaults.set(start.timeIntervalSinceReferenceDate, forKey: "quietHoursStart")
+        defaults.set(end.timeIntervalSinceReferenceDate, forKey: "quietHoursEnd")
+
+        let migrated = NotificationSettings(defaults: defaults)
+        XCTAssertEqual(migrated.quietHoursStartMinutes, 21 * 60 + 45)
+        XCTAssertEqual(migrated.quietHoursEndMinutes, 6 * 60 + 30)
+        XCTAssertNil(defaults.object(forKey: "quietHoursStart"))
+        XCTAssertNil(defaults.object(forKey: "quietHoursEnd"))
+        XCTAssertEqual(defaults.integer(forKey: "quietHoursStartMinutes"), 21 * 60 + 45)
+
+        XCTAssertEqual(NotificationSettings(defaults: defaults).quietHoursStartMinutes, 21 * 60 + 45)
     }
 
     func testClearingADateRemovesItsKey() {
@@ -166,18 +216,16 @@ final class NotificationSettingsTests: XCTestCase {
     }
 
     func testRemoteAlertSettingsCarryEveryServerPolicyField() {
-        var calendar = Calendar(identifier: .gregorian)
         let timeZone = TimeZone(identifier: "America/Los_Angeles")!
-        calendar.timeZone = timeZone
         let settings = NotificationSettings(defaults: defaults)
         settings.leadTime = 45
         settings.rainStartEnabled = false
         settings.rainEndEnabled = true
         settings.quietHoursEnabled = true
-        settings.quietHoursStart = calendar.date(from: DateComponents(year: 2026, month: 1, day: 1, hour: 21, minute: 30))!
-        settings.quietHoursEnd = calendar.date(from: DateComponents(year: 2026, month: 1, day: 2, hour: 6, minute: 15))!
+        settings.quietHoursStartMinutes = 21 * 60 + 30
+        settings.quietHoursEndMinutes = 6 * 60 + 15
 
-        let remote = RemoteAlertSettings(settings: settings, calendar: calendar, timeZone: timeZone)
+        let remote = RemoteAlertSettings(settings: settings, timeZone: timeZone)
 
         XCTAssertEqual(remote.leadTimeMinutes, 45)
         XCTAssertFalse(remote.rainStartEnabled)
