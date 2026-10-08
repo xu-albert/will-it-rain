@@ -346,8 +346,12 @@ struct ContentView: View {
         if case .loaded = appState {} else { appState = .loading }
         do {
             let location = try await locationService.currentLocation()
-            let name = await locationService.reverseGeocode(location)
-            let forecast = try await weatherService.fetch(location: location, locationName: name)
+            let place = await locationService.reverseGeocode(location)
+            let forecast = try await weatherService.fetch(
+                location: location,
+                locationName: place.name,
+                timeZone: place.timeZone
+            )
             withAnimation(.easeInOut(duration: 2.0)) {
                 currentCondition = forecast.currentCondition
             }

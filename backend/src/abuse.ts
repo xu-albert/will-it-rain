@@ -242,11 +242,17 @@ export const DEVICE_RECORD_REFRESH_SECONDS = 7 * 24 * 60 * 60; // 7 days
 // this does bound is same-cell settings churn — lead time, the two alert
 // switches, and the quiet-hours window and time zone. A change inside the
 // cooldown gets a 202 with `retryAfterSeconds`, which the client persists and
-// replays. The one exemption is an opt-out — an alert switched off, or quiet
-// hours switched on — written at once, on its own when the same request also
-// turns something on, the rest of which still waits; each such write can only
-// shrink the set of enabled alerts, so at most three follow any cooled write,
-// and the ceiling is 4 x 1,440/5 = 1,152 writes a day per device rather than an
+// replays. The one exemption is an opt-out, written at once, on its own when
+// the same request also turns something on, the rest of which still waits.
+// There are two kinds. An alert switched off, or quiet hours switched on, can
+// only shrink the set of enabled alerts, so at most three follow any cooled
+// write: 4 x 1,440/5 = 1,152 writes a day. Quiet hours kept on with a window or
+// time zone that newly covers the current local time is not bounded that way:
+// once the stored window ends the same change silences now again, so it recurs
+// as the clock moves. The clock is also its bound — the write leaves the stored
+// window covering the current local minute, so the next one waits for that
+// minute to pass — at most 1,440 a day. Together the ceiling is 1,152 + 1,440 =
+// 2,592 writes a day per device: a loose bound, but a bound, rather than an
 // unbounded alternation.
 //
 // Cell changes are still never deferred, even though the client could now
@@ -380,7 +386,7 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //                                 deliberate, because deferring a real move
 //                                 silently alerts the user for the wrong area.
 //                                 The cooldown bounds only same-cell settings
-//                                 churn, at 1,152/day per device counting the
+//                                 churn, at 2,592/day per device counting the
 //                                 opt-outs it lets through. This term is why
 //                                 the header above no longer calls registration
 //                                 bounded.

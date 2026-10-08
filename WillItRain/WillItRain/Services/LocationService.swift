@@ -43,10 +43,17 @@ final class LocationService: NSObject, ObservableObject {
     // kCLErrorDomain error 1" right after the user tapped Allow.
     private var authorizationWaiters: [CheckedContinuation<CLAuthorizationStatus, Never>] = []
 
+    // Whether this service may ask the user for location access. Only the UI
+    // can: no prompt appears for a background refresh, so one that asked after
+    // "Allow Once" lapsed waited for an answer that never came and never
+    // completed its task. A service that may not ask fails at once instead.
+    private let asksForPermission: Bool
+
     @Published var locationName: String = ""
 
-    init(manager: CLLocationManager = CLLocationManager()) {
+    init(manager: CLLocationManager = CLLocationManager(), asksForPermission: Bool = true) {
         self.manager = manager
+        self.asksForPermission = asksForPermission
         super.init()
         manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
     }
@@ -131,7 +138,8 @@ final class LocationService: NSObject, ObservableObject {
 
     func currentLocation() async throws -> CLLocation {
         let status = await resolvedAuthorizationStatus()
-        if status == .denied || status == .restricted {
+        // Still `.notDetermined` only when this service may not ask.
+        if status == .denied || status == .restricted || status == .notDetermined {
             throw LocationError.permissionDenied
         }
 
@@ -151,10 +159,11 @@ final class LocationService: NSObject, ObservableObject {
 
     /// The authorization status once the user has answered the prompt, asking
     /// for When In Use first if nobody has asked yet. Callers arriving while the
-    /// prompt is up share the one request.
+    /// prompt is up share the one request. A service that may not ask returns
+    /// the status as it stands.
     private func resolvedAuthorizationStatus() async -> CLAuthorizationStatus {
         let status = manager.authorizationStatus
-        guard status == .notDetermined else { return status }
+        guard status == .notDetermined, asksForPermission else { return status }
         return await withCheckedContinuation { continuation in
             authorizationWaiters.append(continuation)
             manager.delegate = self
@@ -203,13 +212,15 @@ final class LocationService: NSObject, ObservableObject {
         }
     }
 
-    func reverseGeocode(_ location: CLLocation) async -> String {
+    /// The place's name, and the time zone its days are counted in, falling
+    /// back to the device's when the place has none.
+    func reverseGeocode(_ location: CLLocation) async -> (name: String, timeZone: TimeZone) {
         let geocoder = CLGeocoder()
         do {
-            let placemarks = try await geocoder.reverseGeocodeLocation(location)
-            return placemarks.first?.locality ?? "Current Location"
+            let placemark = try await geocoder.reverseGeocodeLocation(location).first
+            return (placemark?.locality ?? "Current Location", placemark?.timeZone ?? .current)
         } catch {
-            return "Current Location"
+            return ("Current Location", .current)
         }
     }
 }

@@ -3,7 +3,7 @@ import UserNotifications
 import CoreLocation
 
 class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
-    private let locationService = LocationService()
+    private let locationService = LocationService(asksForPermission: false)
 
     func application(
         _ application: UIApplication,

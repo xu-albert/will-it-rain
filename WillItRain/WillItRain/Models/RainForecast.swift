@@ -258,18 +258,21 @@ struct DaySummary: Identifiable {
     let type: PrecipitationType
     let highTemp: Double? // Celsius
     let lowTemp: Double? // Celsius
+    /// The forecast location's zone. `date` is midnight there, so read in the
+    /// device's zone it can fall on the day before.
+    var timeZone: TimeZone = .current
 
     var dayName: String {
-        let calendar = Calendar.current
+        var calendar = Calendar.current
+        calendar.timeZone = timeZone
         if calendar.isDateInToday(date) { return "Today" }
         if calendar.isDateInTomorrow(date) { return "Tomorrow" }
-        let f = DateFormatter()
-        f.dateFormat = "EEE"
-        return f.string(from: date)
+        return dayAbbreviation
     }
 
     var dayAbbreviation: String {
         let f = DateFormatter()
+        f.timeZone = timeZone
         f.dateFormat = "EEE"
         return f.string(from: date)
     }

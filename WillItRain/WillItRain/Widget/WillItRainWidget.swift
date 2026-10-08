@@ -29,11 +29,15 @@ struct RainWidgetProvider: TimelineProvider {
     func getTimeline(in context: Context, completion: @escaping (Timeline<RainWidgetEntry>) -> Void) {
         Task {
             do {
-                let locationService = LocationService()
+                let locationService = LocationService(asksForPermission: false)
                 let weatherService = WeatherService()
                 let location = try await locationService.currentLocation()
-                let name = await locationService.reverseGeocode(location)
-                let forecast = try await weatherService.fetch(location: location, locationName: name)
+                let place = await locationService.reverseGeocode(location)
+                let forecast = try await weatherService.fetch(
+                    location: location,
+                    locationName: place.name,
+                    timeZone: place.timeZone
+                )
 
                 let status = forecast.heroStatus
                 let entry = RainWidgetEntry(

@@ -184,6 +184,32 @@ final class LocationServiceTests: XCTestCase {
         XCTAssertEqual(manager.requests, 0)
     }
 
+    func testAServiceThatMayNotAskFailsAtOnceInsteadOfWaitingOnThePrompt() async {
+        // The background refresh: no prompt appears there, so after "Allow
+        // Once" lapsed it waited for an answer that never came and its task
+        // never completed.
+        let manager = StubLocationManager()
+        manager.status = .notDetermined
+        let service = LocationService(manager: manager, asksForPermission: false)
+
+        guard let result = await settle(start(service)),
+              case .failure(let error) = result,
+              case LocationError.permissionDenied = error else {
+            return XCTFail("A service that may not ask must fail at once while nobody has answered")
+        }
+        XCTAssertEqual(manager.authorizationRequests, 0)
+        XCTAssertEqual(manager.requests, 0)
+
+        // Once the user has allowed it, the same service gets its fix.
+        manager.status = .authorizedWhenInUse
+        let retry = start(service)
+        await waitForRequests(on: manager, count: 1)
+        service.locationManager(manager, didUpdateLocations: [fix])
+        guard let retried = await settle(retry), case .success = retried else {
+            return XCTFail("A service that may not ask must still get a fix once allowed")
+        }
+    }
+
     func testCoreLocationErrorsReachCallersAsLocationErrors() async {
         // A raw CLError reached the screen as "kCLErrorDomain error 0".
         let manager = StubLocationManager()
