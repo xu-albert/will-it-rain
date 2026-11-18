@@ -298,8 +298,8 @@ accessibility regression is caught only if a human runs this table before releas
 
 ### App Store submission checklist
 
-- [ ] `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` bumped in the pbxproj (currently 1.1.2 / 7)
-      and matches the intended release notes.
+- [ ] `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` bumped in the pbxproj and matches the
+      intended release notes.
 - [ ] **Worker deployed before the build reaches users** whenever the release changes
       `LiveActivityContentState` (1.1.2 adds `precip`). `content-state` is a full replacement, so
       an older Worker's next cron tick strips the new field and, for 1.1.2, turns a snowing card
