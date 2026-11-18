@@ -809,6 +809,29 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
     expect(tick.externalSubrequests).toBeLessThanOrEqual(50);
   });
 
+  it('holds the budget on steady-rain Live Activity refreshes, which send no alert', async () => {
+    // Raining across the whole hour: no device is due an alert, but every
+    // running Live Activity is refreshed, and those refreshes are external
+    // pushes out of the same 34.
+    const tick = await runCron({
+      cells: MAX_GRID_CELLS,
+      devicesPerCell: 5,
+      forecast: (now) => ({
+        forecastNextHour: {
+          minutes: Array.from({ length: 60 }, (_, i) => ({
+            startTime: new Date(now + i * 60_000).toISOString(),
+            precipitationChance: 0.9,
+            precipitationIntensity: 2,
+          })),
+        },
+      }),
+      withActivityToken: true,
+    });
+
+    expect(tick.pushes).toBe(PUSH_BUDGET_PER_INVOCATION);
+    expect(tick.externalSubrequests).toBeLessThanOrEqual(50);
+  });
+
   it('says out loud how many devices it could not notify', async () => {
     const errors: string[] = [];
     vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
