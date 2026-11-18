@@ -21,6 +21,7 @@ import {
   sendLiveActivityUpdate,
   encodeActivityDate,
   intensityFromMmPerHr,
+  LIVE_ACTIVITY_PRIORITY,
 } from './apns';
 import {
   asBoolean,
@@ -132,6 +133,7 @@ function copyFor(precip: Precip) {
     expected: wintry ? 'Snow expected' : 'Rain expected',
     fallingNow: wintry ? 'Snowing now' : 'Raining now',
     fallingVerb: wintry ? 'Snowing · ' : 'Raining · ',
+    fallingHero: wintry ? 'Snowing' : 'Raining',
     ended: wintry ? 'Snow ended' : 'Rain ended',
     hasStopped: wintry ? 'Snow has stopped' : 'Rain has stopped',
   };
@@ -439,7 +441,15 @@ export default {
             ? afterBreak
             : undefined;
 
-        if (!rainStart && !rainEnd) return;
+        // Nothing to say only when it is dry now and stays dry. Steady rain —
+        // wet now with no dry minute anywhere in the series, so neither
+        // rainStart nor rainEnd exists — sends no alert, but a running Live
+        // Activity still needs its refresh: returning here left the card
+        // frozen on whatever the last push said for as long as the rain held.
+        if (!rainingNow && !rainStart) return;
+        const minutesUntilEnd = rainEnd
+          ? Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000)
+          : undefined;
 
         const precip = precipFromForecast(forecast, rainStart?.startTime);
         const copy = copyFor(precip);
@@ -581,7 +591,11 @@ export default {
                     flagPosition: null,
                     precip,
                   };
-                  await sendLiveActivityUpdate(activityToken, contentState, env);
+                  // The rain-start transition: the card is about rain on its way.
+                  await sendLiveActivityUpdate(activityToken, contentState, env, {
+                    event: 'update',
+                    priority: LIVE_ACTIVITY_PRIORITY.transition,
+                  });
                   console.log(`[Activity] Sent rain-start update, grid ${grid.gridKey}`);
                 } catch (err) {
                   console.error(`[Activity] push failed: ${err}`);
@@ -599,8 +613,7 @@ export default {
             );
             console.log(`[Cron] Rain-resume grid ${grid.gridKey}, in ${minutesUntilResume}m`);
           }
-          if (rainEnd && device.rainEndEnabled !== false) {
-            const minutesUntilEnd = Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000);
+          if (minutesUntilEnd !== undefined && device.rainEndEnabled !== false) {
             // The resume above speaks for this break. Saying "Rain ending soon"
             // as well would read as the end of it, and a second `notified-*`
             // read would break the one-per-device count in abuse.ts.
@@ -610,57 +623,89 @@ export default {
               );
               console.log(`[Cron] Rain-end grid ${grid.gridKey}, in ${minutesUntilEnd}m`);
             }
+          }
 
-            // Live Activity: keep the countdown live every cron tick while it's still
-            // raining (State B), independent of the alert's 30-min/dedup gate above.
-            // Once the dry minute actually arrives, send the terminal state and drop
-            // the activity token — a push failure here must never break the alert loop.
-            if (activityToken && budget.spend()) {
-              try {
-                if (minutesUntilEnd > 0) {
-                  const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
-                  const contentState: LiveActivityContentState = {
-                    statusText: copy.fallingNow,
-                    countdownTarget: encodeActivityDate(new Date(now + minutesUntilEnd * 60000)),
-                    heroText: null,
-                    subBold: `stops in about ${minutesUntilEnd} min`,
-                    subRest: copy.fallingVerb,
-                    boldFirst: false,
-                    rightText: '',
-                    segments,
-                    windowMinutes: ACTIVITY_WINDOW_MINUTES,
-                    midLabel: '+45 min',
-                    endLabel: '+90 min',
-                    flagText: null,
-                    flagPosition: null,
-                    precip,
-                  };
-                  await sendLiveActivityUpdate(activityToken, contentState, env);
-                } else {
-                  const contentState: LiveActivityContentState = {
-                    statusText: copy.ended,
-                    countdownTarget: null,
-                    heroText: 'Clear',
-                    subBold: copy.hasStopped,
-                    subRest: '',
-                    boldFirst: true,
-                    rightText: '',
-                    segments: [],
-                    windowMinutes: ACTIVITY_WINDOW_MINUTES,
-                    midLabel: '+45 min',
-                    endLabel: '+90 min',
-                    flagText: null,
-                    flagPosition: null,
-                    precip,
-                  };
-                  await sendLiveActivityUpdate(activityToken, contentState, env, 'end');
-                  await clearActivityToken(device.token, env);
-                  console.log(`[Activity] Sent rain-end (final) update, grid ${grid.gridKey}`);
-                }
-              } catch (err) {
-                console.error(`[Activity] push failed: ${err}`);
-                await discardDeadActivityToken(device.token, err, env);
+          // Live Activity while it is raining (State B), every tick, independent
+          // of the alert's 30-min/dedup gate above and of the notification
+          // toggles: the card is something the user started and is looking at,
+          // and rainEndEnabled says only whether they want an alert. Gating the
+          // card on it left a user who had switched that alert off with a card
+          // frozen on its last push until it went stale. Three shapes:
+          //   - a dry minute ahead: the countdown to it (keepalive);
+          //   - no dry minute in the whole series (steady rain): the same state
+          //     with no countdown, refreshed so it never goes stale (keepalive);
+          //   - the dry minute has arrived: the terminal state, ending the
+          //     activity and dropping its token (transition).
+          // A push failure here must never break the alert loop.
+          if (rainingNow && activityToken && budget.spend()) {
+            try {
+              if (minutesUntilEnd === undefined || minutesUntilEnd > 0) {
+                const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
+                const contentState: LiveActivityContentState =
+                  minutesUntilEnd === undefined
+                    ? {
+                        statusText: copy.fallingNow,
+                        countdownTarget: null,
+                        heroText: copy.fallingHero,
+                        subBold: 'no break in the next hour',
+                        subRest: copy.fallingVerb,
+                        boldFirst: false,
+                        rightText: '',
+                        segments,
+                        windowMinutes: ACTIVITY_WINDOW_MINUTES,
+                        midLabel: '+45 min',
+                        endLabel: '+90 min',
+                        flagText: null,
+                        flagPosition: null,
+                        precip,
+                      }
+                    : {
+                        statusText: copy.fallingNow,
+                        countdownTarget: encodeActivityDate(new Date(now + minutesUntilEnd * 60000)),
+                        heroText: null,
+                        subBold: `stops in about ${minutesUntilEnd} min`,
+                        subRest: copy.fallingVerb,
+                        boldFirst: false,
+                        rightText: '',
+                        segments,
+                        windowMinutes: ACTIVITY_WINDOW_MINUTES,
+                        midLabel: '+45 min',
+                        endLabel: '+90 min',
+                        flagText: null,
+                        flagPosition: null,
+                        precip,
+                      };
+                await sendLiveActivityUpdate(activityToken, contentState, env, {
+                  event: 'update',
+                  priority: LIVE_ACTIVITY_PRIORITY.keepalive,
+                });
+              } else {
+                const contentState: LiveActivityContentState = {
+                  statusText: copy.ended,
+                  countdownTarget: null,
+                  heroText: 'Clear',
+                  subBold: copy.hasStopped,
+                  subRest: '',
+                  boldFirst: true,
+                  rightText: '',
+                  segments: [],
+                  windowMinutes: ACTIVITY_WINDOW_MINUTES,
+                  midLabel: '+45 min',
+                  endLabel: '+90 min',
+                  flagText: null,
+                  flagPosition: null,
+                  precip,
+                };
+                await sendLiveActivityUpdate(activityToken, contentState, env, {
+                  event: 'end',
+                  priority: LIVE_ACTIVITY_PRIORITY.transition,
+                });
+                await clearActivityToken(device.token, env);
+                console.log(`[Activity] Sent rain-end (final) update, grid ${grid.gridKey}`);
               }
+            } catch (err) {
+              console.error(`[Activity] push failed: ${err}`);
+              await discardDeadActivityToken(device.token, err, env);
             }
           }
         }
@@ -1066,7 +1111,12 @@ async function handleTestActivity(request: Request, env: Env): Promise<Response>
   if (precip) contentState.precip = precip;
 
   try {
-    await sendLiveActivityUpdate(activityToken, contentState, env, event);
+    // A hand-sent test push is one the operator wants to see now, so it goes
+    // at transition priority rather than waiting on the phone's discretion.
+    await sendLiveActivityUpdate(activityToken, contentState, env, {
+      event,
+      priority: LIVE_ACTIVITY_PRIORITY.transition,
+    });
     // Same as the cron's own end path: the activity is over, so drop its token
     // now rather than letting the next precipitating tick spend a push on a
     // token APNs will reject before discardDeadActivityToken reaps it.

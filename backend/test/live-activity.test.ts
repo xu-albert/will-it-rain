@@ -71,7 +71,12 @@ async function plantWithActivity(
   harness: Harness,
   n: number,
   now: number,
-  options: { leadTimeMinutes?: number; withActivity?: boolean } = {}
+  options: {
+    leadTimeMinutes?: number;
+    withActivity?: boolean;
+    rainStartEnabled?: boolean;
+    rainEndEnabled?: boolean;
+  } = {}
 ): Promise<void> {
   const { lat, lon } = coordsForCell(0);
   await harness.kv.put(
@@ -81,6 +86,8 @@ async function plantWithActivity(
       lat,
       lon,
       leadTimeMinutes: options.leadTimeMinutes ?? 30,
+      rainStartEnabled: options.rainStartEnabled,
+      rainEndEnabled: options.rainEndEnabled,
       registeredAt: new Date(now - n * 1000).toISOString(),
       renewedAt: new Date(now).toISOString(),
     }),
@@ -98,6 +105,7 @@ async function plantWithActivity(
 interface ActivityPush {
   activityToken: string;
   event: string;
+  priority: string | null;
   contentState: Record<string, unknown>;
   aps: Record<string, unknown>;
 }
@@ -127,6 +135,7 @@ async function capturing<T>(
         captured.activityPushes.push({
           activityToken: url.slice(url.lastIndexOf('/') + 1),
           event: String(payload.aps.event),
+          priority: headers.get('apns-priority'),
           contentState: payload.aps['content-state'] as Record<string, unknown>,
           aps: payload.aps,
         });
@@ -159,6 +168,11 @@ const rainAt = (from: number, summary?: SummaryPeriod[]) => (t: number) =>
   forecast(t, (i) => i >= from, { summary });
 const rainingUntil = (until: number, summary?: SummaryPeriod[]) => (t: number) =>
   forecast(t, (i) => i < until, { summary });
+/** Wet in every minute of the series: no rain start and no rain end exists. */
+const steadyRain = (summary?: SummaryPeriod[]) => (t: number) => forecast(t, () => true, { summary });
+/** Wet one minute ago, dry from now on: the rain has just stopped. */
+const justStopped = (summary?: SummaryPeriod[]) => (t: number) =>
+  forecast(t, (i) => i < 1, { firstMinuteOffsetMinutes: -1, summary });
 
 describe('precipFromForecast', () => {
   const withSummary = (summary?: SummaryPeriod[]) => ({
@@ -377,6 +391,8 @@ describe('the cron pushes precip on every Live Activity update', () => {
       rainAt(20, [{ condition: 'snow' }]),
       rainingUntil(40),
       rainingUntil(40, [{ condition: 'mixed' }]),
+      steadyRain(),
+      steadyRain([{ condition: 'snow' }]),
     ];
     for (const shape of shapes) {
       // Fresh dedup state per shape so every push actually goes out.
@@ -390,6 +406,217 @@ describe('the cron pushes precip on every Live Activity update', () => {
         expect(push.contentState).toHaveProperty('precip');
         expect(['rain', 'wintry']).toContain(push.contentState.precip);
       }
+    }
+  });
+});
+
+// Live Activity refreshes follow the card, not the alert settings. The card is
+// something the user started and is looking at; rainStartEnabled and
+// rainEndEnabled say only whether they want a notification.
+describe('Live Activity refreshes are independent of the notification toggles', () => {
+  it('keep the raining-now countdown going for a device that turned rain-end alerts off', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now(), { rainEndEnabled: false });
+
+    // Twenty minutes left: inside the rain-end alert window, so the alert's
+    // silence below is the toggle's doing, not the window's.
+    const captured = await tick(harness, rainingUntil(20));
+
+    expect(captured.alertPushes).toBe(0);
+    expect(captured.activityPushes).toHaveLength(1);
+    expect(captured.activityPushes[0].event).toBe('update');
+    expect(captured.activityPushes[0].contentState).toMatchObject({
+      statusText: 'Raining now',
+      subBold: 'stops in about 20 min',
+      heroText: null,
+    });
+    expect(typeof captured.activityPushes[0].contentState.countdownTarget).toBe('number');
+  });
+
+  it('end the activity for such a device when the rain stops', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now(), { rainEndEnabled: false });
+
+    const captured = await tick(harness, justStopped());
+
+    expect(captured.alertPushes).toBe(0);
+    expect(captured.activityPushes).toHaveLength(1);
+    expect(captured.activityPushes[0].event).toBe('end');
+    expect(captured.activityPushes[0].contentState).toMatchObject({ statusText: 'Rain ended' });
+    expect(harness.kv.raw(`activity:${fakeToken(1)}`)).toBeUndefined();
+  });
+
+  it('keep refreshing with every notification toggle off', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now(), { rainStartEnabled: false, rainEndEnabled: false });
+
+    const captured = await tick(harness, rainingUntil(40));
+
+    expect(captured.alertPushes).toBe(0);
+    expect(captured.activityPushes).toHaveLength(1);
+    expect(captured.activityPushes[0].contentState.statusText).toBe('Raining now');
+  });
+
+  it('still alert the devices that kept rain-end alerts on, alongside the refresh', async () => {
+    const harness = makeHarness({ signingKey });
+    const now = Date.now();
+    await plantWithActivity(harness, 1, now, { rainEndEnabled: false });
+    await plantWithActivity(harness, 2, now);
+
+    const captured = await tick(harness, rainingUntil(20));
+
+    expect(captured.alertPushes).toBe(1);
+    expect(captured.activityPushes.map((p) => p.activityToken).sort()).toEqual(
+      [activityTokenFor(1), activityTokenFor(2)].sort()
+    );
+  });
+});
+
+// Rain that outlasts the forecast window has no dry minute to count down to,
+// so neither a rain start nor a rain end exists. The tick used to return
+// before any Live Activity work in that case, and the card froze on its last
+// push for as long as the rain held.
+describe('steady rain with no dry minute in the forecast', () => {
+  it('sends a raining-now refresh with no countdown instead of nothing', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now());
+
+    const captured = await tick(harness, steadyRain([{ condition: 'rain' }]));
+
+    expect(captured.alertPushes).toBe(0);
+    expect(captured.activityPushes).toHaveLength(1);
+    expect(captured.activityPushes[0].activityToken).toBe(activityTokenFor(1));
+    expect(captured.activityPushes[0].event).toBe('update');
+    expect(captured.activityPushes[0].contentState).toMatchObject({
+      statusText: 'Raining now',
+      countdownTarget: null,
+      heroText: 'Raining',
+      subRest: 'Raining · ',
+      // One wet stretch across the whole window.
+      segments: [{ start: 0, end: 1 }],
+      precip: 'rain',
+    });
+    // An update, not an end: the activity keeps its token.
+    expect(harness.kv.raw(`activity:${fakeToken(1)}`)).toBeDefined();
+  });
+
+  it('refreshes on every tick the rain holds', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now());
+
+    for (let i = 0; i < 3; i++) {
+      const captured = await tick(harness, steadyRain());
+      expect(captured.activityPushes, `tick ${i}`).toHaveLength(1);
+      expect(captured.activityPushes[0].contentState.heroText).toBe('Raining');
+      expect(captured.alertPushes, `tick ${i}`).toBe(0);
+    }
+  });
+
+  it('keeps the wintry copy in steady snow', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now());
+
+    const captured = await tick(harness, steadyRain([{ condition: 'snow' }]));
+
+    expect(captured.activityPushes).toHaveLength(1);
+    expect(captured.activityPushes[0].contentState).toMatchObject({
+      statusText: 'Snowing now',
+      heroText: 'Snowing',
+      subRest: 'Snowing · ',
+      precip: 'wintry',
+    });
+  });
+
+  it('refreshes where WeatherKit has only the hourly forecast', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now());
+    const hour = 3_600_000;
+
+    const captured = await tick(harness, (t) => ({
+      forecastHourly: {
+        hours: [-1, 0, 1, 2].map((h) => ({
+          forecastStart: new Date(Math.floor(t / hour) * hour + h * hour).toISOString(),
+          precipitationChance: 0.9,
+          precipitationIntensity: 2,
+        })),
+      },
+    }));
+
+    expect(captured.activityPushes).toHaveLength(1);
+    expect(captured.activityPushes[0].contentState).toMatchObject({ countdownTarget: null, heroText: 'Raining' });
+  });
+
+  it('sends nothing to a device with no running Live Activity', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now(), { withActivity: false });
+
+    const captured = await tick(harness, steadyRain());
+
+    expect(captured.activityPushes).toEqual([]);
+    expect(captured.alertPushes).toBe(0);
+  });
+});
+
+// Priority 10 is metered against ActivityKit's hourly budget; the every-tick
+// refreshes of a raining card go at 5 so the pushes that change what the card
+// says are never the ones throttled.
+describe('Live Activity push priority', () => {
+  it('sends the rain-start update at priority 10', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now());
+
+    const { activityPushes } = await tick(harness, rainAt(20));
+
+    expect(activityPushes).toHaveLength(1);
+    expect(activityPushes[0].contentState.statusText).toBe('Rain incoming');
+    expect(activityPushes[0].priority).toBe('10');
+  });
+
+  it('sends the raining-now countdown refresh at priority 5', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now());
+
+    const { activityPushes } = await tick(harness, rainingUntil(40));
+
+    expect(activityPushes).toHaveLength(1);
+    expect(activityPushes[0].event).toBe('update');
+    expect(activityPushes[0].priority).toBe('5');
+  });
+
+  it('sends the steady-rain refresh at priority 5', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now());
+
+    const { activityPushes } = await tick(harness, steadyRain());
+
+    expect(activityPushes).toHaveLength(1);
+    expect(activityPushes[0].priority).toBe('5');
+  });
+
+  it('sends the rain-end push that ends the activity at priority 10', async () => {
+    const harness = makeHarness({ signingKey });
+    await plantWithActivity(harness, 1, Date.now());
+
+    const { activityPushes } = await tick(harness, justStopped());
+
+    expect(activityPushes).toHaveLength(1);
+    expect(activityPushes[0].event).toBe('end');
+    expect(activityPushes[0].priority).toBe('10');
+  });
+
+  it('sends the admin test pushes, update and end alike, at priority 10', async () => {
+    const harness = makeHarness({ signingKey });
+    harness.env.ADMIN_TOKEN = ADMIN;
+
+    for (const event of ['update', 'end']) {
+      await plantWithActivity(harness, 1, Date.now());
+      const { result, captured } = await capturing(rainAt(20), () =>
+        worker.fetch(adminRequest('/test-activity', { token: fakeToken(1), event }), harness.env)
+      );
+      expect(result.status, event).toBe(200);
+      expect(captured.activityPushes).toHaveLength(1);
+      expect(captured.activityPushes[0].event).toBe(event);
+      expect(captured.activityPushes[0].priority, event).toBe('10');
     }
   });
 });

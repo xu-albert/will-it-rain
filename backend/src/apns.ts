@@ -165,6 +165,30 @@ export function encodeActivityDate(date: Date): number {
 
 export type LiveActivityEvent = 'update' | 'end';
 
+// ActivityKit meters priority-10 Live Activity pushes against an hourly budget
+// and throttles them once it is spent; priority 5 is delivered
+// opportunistically and is what Apple asks for on updates that are not
+// time-sensitive. The cron refreshes a raining card every tick, so sending
+// all of those at 10 would spend the budget on keepalives and leave the
+// pushes that change what the card says to be throttled.
+//
+//   TRANSITION (10) — the card's state changes: rain incoming, the terminal
+//                     "Rain ended", and any `end` event.
+//   KEEPALIVE  (5)  — the same state redrawn with fresher numbers: the
+//                     raining-now refreshes, countdown or steady.
+//
+// The widget's countdown ticks on-device between pushes, so a keepalive that
+// arrives a little late leaves the card correct, just slightly less fresh.
+export const LIVE_ACTIVITY_PRIORITY = { transition: 10, keepalive: 5 } as const;
+export type LiveActivityPriority = (typeof LIVE_ACTIVITY_PRIORITY)[keyof typeof LIVE_ACTIVITY_PRIORITY];
+
+export interface LiveActivityPushOptions {
+  event: LiveActivityEvent;
+  // Required, not defaulted: every call site has to say which kind of push it
+  // is making, or a new one would silently spend the transition budget.
+  priority: LiveActivityPriority;
+}
+
 // `precip` is optional in this signature only so the test endpoint can send a
 // payload without it, standing in for a pre-1.1.2 Worker. The invariant that
 // production always sends it is enforced where the cron's content states are
@@ -174,7 +198,7 @@ export async function sendLiveActivityUpdate(
   activityToken: string,
   contentState: Omit<LiveActivityContentState, 'precip'> & { precip?: Precip },
   env: Env,
-  event: LiveActivityEvent = 'update'
+  { event, priority }: LiveActivityPushOptions
 ): Promise<void> {
   const token = await generateAPNsJWT(env);
 
@@ -197,7 +221,7 @@ export async function sendLiveActivityUpdate(
       Authorization: `bearer ${token}`,
       'apns-topic': `${env.APNS_TOPIC}.push-type.liveactivity`,
       'apns-push-type': 'liveactivity',
-      'apns-priority': '10',
+      'apns-priority': String(priority),
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ aps }),
