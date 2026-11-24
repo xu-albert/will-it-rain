@@ -7,20 +7,22 @@ final class NotificationService {
     /// Injected so the gate below can be tested without UNUserNotificationCenter,
     /// whose `add` needs a granted authorization and a running app. The shared
     /// instance delivers through the real center.
-    typealias Deliver = (_ title: String, _ body: String, _ identifier: String) -> Void
+    typealias Deliver = @MainActor (_ title: String, _ body: String, _ identifier: String) -> Void
 
     static let shared = NotificationService()
     private static let center = UNUserNotificationCenter.current()
     private static let maximumInRainPollInterval: TimeInterval = 15 * 60
 
     private let deliver: Deliver
-    private let remoteAlertsActive: () -> Bool
+    private let remoteAlertsActive: @MainActor () -> Bool
 
     init(
         deliver: Deliver? = nil,
-        remoteAlertsActive: (() -> Bool)? = nil
+        remoteAlertsActive: (@MainActor () -> Bool)? = nil
     ) {
-        self.deliver = deliver ?? Self.deliverImmediately
+        self.deliver = deliver ?? { title, body, identifier in
+            Self.deliverImmediately(title: title, body: body, identifier: identifier)
+        }
         self.remoteAlertsActive = remoteAlertsActive ?? {
             PushRegistrationService.shared.isRemoteRegistrationActive
         }

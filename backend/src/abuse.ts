@@ -178,15 +178,29 @@ export const MAX_DEVICE_RECORDS = MAX_GRID_CELLS * MAX_DEVICES_PER_CELL;
 export const RATE_LIMIT_WINDOW_SECONDS = 600;
 export const RATE_LIMIT_MAX_REQUESTS = 20;
 
+// Fixed shard pool for RegistrationLimiter so SQLite DO storage is O(1) bounded
+// under any IP churn or rotating-source flood instead of spawning one persistent
+// SQLite database per unique client IP.
+export const RATE_LIMIT_SHARDS = 16;
+
 // How long a `device:` record survives without being refreshed. Renewal is not
 // incidental: ContentView re-registers on cold launch, unconditionally on
 // willEnterForeground, and after every successful weather poll, and
 // LocationService re-registers on any move over 10 km — so a live install
-// rewrites its own record long before 45 days pass, while a fabricated one,
-// which nothing ever refreshes, evaporates. Before this existed the only
-// pruning path was a push failure, which never fires for a coordinate where it
-// never rains — which is why planted registrations used to be permanent.
-export const DEVICE_RECORD_TTL_SECONDS = 45 * 24 * 60 * 60; // 45 days
+// rewrites its own record long before 14 days pass, while a dormant single-open
+// or fabricated record evaporates instead of holding a scarce cell slot.
+export const DEVICE_RECORD_TTL_SECONDS = 14 * 24 * 60 * 60; // 14 days
+
+// How long an `activity:` token survives without being cleared. iOS Live
+// Activities cannot outlive 12 hours (8h active + 4h on Lock Screen), so 24h
+// gives 2x headroom while preventing stale tokens from lingering for weeks.
+export const ACTIVITY_RECORD_TTL_SECONDS = 24 * 60 * 60; // 24 hours
+
+// How long a cell may go without any occupant registering or renewing before it
+// becomes eligible for eviction when a new cell arrives at MAX_GRID_CELLS.
+// Active users who open the app at least once a week stay strictly protected;
+// long-dormant cells give up their slot instead of returning 503 worldwide.
+export const DORMANT_CELL_THRESHOLD_SECONDS = 7 * 24 * 60 * 60; // 7 days
 
 // Records written before the TTL existed carry no expiration and KV cannot add
 // one after the fact, so the cron rewrites them as it meets them. Bounded per
@@ -215,14 +229,15 @@ export const MAX_DEVICE_REAPS_PER_TICK = 2;
 // nothing in it changed. The client re-registers constantly (cold launch, every
 // foreground, every successful poll), and writing on each of those spends the
 // daily KV write allowance below on nothing. Skipping the identical write is
-// only safe because this threshold forces one through long before the 45-day
-// TTL runs out: 7 days leaves better than six refreshes of headroom.
+// only safe because this threshold forces one through long before the 14-day
+// TTL runs out: 3 days leaves four refreshes of headroom and keeps KV's
+// `renewedAt` well inside DORMANT_CELL_THRESHOLD_SECONDS.
 //
 // The freshness check reads `renewedAt`, never `registeredAt`. They are
 // different facts: `registeredAt` is first-seen and must stay first-seen,
 // because selectCellsWithinCap ranks cells by it and restamping it would let a
 // planted record outrank a live user.
-export const DEVICE_RECORD_REFRESH_SECONDS = 7 * 24 * 60 * 60; // 7 days
+export const DEVICE_RECORD_REFRESH_SECONDS = 3 * 24 * 60 * 60; // 3 days
 
 // The shortest interval at which one device's record may be re-persisted.
 //
@@ -356,12 +371,12 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //      magnitude below it.
 //
 // WRITES — 1,000/day
-//   `device:` puts, /register     ~43/day steady state. Without the
+//   `device:` puts, /register     ~100/day steady state. Without the
 //                                 skip-when-unchanged check below this would be
 //                                 one write per foreground per device —
 //                                 thousands. With it, an unchanged device
 //                                 writes once per DEVICE_RECORD_REFRESH_SECONDS,
-//                                 so 300/7 ~= 43, plus one per genuine change of
+//                                 so 300/3 = 100, plus one per genuine change of
 //                                 coordinates or settings.
 //   `device:` puts, TTL migration <= 5 x 144 = 720/day, but only until the
 //                                 pre-TTL records are drained; then zero.
@@ -541,7 +556,7 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 // (TESTING.md documents ~15 devices, an order of magnitude below every
 // crossover above) and that running near the caps needs the Paid plan.
 // Exceeding an allowance makes that operation fail for the rest of the UTC day:
-// KV writes gone means putDeviceRecord throws and /register 500s, and the 45-day
+// KV writes gone means putDeviceRecord throws and /register 500s, and the 14-day
 // TTL is only safe while live installs can renew; KV deletes gone means
 // /unregister 500s and dead tokens cannot be reaped; a DO meter gone means the
 // gate stops counting and lets everything through.
@@ -572,18 +587,26 @@ async function clientBucket(request: Request): Promise<string> {
     .join('');
 }
 
+function limiterShardName(bucket: string): string {
+  const prefix = parseInt(bucket.slice(0, 2), 16);
+  const shard = Number.isFinite(prefix) ? prefix % RATE_LIMIT_SHARDS : 0;
+  return `shard-${shard}`;
+}
+
 // ---------------------------------------------------------------------------
 // Rate limit
 // ---------------------------------------------------------------------------
 
 export async function checkRegistrationRate(request: Request, env: Env): Promise<RateDecision> {
   const bucket = await clientBucket(request);
+  const shard = limiterShardName(bucket);
 
   try {
-    const stub = env.REGISTRATION_LIMITER.get(env.REGISTRATION_LIMITER.idFromName(bucket));
+    const stub = env.REGISTRATION_LIMITER.get(env.REGISTRATION_LIMITER.idFromName(shard));
     const response = await stub.fetch('https://limiter/check', {
       method: 'POST',
       body: JSON.stringify({
+        bucket,
         windowSeconds: RATE_LIMIT_WINDOW_SECONDS,
         maxRequests: RATE_LIMIT_MAX_REQUESTS,
       }),
@@ -613,9 +636,10 @@ export type CellDecision = CoverageReply;
  *
  * A device already registered in that cell is always admitted — existing users
  * can re-register, move within their cell, or change their lead time even once
- * the service is full. Only a device that is new to a full cell, or that would
- * open a cell beyond the global cap (and so add ~4,383 WeatherKit calls a
- * month, forever), is turned away.
+ * the service is full. When at MAX_GRID_CELLS and a new cell is requested, the
+ * registry evicts the oldest-renewed dormant cell (one whose occupants have all
+ * been inactive for at least DORMANT_CELL_THRESHOLD_SECONDS) if one exists,
+ * while strictly protecting active cells.
  */
 export async function reserveGridCell(
   gridKey: string,
@@ -632,6 +656,7 @@ export async function reserveGridCell(
         incumbent: options.incumbent === true,
         maxCells: MAX_GRID_CELLS,
         maxDevicesPerCell: MAX_DEVICES_PER_CELL,
+        dormantAfterMs: DORMANT_CELL_THRESHOLD_SECONDS * 1000,
       }),
     });
     return (await response.json()) as CoverageReply;
@@ -699,14 +724,21 @@ export async function releaseGridCell(deviceToken: string, env: Env): Promise<vo
  */
 export async function reconcileCoverage(grids: GridCell[], env: Env): Promise<void> {
   const coverage: CoverageMap = {};
+  const activity: Record<string, number> = {};
   for (const grid of grids) {
     coverage[grid.gridKey] = grid.devices.map((device) => device.token);
+    for (const device of grid.devices) {
+      const ts = Date.parse(device.renewedAt ?? device.registeredAt);
+      if (Number.isFinite(ts)) {
+        activity[device.token] = Math.max(activity[device.token] ?? -Infinity, ts);
+      }
+    }
   }
 
   try {
     await coverageStub(env).fetch('https://coverage/reconcile', {
       method: 'POST',
-      body: JSON.stringify({ coverage }),
+      body: JSON.stringify({ coverage, activity }),
     });
   } catch (err) {
     console.warn(`[Abuse] Could not reconcile grid-cell coverage: ${err}`);

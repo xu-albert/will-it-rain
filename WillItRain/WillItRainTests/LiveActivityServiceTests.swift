@@ -114,4 +114,29 @@ final class LiveActivityServiceTests: XCTestCase {
         ]
         XCTAssertTrue(states.allSatisfy { $0.precip != nil })
     }
+
+    // MARK: - Teardown
+
+    func testEndAllUnregistersRemoteLiveActivityWhenActivitiesAreEnded() async {
+        let unregistered = expectation(description: "remote Live Activity unregistered")
+        let service = LiveActivityService(
+            endActivities: { ["activity-1"] },
+            unregisterRemoteActivity: { unregistered.fulfill() }
+        )
+
+        service.endAll()
+        await fulfillment(of: [unregistered], timeout: 2)
+    }
+
+    func testEndAllSkipsRemoteUnregisterWhenNoActivitiesAreRunning() async {
+        var unregisterCount = 0
+        let service = LiveActivityService(
+            endActivities: { [] },
+            unregisterRemoteActivity: { unregisterCount += 1 }
+        )
+
+        service.endAll()
+        await Task.yield()
+        XCTAssertEqual(unregisterCount, 0)
+    }
 }

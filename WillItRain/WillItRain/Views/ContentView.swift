@@ -303,14 +303,14 @@ struct ContentView: View {
 
     /// Rewrite this device's server-side registration on every foreground.
     ///
-    /// The backend expires a `device:` record 45 days after its last write, which
+    /// The backend expires a `device:` record 14 days after its last write, which
     /// is what makes fabricated registrations transient — but it only makes a
     /// *live* install safe if the install genuinely renews itself. Nothing else
     /// guarantees that: the weather poller only re-registers after a successful
     /// fetch, LocationService only fires past 10 km, and background refresh never
     /// registers at all. Without this, someone who opens the app daily but never
     /// cold-launches it and never travels would silently lose every rain alert on
-    /// day 45.
+    /// day 14.
     ///
     /// Cheap and safe to repeat: it is a no-op until APNs has handed us a token,
     /// and the server's per-client throttle (20 per 10 minutes) is far above any

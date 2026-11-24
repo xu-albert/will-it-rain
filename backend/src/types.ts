@@ -1,6 +1,6 @@
 export interface Env {
   DEVICES: KVNamespace;
-  /** Per-client registration throttle. One instance per hashed client address. */
+  /** Per-client registration throttle, sharded across a fixed pool of instances. */
   REGISTRATION_LIMITER: DurableObjectNamespace;
   /** The authoritative grid-cell / per-cell-device tally. One global instance. */
   COVERAGE: DurableObjectNamespace;
@@ -73,6 +73,10 @@ export interface CoverageReply {
   cells: number;
   /** Devices in the requested cell. */
   devices: number;
+  /** Grid key evicted to admit a new cell at cap, when a dormant slot existed. */
+  evictedCell?: string;
+  /** Device tokens belonging to `evictedCell`, whose KV records should be cleared. */
+  evictedTokens?: string[];
 }
 
 export interface WeatherKitMinute {

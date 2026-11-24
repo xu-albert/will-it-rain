@@ -80,13 +80,13 @@ rescale one PNG into another size. `verify_mark.py` checks that the SwiftUI
   `Codable` init throws on a missing key and ActivityKit then drops the update silently — the
   card freezes with no error. Consequence for releases: **deploy the Worker before an app that
   adds a content-state field reaches users**, or the old Worker's next tick strips the field.
-- A `device:` record's 45-day TTL is only safe because the client genuinely renews
+- A `device:` record's 14-day TTL is only safe because the client genuinely renews
   it: `ContentView` re-registers on cold launch, on `willEnterForeground` and after
   every successful weather poll, and `LocationService` re-registers past a 10 km
   move. Renewal takes both halves, though — the server skips a re-registration that
   changes nothing, so what actually resets the TTL is `DEVICE_RECORD_REFRESH_SECONDS`
-  (7 days) forcing a write through. Break either half and the TTL becomes a silent
-  alert outage on day 45.
+  (3 days) forcing a write through. Break either half and the TTL becomes a silent
+  alert outage on day 14.
 
 ## Maintaining this file
 
