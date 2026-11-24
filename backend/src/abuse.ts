@@ -578,8 +578,8 @@ function clientAddress(request: Request): string {
   return request.headers.get('CF-Connecting-IP') ?? 'unknown';
 }
 
-// The address is hashed before it names a Durable Object so that the instance
-// name is not a short-lived log of who talked to us. This is bookkeeping
+// The address is hashed before it is stored as a rate-limit bucket key so the
+// shard's map is not a short-lived log of raw client IPs. This is bookkeeping
 // hygiene, not anonymisation: the IPv4 space is small enough to brute-force a
 // hash.
 async function clientBucket(request: Request): Promise<string> {
