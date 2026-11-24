@@ -73,9 +73,9 @@ export interface CoverageReply {
   cells: number;
   /** Devices in the requested cell. */
   devices: number;
-  /** Grid key evicted to admit a new cell at cap, when a dormant slot existed. */
-  evictedCell?: string;
-  /** Device tokens belonging to `evictedCell`, whose KV records should be cleared. */
+  /** Grid keys evicted to admit a new cell within cap, when enough dormant slots existed. */
+  evictedCells?: string[];
+  /** Device tokens belonging to `evictedCells`, whose KV records should be cleared. */
   evictedTokens?: string[];
 }
 

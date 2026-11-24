@@ -475,7 +475,8 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //                                 1 reconcile, MAX_DEVICE_REAPS_PER_TICK
 //                                 releases, and worst case one flag-reap per
 //                                 push attempted.
-//   limiter alarms                1 per address per idle window, the self-clean.
+//   limiter alarms                1 per active shard (<= RATE_LIMIT_SHARDS) per
+//                                 expiry/idle cycle, the self-clean.
 //   => The cron spends ~5.5% of the allowance. Registration is the term that
 //      moves: one address at the 20-per-10-minutes ceiling is 2,880
 //      registrations = ~5,760 requests/day, so ~17 sustained addresses drain it.
@@ -484,33 +485,37 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //      with nothing in this file bounding it.
 //
 // DO ROWS WRITTEN — 100,000/day; a put, a delete and a setAlarm are one row each
-//   limiter, admitted request     1 WINDOW_KEY put, plus 1 setAlarm on the
-//                                 request that opens a window and 1 for the
-//                                 deleteAll when that alarm fires. A 429 writes
-//                                 nothing at all.
-//   reserve, per registration     1 RECENT_KEY put always, 1 COVERAGE_KEY put
-//                                 when the tally actually moves, and 1
-//                                 PENDING_KEY put only for a device that was
-//                                 flagged — 1 to 3, usually 2.
-//   reserve, per refusal          <= 2: the coverage put for the old cell it
-//                                 released on the way in, and the
-//                                 recent-admission forget.
-//   release                       <= 3, on a teardown and on a reap.
+//   limiter, admitted request     1 BUCKETS_KEY put per request on the client's
+//                                 shard, plus 1 setAlarm when that shard has no
+//                                 armed alarm, and 1 deleteAll (or 1 put + 1
+//                                 setAlarm if live buckets remain) when the
+//                                 alarm fires. A 429 writes nothing at all.
+//   reserve, per registration     1 RECENT_KEY put always, 1 ACTIVITY_KEY put
+//                                 whenever the timestamp advances or dormant
+//                                 devices are evicted, 1 COVERAGE_KEY put when
+//                                 the tally actually moves, and 1 PENDING_KEY
+//                                 put only when a device was flagged — 1 to 4,
+//                                 usually 2 unchanged or 3 on a cell change.
+//   reserve, per refusal          <= 3: the coverage put for the old cell it
+//                                 released on the way in, the activity removal,
+//                                 and the recent-admission forget.
+//   release                       <= 4, on a teardown and on a reap: coverage,
+//                                 activity, recent, pending.
 //   flag-reap                     1 per newly rejected token, <= 34/tick.
-//   reconcile                     3/tick unconditionally: coverage, recent,
-//                                 pending.
-//   => The cron is <= 43/tick = 6,192/day, ~6%. One address at the throttle
-//      ceiling writes ~5,800 rows/day re-registering unchanged, and ~8,640 when
-//      it alternates cells so the tally moves on every request, so 12 to 17
+//   reconcile                     4/tick unconditionally: coverage, recent,
+//                                 activity, pending.
+//   => The cron is <= 46/tick = 6,624/day, ~6.6%. One address at the throttle
+//      ceiling writes ~8,640 rows/day re-registering unchanged, and ~11,520
+//      when it alternates cells so the tally moves on every request, so 9 to 12
 //      sustained addresses drain it — the same shape as the KV write bucket, and
 //      for the same reason.
 //
 // DO ROWS READ — 5,000,000/day
-//   ~4 per admitted registration (the limiter's window get, plus coverage,
-//   recent and pending inside reserve) and ~45 per cron tick, so ~11,500/day
-//   for an address at the throttle ceiling and ~6,500/day for the cron. Fits
-//   with three orders of magnitude to spare. It is listed so the next reader can
-//   see it was counted, not because it needs watching.
+//   ~5 per admitted registration (the limiter shard's buckets get, plus
+//   coverage, recent, activity and pending inside reserve) and <= 46 per cron
+//   tick, so ~14,400/day for an address at the throttle ceiling and ~6,600/day
+//   for the cron. Fits with three orders of magnitude to spare. It is listed so
+//   the next reader can see it was counted, not because it needs watching.
 //
 // DO DURATION — 13,000 GB-s/day
 //   The one term here bounded by argument rather than arithmetic: neither object
@@ -538,7 +543,7 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //   rather than assume the bucket cannot move.
 //
 //   ALL FOUR DO METERS FIT, and none of them gets a budget. Legitimate traffic
-//   spends about 6% of the two that bind first — requests and rows written —
+//   spends under 7% of the two that bind first — requests and rows written —
 //   and far less of rows read and duration, and no arithmetic above asks for a
 //   bound, so there is deliberately no per-tick DO budget, no new constant and
 //   no guard code here —
@@ -636,10 +641,11 @@ export type CellDecision = CoverageReply;
  *
  * A device already registered in that cell is always admitted — existing users
  * can re-register, move within their cell, or change their lead time even once
- * the service is full. When at MAX_GRID_CELLS and a new cell is requested, the
- * registry evicts the oldest-renewed dormant cell (one whose occupants have all
- * been inactive for at least DORMANT_CELL_THRESHOLD_SECONDS) if one exists,
- * while strictly protecting active cells.
+ * the service is full. When at or above MAX_GRID_CELLS and a new cell is
+ * requested, the registry evicts enough oldest-renewed dormant cells (whose
+ * occupants have all been inactive for at least DORMANT_CELL_THRESHOLD_SECONDS)
+ * to stay within MAX_GRID_CELLS if enough exist, while strictly protecting
+ * active cells.
  */
 export async function reserveGridCell(
   gridKey: string,

@@ -1339,8 +1339,9 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   }
 
   if (cell.evictedTokens && cell.evictedTokens.length > 0) {
+    const evictedLabel = cell.evictedCells?.join(', ') ?? 'unknown';
     console.log(
-      `[Register] Evicted dormant cell ${cell.evictedCell} (${cell.evictedTokens.length} stale device(s)) to admit grid ${gridKey}`
+      `[Register] Evicted dormant cell(s) ${evictedLabel} (${cell.evictedTokens.length} stale device(s)) to admit grid ${gridKey}`
     );
     await evictDormantDevicesFromKV(cell.evictedTokens, env);
   }

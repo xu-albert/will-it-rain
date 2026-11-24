@@ -1730,6 +1730,117 @@ describe('Free-tier capacity mitigation (14d TTL, dormant eviction, 0.05 deg gri
     }
   });
 
+  it('refuses without evicting when an overflowed registry has fewer dormant cells than needed to stay within MAX_GRID_CELLS', async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse('2026-11-24T08:00:00.000Z');
+      vi.setSystemTime(now);
+      const harness = makeHarness();
+
+      // 15 active cells (1..15) plus 1 dormant cell (0) resurrected by stale KV
+      // reconciliation => 16 total cells. Admitting a newcomer requires evicting
+      // 2 cells to finish at 15, so 1 dormant cell is not enough.
+      for (let n = 0; n <= MAX_GRID_CELLS; n++) {
+        const { lat, lon } = coordsForCell(n);
+        const ageDays = n === 0 ? 12 : 1;
+        const ts = new Date(now - ageDays * 24 * 60 * 60 * 1000).toISOString();
+        await harness.kv.put(
+          `device:${fakeToken(n)}`,
+          JSON.stringify({
+            token: fakeToken(n),
+            lat,
+            lon,
+            leadTimeMinutes: 20,
+            registeredAt: ts,
+            renewedAt: ts,
+          }),
+          { expirationTtl: DEVICE_RECORD_TTL_SECONDS }
+        );
+      }
+
+      const coverage = await readCoverage(harness.env);
+      expect(coverage.grids).toHaveLength(MAX_GRID_CELLS + 1);
+      await reconcileCoverage(coverage.grids, harness.env);
+
+      const newcomer = await worker.fetch(
+        registerRequest(888, { cell: 888, ip: '192.0.2.223' }),
+        harness.env
+      );
+      expect(newcomer.status).toBe(503);
+      expect(((await newcomer.json()) as { code: string }).code).toBe('coverage_at_capacity');
+      expect(harness.kv.raw(`device:${fakeToken(888)}`)).toBeUndefined();
+      // The lone dormant cell must not have been partially evicted on refusal.
+      expect(harness.kv.raw(`device:${fakeToken(0)}`)).toBeDefined();
+      const stored = await harness.coverage
+        .storageFor('global')
+        .get<Record<string, string[]>>('cells');
+      expect(Object.keys(stored ?? {})).toHaveLength(MAX_GRID_CELLS + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('evicts all needed dormant cells from both registry and KV when overflowed past MAX_GRID_CELLS', async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse('2026-11-24T08:00:00.000Z');
+      vi.setSystemTime(now);
+      const harness = makeHarness();
+
+      // 14 active cells (2..15) plus 2 dormant cells (0 idle 12d, 1 idle 9d)
+      // => 16 total cells. Admitting a newcomer must evict both dormant cells so
+      // the resulting cell count is exactly MAX_GRID_CELLS (15).
+      for (let n = 0; n <= MAX_GRID_CELLS; n++) {
+        const { lat, lon } = coordsForCell(n);
+        const ageDays = n === 0 ? 12 : n === 1 ? 9 : 1;
+        const ts = new Date(now - ageDays * 24 * 60 * 60 * 1000).toISOString();
+        await harness.kv.put(
+          `device:${fakeToken(n)}`,
+          JSON.stringify({
+            token: fakeToken(n),
+            lat,
+            lon,
+            leadTimeMinutes: 20,
+            registeredAt: ts,
+            renewedAt: ts,
+          }),
+          { expirationTtl: DEVICE_RECORD_TTL_SECONDS }
+        );
+      }
+      await harness.kv.put(
+        `activity:${fakeToken(0)}`,
+        JSON.stringify({ activityToken: fakeToken(900), activityUpdatedAt: new Date(now).toISOString() }),
+        { expirationTtl: ACTIVITY_RECORD_TTL_SECONDS }
+      );
+      await harness.kv.put(
+        `activity:${fakeToken(1)}`,
+        JSON.stringify({ activityToken: fakeToken(901), activityUpdatedAt: new Date(now).toISOString() }),
+        { expirationTtl: ACTIVITY_RECORD_TTL_SECONDS }
+      );
+
+      const coverage = await readCoverage(harness.env);
+      await reconcileCoverage(coverage.grids, harness.env);
+
+      const newcomer = await worker.fetch(
+        registerRequest(889, { cell: 889, ip: '192.0.2.224' }),
+        harness.env
+      );
+      expect(newcomer.status).toBe(200);
+      expect(harness.kv.raw(`device:${fakeToken(0)}`)).toBeUndefined();
+      expect(harness.kv.raw(`activity:${fakeToken(0)}`)).toBeUndefined();
+      expect(harness.kv.raw(`device:${fakeToken(1)}`)).toBeUndefined();
+      expect(harness.kv.raw(`activity:${fakeToken(1)}`)).toBeUndefined();
+      expect(harness.kv.raw(`device:${fakeToken(889)}`)).toBeDefined();
+      expect(storedCells(harness.kv).size).toBe(MAX_GRID_CELLS);
+      const stored = await harness.coverage
+        .storageFor('global')
+        .get<Record<string, string[]>>('cells');
+      expect(Object.keys(stored ?? {})).toHaveLength(MAX_GRID_CELLS);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('coarsens grid cells to 0.05 degrees and smoothly merges legacy 0.01-degree entries', async () => {
     expect(GRID_PRECISION).toBe(0.05);
     // Two nearby metro points (~3.5 km apart) map to the same 0.05 deg cell.
@@ -1865,5 +1976,15 @@ describe('fixed-shard RegistrationLimiter', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('purges legacy per-IP window keys when an in-flight pre-deploy alarm fires', async () => {
+    const harness = makeHarness();
+    const legacyStorage = harness.limiter.storageFor('deadbeef01234567');
+    await legacyStorage.put('window', { window: 1, count: 5 });
+
+    await harness.limiter.runAlarm('deadbeef01234567');
+
+    expect(await legacyStorage.get('window')).toBeUndefined();
   });
 });

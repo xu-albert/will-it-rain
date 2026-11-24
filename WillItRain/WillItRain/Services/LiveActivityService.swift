@@ -75,12 +75,7 @@ final class LiveActivityService {
 
     func endAll() {
         let endedIDs = endActivities()
-        let hadObservers = !tokenObservers.isEmpty
-        for id in endedIDs {
-            tokenObservers[id]?.cancel()
-            tokenObservers[id] = nil
-        }
-        guard !endedIDs.isEmpty || hadObservers else { return }
+        guard !endedIDs.isEmpty || !tokenObservers.isEmpty else { return }
         for observer in tokenObservers.values {
             observer.cancel()
         }

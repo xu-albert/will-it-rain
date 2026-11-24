@@ -143,7 +143,7 @@ export class RegistrationLimiter {
       }
     }
     if (Object.keys(live).length === 0) {
-      await this.ctx.storage.delete(BUCKETS_KEY);
+      await this.ctx.storage.deleteAll();
     } else {
       await this.ctx.storage.put<BucketMap>(BUCKETS_KEY, live);
       await this.ctx.storage.setAlarm(latestExpiry + 1000);
@@ -281,25 +281,26 @@ export class CoverageRegistry {
   }
 
   /**
-   * Finds the oldest-renewed dormant cell eligible for eviction at cap.
+   * Finds the `count` oldest-renewed dormant cells eligible for eviction at cap.
    *
    * A cell is dormant only when EVERY occupant has a known activity timestamp
    * at least `dormantAfterMs` old and none was admitted within the reconcile
    * grace window. Any cell with an active occupant or unknown timestamp (e.g.
    * before the first post-deploy reconcile populates timestamps from KV) is
-   * protected.
+   * protected. Returns `null` if fewer than `count` eligible cells exist so
+   * callers never partially evict before refusing.
    */
-  private findDormantVictim(
+  private findDormantVictims(
     cells: CoverageMap,
     activity: DeviceActivity,
     recent: RecentAdmissions,
     now: number,
-    dormantAfterMs: number
-  ): string | null {
-    if (!Number.isFinite(dormantAfterMs) || dormantAfterMs <= 0) return null;
+    dormantAfterMs: number,
+    count: number
+  ): string[] | null {
+    if (!Number.isFinite(dormantAfterMs) || dormantAfterMs <= 0 || count <= 0) return null;
 
-    let victimKey: string | null = null;
-    let victimLastActivity = Number.POSITIVE_INFINITY;
+    const candidates: Array<{ key: string; lastActivity: number }> = [];
 
     for (const [key, tokens] of Object.entries(cells)) {
       if (tokens.length === 0) continue;
@@ -321,16 +322,17 @@ export class CoverageRegistry {
       if (!eligible) continue;
       if (now - cellLastActivity < dormantAfterMs) continue;
 
-      if (
-        cellLastActivity < victimLastActivity ||
-        (cellLastActivity === victimLastActivity && (victimKey === null || key < victimKey))
-      ) {
-        victimKey = key;
-        victimLastActivity = cellLastActivity;
-      }
+      candidates.push({ key, lastActivity: cellLastActivity });
     }
 
-    return victimKey;
+    if (candidates.length < count) return null;
+
+    candidates.sort((a, b) => {
+      if (a.lastActivity !== b.lastActivity) return a.lastActivity - b.lastActivity;
+      return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+    });
+
+    return candidates.slice(0, count).map((c) => c.key);
   }
 
   /**
@@ -378,7 +380,7 @@ export class CoverageRegistry {
     const activity = await this.loadActivity();
     let changed = migrated;
     let activityChanged = false;
-    let evictedCell: string | undefined;
+    let evictedCells: string[] | undefined;
     let evictedTokens: string[] | undefined;
 
     for (const [key, tokens] of Object.entries(cells)) {
@@ -410,18 +412,30 @@ export class CoverageRegistry {
       }
     } else {
       if (Object.keys(cells).length >= maxCells && !incumbent) {
-        const victimKey = this.findDormantVictim(cells, activity, recent, now, dormantAfterMs);
-        if (victimKey !== null) {
-          evictedCell = victimKey;
-          evictedTokens = [...cells[victimKey]];
-          delete cells[victimKey];
-          for (const token of evictedTokens) {
-            if (token in activity) {
-              delete activity[token];
-              activityChanged = true;
+        const needed = Object.keys(cells).length - maxCells + 1;
+        const victimKeys = this.findDormantVictims(
+          cells,
+          activity,
+          recent,
+          now,
+          dormantAfterMs,
+          needed
+        );
+        if (victimKeys !== null) {
+          evictedCells = victimKeys;
+          const evictedTokenSet = new Set<string>();
+          for (const victimKey of victimKeys) {
+            for (const token of cells[victimKey]) {
+              evictedTokenSet.add(token);
+              if (token in activity) {
+                delete activity[token];
+                activityChanged = true;
+              }
+              delete recent[token];
             }
-            delete recent[token];
+            delete cells[victimKey];
           }
+          evictedTokens = [...evictedTokenSet];
           changed = true;
         } else {
           if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
@@ -456,7 +470,7 @@ export class CoverageRegistry {
       ok: true,
       cells: Object.keys(cells).length,
       devices: cells[gridKey]?.length ?? 0,
-      ...(evictedCell ? { evictedCell, evictedTokens } : {}),
+      ...(evictedCells ? { evictedCells, evictedTokens } : {}),
     };
     return reply(admitted);
   }
