@@ -11,6 +11,7 @@ import {
 } from './types';
 import { LegacyRecord, readActivityTokens, readCoverage, gridCenter, toGridKey } from './grid';
 import { fetchForecast } from './weatherkit';
+import { formatError, isTimeoutError, logError, logInfo, logWarn } from './logger';
 import { nextHourMinutes } from './nextHour';
 import { CRON_PERIOD_MINUTES } from './scheduling';
 import {
@@ -226,6 +227,15 @@ function hasJsonContentType(request: Request): boolean {
   return contentType.split(';')[0].trim().toLowerCase() === 'application/json';
 }
 
+interface RequestLogContext {
+  code?: string;
+  gridKey?: string;
+  bucketPrefix?: string;
+  reason?: string;
+  retryAfterSeconds?: number;
+  evictedCells?: string[];
+}
+
 // Front door for every state-changing endpoint. Returns a response to send
 // instead of running the handler, or null to proceed.
 //
@@ -236,9 +246,11 @@ function hasJsonContentType(request: Request): boolean {
 async function guardMutation(
   request: Request,
   env: Env,
-  options: { throttle: boolean }
+  options: { throttle: boolean },
+  reqLog: RequestLogContext
 ): Promise<Response | null> {
   if (!hasJsonContentType(request)) {
+    reqLog.code = 'unsupported_media_type';
     return json(
       {
         error: 'Content-Type must be application/json.',
@@ -251,8 +263,10 @@ async function guardMutation(
   if (!options.throttle) return null;
 
   const rate = await checkRegistrationRate(request, env);
+  if (rate.bucketPrefix) reqLog.bucketPrefix = rate.bucketPrefix;
   if (!rate.ok) {
-    console.log(`[Abuse] Throttled a registration request for ${rate.retryAfterSeconds}s`);
+    reqLog.code = 'rate_limited';
+    reqLog.retryAfterSeconds = rate.retryAfterSeconds;
     return json(
       {
         error:
@@ -271,250 +285,378 @@ async function guardMutation(
 export default {
   // HTTP API for device registration
   async fetch(request: Request, env: Env): Promise<Response> {
+    const startMs = Date.now();
     const url = new URL(request.url);
+    const reqLog: RequestLogContext = {};
 
-    // /register and /register-activity are throttled: they are the two routes
-    // that grow stored state and, through it, the cron's WeatherKit bill. The
-    // two teardown routes are only content-type checked — a user leaving should
-    // never be told to come back later.
-    if (request.method === 'POST' && url.pathname === '/register') {
-      return (await guardMutation(request, env, { throttle: true })) ?? handleRegister(request, env);
+    const dispatch = async (): Promise<Response> => {
+      // /register and /register-activity are throttled: they are the two routes
+      // that grow stored state and, through it, the cron's WeatherKit bill. The
+      // two teardown routes are only content-type checked — a user leaving should
+      // never be told to come back later.
+      if (request.method === 'POST' && url.pathname === '/register') {
+        return (
+          (await guardMutation(request, env, { throttle: true }, reqLog)) ??
+          handleRegister(request, env, reqLog)
+        );
+      }
+
+      if (request.method === 'DELETE' && url.pathname === '/unregister') {
+        return (
+          (await guardMutation(request, env, { throttle: false }, reqLog)) ??
+          handleUnregister(request, env, reqLog)
+        );
+      }
+
+      if (request.method === 'POST' && url.pathname === '/register-activity') {
+        return (
+          (await guardMutation(request, env, { throttle: true }, reqLog)) ??
+          handleRegisterActivity(request, env, reqLog)
+        );
+      }
+
+      if (request.method === 'POST' && url.pathname === '/unregister-activity') {
+        return (
+          (await guardMutation(request, env, { throttle: false }, reqLog)) ??
+          handleUnregisterActivity(request, env, reqLog)
+        );
+      }
+
+      if (request.method === 'POST' && url.pathname === '/test-rain') {
+        if (!isAuthorizedAdmin(request, env)) {
+          reqLog.code = 'unauthorized';
+          return json({ error: 'Unauthorized' }, 401);
+        }
+        return handleTestRain(request, env, reqLog);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/test-activity') {
+        if (!isAuthorizedAdmin(request, env)) {
+          reqLog.code = 'unauthorized';
+          return json({ error: 'Unauthorized' }, 401);
+        }
+        return handleTestActivity(request, env, reqLog);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/test-cron') {
+        if (!isAuthorizedAdmin(request, env)) {
+          reqLog.code = 'unauthorized';
+          return json({ error: 'Unauthorized' }, 401);
+        }
+        return handleTestCron(request, env, reqLog);
+      }
+
+      reqLog.code = 'not_found';
+      return new Response('Not found', { status: 404 });
+    };
+
+    try {
+      const response = await dispatch();
+      const durationMs = Date.now() - startMs;
+      const fields = {
+        method: request.method,
+        route: url.pathname,
+        status: response.status,
+        durationMs,
+        code: reqLog.code,
+        gridKey: reqLog.gridKey,
+        bucketPrefix: reqLog.bucketPrefix,
+        reason: reqLog.reason,
+        retryAfterSeconds: reqLog.retryAfterSeconds,
+        evictedCells: reqLog.evictedCells,
+      };
+      if (response.status >= 500) {
+        logError('http.request', fields);
+      } else if (response.status >= 400) {
+        logWarn('http.request', fields);
+      } else {
+        logInfo('http.request', fields);
+      }
+      return response;
+    } catch (err) {
+      logError('http.request', {
+        method: request.method,
+        route: url.pathname,
+        status: 500,
+        code: 'unhandled_exception',
+        durationMs: Date.now() - startMs,
+        gridKey: reqLog.gridKey,
+        bucketPrefix: reqLog.bucketPrefix,
+        error: formatError(err),
+      });
+      throw err;
     }
-
-    if (request.method === 'DELETE' && url.pathname === '/unregister') {
-      return (
-        (await guardMutation(request, env, { throttle: false })) ?? handleUnregister(request, env)
-      );
-    }
-
-    if (request.method === 'POST' && url.pathname === '/register-activity') {
-      return (
-        (await guardMutation(request, env, { throttle: true })) ??
-        handleRegisterActivity(request, env)
-      );
-    }
-
-    if (request.method === 'POST' && url.pathname === '/unregister-activity') {
-      return (
-        (await guardMutation(request, env, { throttle: false })) ??
-        handleUnregisterActivity(request, env)
-      );
-    }
-
-    if (request.method === 'POST' && url.pathname === '/test-rain') {
-      if (!isAuthorizedAdmin(request, env)) return json({ error: 'Unauthorized' }, 401);
-      return handleTestRain(request, env);
-    }
-
-    if (request.method === 'POST' && url.pathname === '/test-activity') {
-      if (!isAuthorizedAdmin(request, env)) return json({ error: 'Unauthorized' }, 401);
-      return handleTestActivity(request, env);
-    }
-
-    if (request.method === 'POST' && url.pathname === '/test-cron') {
-      if (!isAuthorizedAdmin(request, env)) return json({ error: 'Unauthorized' }, 401);
-      return handleTestCron(request, env);
-    }
-
-    return new Response('Not found', { status: 404 });
   },
 
   // Cron trigger: check weather for all registered devices
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    const coverage = await readCoverage(env);
-    if (coverage.truncated) {
-      console.error(
-        `[Cron] Stopped reading device records at MAX_DEVICE_RECORDS=${MAX_DEVICE_RECORDS}; ` +
-          `KV holds more than the registration caps allow, so this tick sees only part of the fleet.`
-      );
-    }
+    const tickStartMs = Date.now();
+    logInfo('cron.start', {
+      scheduledTime:
+        typeof _event?.scheduledTime === 'number' && Number.isFinite(_event.scheduledTime)
+          ? new Date(_event.scheduledTime).toISOString()
+          : undefined,
+    });
 
-    await migrateLegacyRecords(coverage.legacy, env);
-
-    // Hand the registry what KV actually holds, so its tally cannot drift as
-    // records expire. Skipped after a truncated read: a partial picture must
-    // never be written back as the truth.
-    if (!coverage.truncated) await reconcileCoverage(coverage.grids, env);
-
-    // One WeatherKit fetch per cell, all inside this one invocation: without a
-    // ceiling here, enough registrations exhaust the Free plan's external
-    // subrequest budget and take the whole tick down.
-    const { cells: grids, skipped } = selectCellsWithinCap(coverage.grids);
-    if (skipped > 0) {
-      console.error(
-        `[Cron] Grid-cell cap hit: serving the ${grids.length} oldest of ${coverage.grids.length} cells, ` +
-          `skipping ${skipped}. Cap is MAX_GRID_CELLS=${MAX_GRID_CELLS}; raising it needs the ` +
-          `subrequest arithmetic in abuse.ts re-run and the Workers Paid plan.`
-      );
-    }
-    console.log(`[Cron] Processing ${grids.length} grid cells`);
-
-    // Every push below is an external subrequest out of the same 50 the
-    // WeatherKit fetches come from. The budget makes exhaustion deterministic —
-    // selectCellsWithinCap has ordered both the cells and the devices inside
-    // them oldest-first, and this loop is sequential, so the users who were here
-    // longest are the ones served — instead of letting the runtime throw "Too
-    // many subrequests" into a catch that swallows it.
+    let cellsTotal = 0;
+    let cellsProcessed = 0;
+    let cellsSkipped = 0;
+    let weatherkitOk = 0;
+    let weatherkitErr = 0;
+    let weatherkitTimeout = 0;
+    let apnsSent = 0;
+    let apnsFailed = 0;
+    let apns410Reaped = 0;
+    let activitySent = 0;
+    let activityFailed = 0;
+    let queuedReapsDrained = 0;
+    let coverageTruncated = false;
+    let allGrids: GridCell[] = [];
+    const reapedTokens = new Set<string>();
     const budget = createPushBudget();
-    const reaps = createReapBudget();
 
-    // Tokens APNs has already rejected, waiting on the reap budget. Draining
-    // them here rather than only when a push happens to fail is what makes the
-    // queue finite: the push loop below skips whatever is still flagged, so a
-    // flagged device never fails another push and would otherwise sit in KV
-    // holding a cell slot until its 14-day TTL ran out.
-    //
-    // Draining first also fixes the precedence. notifyOnce writes its dedup key
-    // only after the push resolves, so a throwing push leaves nothing behind and
-    // is retried next tick; devices are walked oldest-first and a long-
-    // uninstalled device has the oldest registeredAt; so an unguarded backlog
-    // spends the push budget on the dead before the living, every tick until it
-    // clears. Cleanup must never outrank an alert.
-    //
-    // readPendingReaps fails open to an empty set, so a registry blip costs some
-    // wasted pushes rather than the whole tick.
-    // The set stays whole after draining, because it is also the skip list: this
-    // tick's readCoverage snapshot was taken before the deletes below, so a
-    // device reaped here is still in `grid.devices` and pushing to it would be
-    // pure waste.
-    const pendingReaps = await readPendingReaps(env);
-    let queuedReaps = pendingReaps.size;
-    for (const deviceToken of pendingReaps) {
-      if (!reaps.spend()) break;
-      try {
-        await removeDevice(deviceToken, env);
-        queuedReaps -= 1;
-      } catch (err) {
-        console.error(`[Cron] Could not reap queued device: ${err}`);
-      }
-    }
-    if (queuedReaps > 0) {
-      console.error(
-        `[Cron] ${queuedReaps} rejected device tokens still queued for deletion; the cap is ` +
-          `MAX_DEVICE_REAPS_PER_TICK=${MAX_DEVICE_REAPS_PER_TICK}, sized from the Free plan's ` +
-          `daily KV delete allowance in abuse.ts. They are skipped this tick and retried next.`
-      );
-    }
-
-    // Live Activity updates are the optional half of a tick and must never be
-    // able to take the mandatory half down with them — the same invariant the
-    // per-push catches below state. Unguarded, a `list` that throws here aborts
-    // scheduled() before a single rain alert goes out, which is the product's
-    // entire purpose. Degrade to "no Live Activity updates this tick" instead:
-    // the next tick retries, and the card keeps refreshing on-device meanwhile.
-    let activityTokens = new Map<string, string>();
     try {
-      activityTokens = await readActivityTokens(env);
-    } catch (err) {
-      console.error(
-        `[Cron] Could not read Live Activity tokens: ${err}. Rain alerts still go out this ` +
-          `tick; no Live Activity is updated.`
-      );
-    }
+      const coverage = await readCoverage(env);
+      allGrids = coverage.grids;
+      cellsTotal = coverage.grids.length;
+      coverageTruncated = coverage.truncated;
+      if (coverage.truncated) {
+        logError('cron.coverage_truncated', {
+          maxDeviceRecords: MAX_DEVICE_RECORDS,
+          cellsTotal,
+          reason: 'max_device_records_reached',
+        });
+      }
 
-    const processGrid = async (grid: GridCell) => {
-      const { lat, lon } = gridCenter(grid.gridKey);
+      await migrateLegacyRecords(coverage.legacy, env);
+
+      // Hand the registry what KV actually holds, so its tally cannot drift as
+      // records expire. Skipped after a truncated read: a partial picture must
+      // never be written back as the truth.
+      if (!coverage.truncated) await reconcileCoverage(coverage.grids, env);
+
+      // One WeatherKit fetch per cell, all inside this one invocation: without a
+      // ceiling here, enough registrations exhaust the Free plan's external
+      // subrequest budget and take the whole tick down.
+      const { cells: grids, skipped } = selectCellsWithinCap(coverage.grids);
+      cellsSkipped = skipped;
+      if (skipped > 0) {
+        logError('cron.cell_cap_hit', {
+          serving: grids.length,
+          cellsTotal: coverage.grids.length,
+          skipped,
+          maxGridCells: MAX_GRID_CELLS,
+        });
+      }
+
+      // Every push below is an external subrequest out of the same 50 the
+      // WeatherKit fetches come from. The budget makes exhaustion deterministic —
+      // selectCellsWithinCap has ordered both the cells and the devices inside
+      // them oldest-first, and this loop is sequential, so the users who were here
+      // longest are the ones served — instead of letting the runtime throw "Too
+      // many subrequests" into a catch that swallows it.
+      const reaps = createReapBudget();
+
+      // Tokens APNs has already rejected, waiting on the reap budget. Draining
+      // them here rather than only when a push happens to fail is what makes the
+      // queue finite: the push loop below skips whatever is still flagged, so a
+      // flagged device never fails another push and would otherwise sit in KV
+      // holding a cell slot until its 14-day TTL ran out.
+      //
+      // Draining first also fixes the precedence. notifyOnce writes its dedup key
+      // only after the push resolves, so a throwing push leaves nothing behind and
+      // is retried next tick; devices are walked oldest-first and a long-
+      // uninstalled device has the oldest registeredAt; so an unguarded backlog
+      // spends the push budget on the dead before the living, every tick until it
+      // clears. Cleanup must never outrank an alert.
+      //
+      // readPendingReaps fails open to an empty set, so a registry blip costs some
+      // wasted pushes rather than the whole tick.
+      // The set stays whole after draining, because it is also the skip list: this
+      // tick's readCoverage snapshot was taken before the deletes below, so a
+      // device reaped here is still in `grid.devices` and pushing to it would be
+      // pure waste.
+      const pendingReaps = await readPendingReaps(env);
+      let queuedReaps = pendingReaps.size;
+      for (const deviceToken of pendingReaps) {
+        if (!reaps.spend()) break;
+        try {
+          await removeDevice(deviceToken, env);
+          queuedReaps -= 1;
+          queuedReapsDrained += 1;
+          reapedTokens.add(deviceToken);
+        } catch (err) {
+          logError('cron.reap_failed', {
+            reason: 'queued_reap_failed',
+            error: formatError(err),
+          });
+        }
+      }
+      if (queuedReaps > 0) {
+        logError('cron.reap_backlog', {
+          count: queuedReaps,
+          maxDeviceReapsPerTick: MAX_DEVICE_REAPS_PER_TICK,
+        });
+      }
+
+      // Live Activity updates are the optional half of a tick and must never be
+      // able to take the mandatory half down with them — the same invariant the
+      // per-push catches below state. Unguarded, a `list` that throws here aborts
+      // scheduled() before a single rain alert goes out, which is the product's
+      // entire purpose. Degrade to "no Live Activity updates this tick" instead:
+      // the next tick retries, and the card keeps refreshing on-device meanwhile.
+      let activityTokens = new Map<string, string>();
       try {
-        const forecast = await fetchForecast(lat, lon, env);
-        const now = Date.now();
-        // Minute data where WeatherKit has it, the hourly forecast where it does
-        // not — without the fallback every device outside minute coverage was
-        // silently unalertable.
-        const minutes = nextHourMinutes(forecast, now);
-        if (!minutes || minutes.length === 0) return;
+        activityTokens = await readActivityTokens(env);
+      } catch (err) {
+        logError('cron.activity_tokens_unavailable', {
+          reason: 'activity_list_failed',
+          error: formatError(err),
+        });
+      }
 
-        const rainingNow = isWet(minutes[0]);
+      const processGrid = async (grid: GridCell) => {
+        const { lat, lon } = gridCenter(grid.gridKey);
+        let forecast: WeatherKitForecast;
+        try {
+          forecast = await fetchForecast(lat, lon, env, grid.gridKey);
+          weatherkitOk += 1;
+        } catch (err) {
+          weatherkitErr += 1;
+          if (isTimeoutError(err)) weatherkitTimeout += 1;
+          return;
+        }
 
-        // Rain START: first wet minute ahead — only relevant if it isn't already raining.
-        const rainStart = rainingNow ? undefined : minutes.find(isWet);
-        // Rain END: if it's raining now, the first upcoming dry minute (rain tapering off).
-        const rainEnd = rainingNow ? minutes.find((m) => !isWet(m)) : undefined;
-        // Rain RESUMING: the break rainEnd opens begins before the next tick, and
-        // more rain follows it inside the hour — the server's half of the app's
-        // "More rain coming" alert. It is announced as the break opens because
-        // the next tick's start alert is exactly what the 30-minute floor
-        // swallows after a short shower.
-        const afterBreak = rainEnd ? minutes.slice(minutes.indexOf(rainEnd)).find(isWet) : undefined;
-        const rainResume =
-          rainEnd &&
-          afterBreak &&
-          Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000) <= CRON_PERIOD_MINUTES &&
-          new Date(afterBreak.startTime).getTime() > now
-            ? afterBreak
+        try {
+          const now = Date.now();
+          // Minute data where WeatherKit has it, the hourly forecast where it does
+          // not — without the fallback every device outside minute coverage was
+          // silently unalertable.
+          const minutes = nextHourMinutes(forecast, now);
+          if (!minutes || minutes.length === 0) return;
+
+          const rainingNow = isWet(minutes[0]);
+
+          // Rain START: first wet minute ahead — only relevant if it isn't already raining.
+          const rainStart = rainingNow ? undefined : minutes.find(isWet);
+          // Rain END: if it's raining now, the first upcoming dry minute (rain tapering off).
+          const rainEnd = rainingNow ? minutes.find((m) => !isWet(m)) : undefined;
+          // Rain RESUMING: the break rainEnd opens begins before the next tick, and
+          // more rain follows it inside the hour — the server's half of the app's
+          // "More rain coming" alert. It is announced as the break opens because
+          // the next tick's start alert is exactly what the 30-minute floor
+          // swallows after a short shower.
+          const afterBreak = rainEnd ? minutes.slice(minutes.indexOf(rainEnd)).find(isWet) : undefined;
+          const rainResume =
+            rainEnd &&
+            afterBreak &&
+            Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000) <= CRON_PERIOD_MINUTES &&
+            new Date(afterBreak.startTime).getTime() > now
+              ? afterBreak
+              : undefined;
+
+          // Nothing to say only when it is dry now and stays dry. Steady rain —
+          // wet now with no dry minute anywhere in the series, so neither
+          // rainStart nor rainEnd exists — sends no alert, but a running Live
+          // Activity still needs its refresh: returning here left the card
+          // frozen on whatever the last push said for as long as the rain held.
+          if (!rainingNow && !rainStart) return;
+          const minutesUntilEnd = rainEnd
+            ? Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000)
             : undefined;
 
-        // Nothing to say only when it is dry now and stays dry. Steady rain —
-        // wet now with no dry minute anywhere in the series, so neither
-        // rainStart nor rainEnd exists — sends no alert, but a running Live
-        // Activity still needs its refresh: returning here left the card
-        // frozen on whatever the last push said for as long as the rain held.
-        if (!rainingNow && !rainStart) return;
-        const minutesUntilEnd = rainEnd
-          ? Math.round((new Date(rainEnd.startTime).getTime() - now) / 60000)
-          : undefined;
+          const precip = precipFromForecast(forecast, rainStart?.startTime);
+          const copy = copyFor(precip);
+          // Logged so the summary schema can be checked against real responses
+          // rather than trusted from Apple's docs — a wintry value has never yet
+          // been seen in the wild (spec, "Server changes are load-bearing").
+          logInfo('cron.grid_precip', {
+            gridKey: grid.gridKey,
+            precip,
+            summary: forecast.forecastHourly?.summary?.map((s) => s.condition) ?? null,
+          });
 
-        const precip = precipFromForecast(forecast, rainStart?.startTime);
-        const copy = copyFor(precip);
-        // Logged so the summary schema can be checked against real responses
-        // rather than trusted from Apple's docs — a wintry value has never yet
-        // been seen in the wild (spec, "Server changes are load-bearing").
-        console.log(
-          `[Cron] Grid ${grid.gridKey} precip=${precip} summary=` +
-            JSON.stringify(forecast.forecastHourly?.summary?.map((s) => s.condition) ?? null)
-        );
-
-        // At most one push per device per event type, deduped via KV. Both kinds
-        // are floored at ALERT_FLOOR_MINUTES since the last one sent. A rain
-        // start carries a second test past that floor: the record names the
-        // onset it announced, so the shower a long lead time watches approach
-        // for the best part of an hour stays one event, while a genuinely
-        // different shower still earns its own alert — the client keys on the
-        // onset the same way (`isSameEvent`, NotificationService.swift).
-        //
-        // A record with no onset in it was written before that keying and stands
-        // for whatever rain the device was last told about, so it goes on
-        // suppressing until it expires rather than repeating an alert on deploy.
-        //
-        // A resume shares the start record, so whichever announces an onset
-        // first, the other stays silent for it. The one difference: to a resume,
-        // a record a start alert wrote whose onset has already begun is spent —
-        // that is the rain now breaking, and the rain after the break is a
-        // different event however soon after the last alert it comes. A record
-        // a resume wrote is never spent, so in flickering rain one resume holds
-        // the next ones to the floor. The record names its kind for that.
-        const notifyOnce = async (
-          device: DeviceRegistration,
-          kind: 'start' | 'resume' | 'end',
-          onsetTime: string | undefined,
-          send: () => Promise<void>
-        ) => {
-          const onsetMinute =
-            onsetTime === undefined ? undefined : Math.round(new Date(onsetTime).getTime() / 60_000);
-          const metaKey = `notified-${kind === 'end' ? 'end' : 'start'}:${device.token}`;
-          const recorded = await env.DEVICES.get(metaKey);
-          if (recorded !== null) {
-            const [notifiedAt, notifiedOnset, notifiedKind] = recorded.split(':');
-            const spent =
-              kind === 'resume' &&
-              notifiedKind !== 'resume' &&
-              notifiedOnset !== undefined &&
-              parseInt(notifiedOnset) * 60_000 <= now;
-            if (!spent) {
-              if (now - parseInt(notifiedAt) <= ALERT_FLOOR_MINUTES * 60 * 1000) return;
-              if (
-                onsetMinute !== undefined &&
-                (notifiedOnset === undefined ||
-                  Math.abs(parseInt(notifiedOnset) - onsetMinute) <= SAME_ONSET_DRIFT_MINUTES)
-              ) {
-                return;
+          // At most one push per device per event type, deduped via KV. Both kinds
+          // are floored at ALERT_FLOOR_MINUTES since the last one sent. A rain
+          // start carries a second test past that floor: the record names the
+          // onset it announced, so the shower a long lead time watches approach
+          // for the best part of an hour stays one event, while a genuinely
+          // different shower still earns its own alert — the client keys on the
+          // onset the same way (`isSameEvent`, NotificationService.swift).
+          //
+          // A record with no onset in it was written before that keying and stands
+          // for whatever rain the device was last told about, so it goes on
+          // suppressing until it expires rather than repeating an alert on deploy.
+          //
+          // A resume shares the start record, so whichever announces an onset
+          // first, the other stays silent for it. The one difference: to a resume,
+          // a record a start alert wrote whose onset has already begun is spent —
+          // that is the rain now breaking, and the rain after the break is a
+          // different event however soon after the last alert it comes. A record
+          // a resume wrote is never spent, so in flickering rain one resume holds
+          // the next ones to the floor. The record names its kind for that.
+          const notifyOnce = async (
+            device: DeviceRegistration,
+            kind: 'start' | 'resume' | 'end',
+            onsetTime: string | undefined,
+            send: () => Promise<void>
+          ): Promise<boolean> => {
+            const onsetMinute =
+              onsetTime === undefined ? undefined : Math.round(new Date(onsetTime).getTime() / 60_000);
+            const keyPrefix = kind === 'end' ? 'notified-end' : 'notified-start';
+            const metaKey = `${keyPrefix}:${device.token}`;
+            let recorded: string | null;
+            try {
+              recorded = await env.DEVICES.get(metaKey);
+            } catch (err) {
+              logError('kv.error', {
+                op: 'get',
+                keyPrefix,
+                gridKey: grid.gridKey,
+                error: formatError(err),
+              });
+              throw err;
+            }
+            if (recorded !== null) {
+              const [notifiedAt, notifiedOnset, notifiedKind] = recorded.split(':');
+              const spent =
+                kind === 'resume' &&
+                notifiedKind !== 'resume' &&
+                notifiedOnset !== undefined &&
+                parseInt(notifiedOnset) * 60_000 <= now;
+              if (!spent) {
+                if (now - parseInt(notifiedAt) <= ALERT_FLOOR_MINUTES * 60 * 1000) return false;
+                if (
+                  onsetMinute !== undefined &&
+                  (notifiedOnset === undefined ||
+                    Math.abs(parseInt(notifiedOnset) - onsetMinute) <= SAME_ONSET_DRIFT_MINUTES)
+                ) {
+                  return false;
+                }
               }
             }
-          }
-          // Claimed after the dedup check, so a push we were never going to
-          // send does not spend budget a later device could have used.
-          if (!budget.spend()) return;
-          try {
-            await send();
+            // Claimed after the dedup check, so a push we were never going to
+            // send does not spend budget a later device could have used.
+            if (!budget.spend()) return false;
+            try {
+              await send();
+              apnsSent += 1;
+            } catch (err) {
+              apnsFailed += 1;
+              logError('cron.alert_failed', {
+                gridKey: grid.gridKey,
+                kind,
+                status: err instanceof APNsError ? err.status : undefined,
+                reason: err instanceof APNsError ? err.reason : undefined,
+                timeout: isTimeoutError(err),
+                error: formatError(err),
+              });
+              const failure = await recordPushFailure(device.token, err, env, reaps);
+              if (failure.reaped) reapedTokens.add(device.token);
+              if (failure.reaped410) apns410Reaped += 1;
+              return false;
+            }
+
             // The record has to outlive the span it suppresses. A resume can
             // announce rain further out than the lead time, so its span runs
             // to its own onset.
@@ -522,211 +664,304 @@ export default {
               kind === 'resume' && onsetMinute !== undefined
                 ? onsetMinute - Math.floor(now / 60_000)
                 : device.leadTimeMinutes;
-            await env.DEVICES.put(
-              metaKey,
-              onsetMinute === undefined ? now.toString() : `${now}:${onsetMinute}:${kind}`,
-              {
-                expirationTtl:
-                  onsetMinute === undefined
-                    ? 3600
-                    : Math.max(3600, (spanMinutes + SAME_ONSET_DRIFT_MINUTES) * 60),
-              }
-            );
-          } catch (err) {
-            console.error(`[Cron] Failed to notify device (${kind}): ${err}`);
-            await recordPushFailure(device.token, err, env, reaps);
-          }
-        };
+            try {
+              await env.DEVICES.put(
+                metaKey,
+                onsetMinute === undefined ? now.toString() : `${now}:${onsetMinute}:${kind}`,
+                {
+                  expirationTtl:
+                    onsetMinute === undefined
+                      ? 3600
+                      : Math.max(3600, (spanMinutes + SAME_ONSET_DRIFT_MINUTES) * 60),
+                }
+              );
+            } catch (err) {
+              logError('kv.error', {
+                op: 'put',
+                keyPrefix,
+                gridKey: grid.gridKey,
+                reason: 'dedup_write_failed',
+                error: formatError(err),
+              });
+            }
+            return true;
+          };
 
-        for (const device of grid.devices) {
-          if (pendingReaps.has(device.token)) continue;
-          const activityToken = activityTokens.get(device.token);
-          const alertsQuiet = isInQuietHours(device, new Date(now));
-          if (rainStart && device.rainStartEnabled !== false) {
-            const minutesUntilRain = Math.round((new Date(rainStart.startTime).getTime() - now) / 60000);
-            // Widened by one cron period: at a 10-minute lead time the alert window
-            // equalled the tick period exactly, so a tick could see rain at 10.6m
-            // (rounds to 11, no alert) and the next tick fire with under a minute to
-            // spare — any cron delay turned that into a miss. Firing slightly early
-            // is the safe direction for a rain warning.
-            // The START_SLACK_MINUTES slack stays: `rainStart` can be a minute
-            // already in the past, so a negative `minutesUntilRain` is reachable
-            // here, not dead — see "still fire when the feed says the rain began a
-            // few minutes ago" in cron-alerts.test.ts.
-            if (
-              minutesUntilRain <= device.leadTimeMinutes + CRON_PERIOD_MINUTES &&
-              minutesUntilRain >= -START_SLACK_MINUTES
-            ) {
-              if (!alertsQuiet) {
-                await notifyOnce(device, 'start', rainStart.startTime, () =>
-                  sendRainAlert(
-                    device.token,
-                    minutesUntilRain,
-                    env,
-                    intensityFromMmPerHr(rainStart.precipitationIntensity)
-                  )
+          for (const device of grid.devices) {
+            if (pendingReaps.has(device.token)) continue;
+            const activityToken = activityTokens.get(device.token);
+            const alertsQuiet = isInQuietHours(device, new Date(now));
+            if (rainStart && device.rainStartEnabled !== false) {
+              const minutesUntilRain = Math.round((new Date(rainStart.startTime).getTime() - now) / 60000);
+              // Widened by one cron period: at a 10-minute lead time the alert window
+              // equalled the tick period exactly, so a tick could see rain at 10.6m
+              // (rounds to 11, no alert) and the next tick fire with under a minute to
+              // spare — any cron delay turned that into a miss. Firing slightly early
+              // is the safe direction for a rain warning.
+              // The START_SLACK_MINUTES slack stays: `rainStart` can be a minute
+              // already in the past, so a negative `minutesUntilRain` is reachable
+              // here, not dead — see "still fire when the feed says the rain began a
+              // few minutes ago" in cron-alerts.test.ts.
+              if (
+                minutesUntilRain <= device.leadTimeMinutes + CRON_PERIOD_MINUTES &&
+                minutesUntilRain >= -START_SLACK_MINUTES
+              ) {
+                if (!alertsQuiet) {
+                  const sent = await notifyOnce(device, 'start', rainStart.startTime, () =>
+                    sendRainAlert(
+                      device.token,
+                      minutesUntilRain,
+                      env,
+                      intensityFromMmPerHr(rainStart.precipitationIntensity)
+                    )
+                  );
+                  if (sent) {
+                    logInfo('cron.alert_sent', {
+                      gridKey: grid.gridKey,
+                      kind: 'start',
+                      minutesUntil: minutesUntilRain,
+                      precip,
+                    });
+                  }
+                }
+
+                // Live Activity: rain incoming (State A). Only relevant within the same
+                // lead-time window as the alert above; a push failure here must never
+                // break the alert-push loop.
+                if (activityToken && budget.spend()) {
+                  try {
+                    const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
+                    const contentState: LiveActivityContentState = {
+                      statusText: copy.incoming,
+                      countdownTarget: encodeActivityDate(new Date(now + minutesUntilRain * 60000)),
+                      heroText: null,
+                      subBold: copy.expected,
+                      subRest: ' · next hour',
+                      boldFirst: true,
+                      rightText: '',
+                      segments,
+                      windowMinutes: ACTIVITY_WINDOW_MINUTES,
+                      midLabel: '+45 min',
+                      endLabel: '+90 min',
+                      // No flag from the server: DeviceRegistration has no timezone, so a
+                      // clock time would render in UTC. The app's own refreshes set it.
+                      flagText: null,
+                      flagPosition: null,
+                      precip,
+                    };
+                    // The rain-start transition: the card is about rain on its way.
+                    await sendLiveActivityUpdate(activityToken, contentState, env, {
+                      event: 'update',
+                      priority: LIVE_ACTIVITY_PRIORITY.transition,
+                    });
+                    activitySent += 1;
+                    logInfo('activity.sent', {
+                      gridKey: grid.gridKey,
+                      kind: 'rain_start',
+                      activityEvent: 'update',
+                      priority: LIVE_ACTIVITY_PRIORITY.transition,
+                      precip,
+                    });
+                  } catch (err) {
+                    activityFailed += 1;
+                    logError('activity.failed', {
+                      gridKey: grid.gridKey,
+                      kind: 'rain_start',
+                      status: err instanceof APNsError ? err.status : undefined,
+                      reason: err instanceof APNsError ? err.reason : undefined,
+                      timeout: isTimeoutError(err),
+                      error: formatError(err),
+                    });
+                    await discardDeadActivityToken(device.token, err, env);
+                  }
+                }
+              }
+            }
+            // A resume is a start-kind alert, so it follows the rain-start opt-out.
+            const resume = device.rainStartEnabled !== false ? rainResume : undefined;
+            if (resume && !alertsQuiet) {
+              const minutesUntilResume = Math.round((new Date(resume.startTime).getTime() - now) / 60000);
+              const sent = await notifyOnce(device, 'resume', resume.startTime, () =>
+                sendRainResumeAlert(device.token, minutesUntilResume, env)
+              );
+              if (sent) {
+                logInfo('cron.alert_sent', {
+                  gridKey: grid.gridKey,
+                  kind: 'resume',
+                  minutesUntil: minutesUntilResume,
+                  precip,
+                });
+              }
+            }
+            if (minutesUntilEnd !== undefined && device.rainEndEnabled !== false) {
+              // The resume above speaks for this break. Saying "Rain ending soon"
+              // as well would read as the end of it, and a second `notified-*`
+              // read would break the one-per-device count in abuse.ts.
+              if (!resume && !alertsQuiet && minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
+                const sent = await notifyOnce(device, 'end', undefined, () =>
+                  sendRainEndAlert(device.token, env, minutesUntilEnd)
                 );
-                console.log(`[Cron] Rain-start grid ${grid.gridKey}, in ${minutesUntilRain}m`);
+                if (sent) {
+                  logInfo('cron.alert_sent', {
+                    gridKey: grid.gridKey,
+                    kind: 'end',
+                    minutesUntil: minutesUntilEnd,
+                    precip,
+                  });
+                }
               }
+            }
 
-              // Live Activity: rain incoming (State A). Only relevant within the same
-              // lead-time window as the alert above; a push failure here must never
-              // break the alert-push loop.
-              if (activityToken && budget.spend()) {
-                try {
+            // Live Activity while it is raining (State B), every tick, independent
+            // of the alert's 30-min/dedup gate above and of the notification
+            // toggles: the card is something the user started and is looking at,
+            // and rainEndEnabled says only whether they want an alert. Gating the
+            // card on it left a user who had switched that alert off with a card
+            // frozen on its last push until it went stale. Three shapes:
+            //   - a dry minute ahead: the countdown to it (keepalive);
+            //   - no dry minute in the whole series (steady rain): the same state
+            //     with no countdown, refreshed so it never goes stale (keepalive);
+            //   - the dry minute has arrived: the terminal state, ending the
+            //     activity and dropping its token (transition).
+            // A push failure here must never break the alert loop.
+            if (rainingNow && activityToken && budget.spend()) {
+              try {
+                if (minutesUntilEnd === undefined || minutesUntilEnd > 0) {
                   const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
+                  const contentState: LiveActivityContentState =
+                    minutesUntilEnd === undefined
+                      ? {
+                          statusText: copy.fallingNow,
+                          countdownTarget: null,
+                          heroText: copy.fallingHero,
+                          subBold: 'no break in the next hour',
+                          subRest: copy.fallingVerb,
+                          boldFirst: false,
+                          rightText: '',
+                          segments,
+                          windowMinutes: ACTIVITY_WINDOW_MINUTES,
+                          midLabel: '+45 min',
+                          endLabel: '+90 min',
+                          flagText: null,
+                          flagPosition: null,
+                          precip,
+                        }
+                      : {
+                          statusText: copy.fallingNow,
+                          countdownTarget: encodeActivityDate(new Date(now + minutesUntilEnd * 60000)),
+                          heroText: null,
+                          subBold: `stops in about ${minutesUntilEnd} min`,
+                          subRest: copy.fallingVerb,
+                          boldFirst: false,
+                          rightText: '',
+                          segments,
+                          windowMinutes: ACTIVITY_WINDOW_MINUTES,
+                          midLabel: '+45 min',
+                          endLabel: '+90 min',
+                          flagText: null,
+                          flagPosition: null,
+                          precip,
+                        };
+                  await sendLiveActivityUpdate(activityToken, contentState, env, {
+                    event: 'update',
+                    priority: LIVE_ACTIVITY_PRIORITY.keepalive,
+                  });
+                  activitySent += 1;
+                  logInfo('activity.sent', {
+                    gridKey: grid.gridKey,
+                    kind: minutesUntilEnd === undefined ? 'steady_rain' : 'raining_now',
+                    activityEvent: 'update',
+                    priority: LIVE_ACTIVITY_PRIORITY.keepalive,
+                    precip,
+                    minutesUntilEnd,
+                  });
+                } else {
                   const contentState: LiveActivityContentState = {
-                    statusText: copy.incoming,
-                    countdownTarget: encodeActivityDate(new Date(now + minutesUntilRain * 60000)),
-                    heroText: null,
-                    subBold: copy.expected,
-                    subRest: ' · next hour',
+                    statusText: copy.ended,
+                    countdownTarget: null,
+                    heroText: 'Clear',
+                    subBold: copy.hasStopped,
+                    subRest: '',
                     boldFirst: true,
                     rightText: '',
-                    segments,
+                    segments: [],
                     windowMinutes: ACTIVITY_WINDOW_MINUTES,
                     midLabel: '+45 min',
                     endLabel: '+90 min',
-                    // No flag from the server: DeviceRegistration has no timezone, so a
-                    // clock time would render in UTC. The app's own refreshes set it.
                     flagText: null,
                     flagPosition: null,
                     precip,
                   };
-                  // The rain-start transition: the card is about rain on its way.
                   await sendLiveActivityUpdate(activityToken, contentState, env, {
-                    event: 'update',
+                    event: 'end',
                     priority: LIVE_ACTIVITY_PRIORITY.transition,
                   });
-                  console.log(`[Activity] Sent rain-start update, grid ${grid.gridKey}`);
-                } catch (err) {
-                  console.error(`[Activity] push failed: ${err}`);
-                  await discardDeadActivityToken(device.token, err, env);
+                  await clearActivityToken(device.token, env);
+                  activitySent += 1;
+                  logInfo('activity.sent', {
+                    gridKey: grid.gridKey,
+                    kind: 'rain_end',
+                    activityEvent: 'end',
+                    priority: LIVE_ACTIVITY_PRIORITY.transition,
+                    precip,
+                  });
                 }
+              } catch (err) {
+                activityFailed += 1;
+                logError('activity.failed', {
+                  gridKey: grid.gridKey,
+                  kind: 'raining_now',
+                  status: err instanceof APNsError ? err.status : undefined,
+                  reason: err instanceof APNsError ? err.reason : undefined,
+                  timeout: isTimeoutError(err),
+                  error: formatError(err),
+                });
+                await discardDeadActivityToken(device.token, err, env);
               }
             }
           }
-          // A resume is a start-kind alert, so it follows the rain-start opt-out.
-          const resume = device.rainStartEnabled !== false ? rainResume : undefined;
-          if (resume && !alertsQuiet) {
-            const minutesUntilResume = Math.round((new Date(resume.startTime).getTime() - now) / 60000);
-            await notifyOnce(device, 'resume', resume.startTime, () =>
-              sendRainResumeAlert(device.token, minutesUntilResume, env)
-            );
-            console.log(`[Cron] Rain-resume grid ${grid.gridKey}, in ${minutesUntilResume}m`);
-          }
-          if (minutesUntilEnd !== undefined && device.rainEndEnabled !== false) {
-            // The resume above speaks for this break. Saying "Rain ending soon"
-            // as well would read as the end of it, and a second `notified-*`
-            // read would break the one-per-device count in abuse.ts.
-            if (!resume && !alertsQuiet && minutesUntilEnd <= 30 && minutesUntilEnd >= -5) {
-              await notifyOnce(device, 'end', undefined, () =>
-                sendRainEndAlert(device.token, env, minutesUntilEnd)
-              );
-              console.log(`[Cron] Rain-end grid ${grid.gridKey}, in ${minutesUntilEnd}m`);
-            }
-          }
-
-          // Live Activity while it is raining (State B), every tick, independent
-          // of the alert's 30-min/dedup gate above and of the notification
-          // toggles: the card is something the user started and is looking at,
-          // and rainEndEnabled says only whether they want an alert. Gating the
-          // card on it left a user who had switched that alert off with a card
-          // frozen on its last push until it went stale. Three shapes:
-          //   - a dry minute ahead: the countdown to it (keepalive);
-          //   - no dry minute in the whole series (steady rain): the same state
-          //     with no countdown, refreshed so it never goes stale (keepalive);
-          //   - the dry minute has arrived: the terminal state, ending the
-          //     activity and dropping its token (transition).
-          // A push failure here must never break the alert loop.
-          if (rainingNow && activityToken && budget.spend()) {
-            try {
-              if (minutesUntilEnd === undefined || minutesUntilEnd > 0) {
-                const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
-                const contentState: LiveActivityContentState =
-                  minutesUntilEnd === undefined
-                    ? {
-                        statusText: copy.fallingNow,
-                        countdownTarget: null,
-                        heroText: copy.fallingHero,
-                        subBold: 'no break in the next hour',
-                        subRest: copy.fallingVerb,
-                        boldFirst: false,
-                        rightText: '',
-                        segments,
-                        windowMinutes: ACTIVITY_WINDOW_MINUTES,
-                        midLabel: '+45 min',
-                        endLabel: '+90 min',
-                        flagText: null,
-                        flagPosition: null,
-                        precip,
-                      }
-                    : {
-                        statusText: copy.fallingNow,
-                        countdownTarget: encodeActivityDate(new Date(now + minutesUntilEnd * 60000)),
-                        heroText: null,
-                        subBold: `stops in about ${minutesUntilEnd} min`,
-                        subRest: copy.fallingVerb,
-                        boldFirst: false,
-                        rightText: '',
-                        segments,
-                        windowMinutes: ACTIVITY_WINDOW_MINUTES,
-                        midLabel: '+45 min',
-                        endLabel: '+90 min',
-                        flagText: null,
-                        flagPosition: null,
-                        precip,
-                      };
-                await sendLiveActivityUpdate(activityToken, contentState, env, {
-                  event: 'update',
-                  priority: LIVE_ACTIVITY_PRIORITY.keepalive,
-                });
-              } else {
-                const contentState: LiveActivityContentState = {
-                  statusText: copy.ended,
-                  countdownTarget: null,
-                  heroText: 'Clear',
-                  subBold: copy.hasStopped,
-                  subRest: '',
-                  boldFirst: true,
-                  rightText: '',
-                  segments: [],
-                  windowMinutes: ACTIVITY_WINDOW_MINUTES,
-                  midLabel: '+45 min',
-                  endLabel: '+90 min',
-                  flagText: null,
-                  flagPosition: null,
-                  precip,
-                };
-                await sendLiveActivityUpdate(activityToken, contentState, env, {
-                  event: 'end',
-                  priority: LIVE_ACTIVITY_PRIORITY.transition,
-                });
-                await clearActivityToken(device.token, env);
-                console.log(`[Activity] Sent rain-end (final) update, grid ${grid.gridKey}`);
-              }
-            } catch (err) {
-              console.error(`[Activity] push failed: ${err}`);
-              await discardDeadActivityToken(device.token, err, env);
-            }
-          }
+        } catch (err) {
+          logError('cron.grid_error', {
+            gridKey: grid.gridKey,
+            error: formatError(err),
+          });
         }
-      } catch (err) {
-        console.error(`[Cron] Failed to fetch weather for grid ${grid.gridKey}: ${err}`);
+      };
+
+      for (const grid of grids) {
+        cellsProcessed += 1;
+        await processGrid(grid);
       }
-    };
 
-    for (const grid of grids) {
-      await processGrid(grid);
-    }
-
-    if (budget.denied > 0) {
-      console.error(
-        `[Cron] Push budget exhausted: sent ${budget.spent} of the ` +
-          `PUSH_BUDGET_PER_INVOCATION=${PUSH_BUDGET_PER_INVOCATION} external pushes this tick and ` +
-          `dropped ${budget.denied}. Those devices were NOT notified. See the subrequest arithmetic ` +
-          `in abuse.ts before raising either the budget or MAX_GRID_CELLS.`
-      );
+      if (budget.denied > 0) {
+        logError('cron.push_budget_exhausted', {
+          sent: budget.spent,
+          limit: PUSH_BUDGET_PER_INVOCATION,
+          dropped: budget.denied,
+        });
+      }
+    } finally {
+      const cellsEmptiedByReap = allGrids.filter(
+        (g) => g.devices.length > 0 && g.devices.every((d) => reapedTokens.has(d.token))
+      ).length;
+      logInfo('cron.summary', {
+        cellsTotal,
+        cellsProcessed,
+        cellsSkipped,
+        evictedCells: cellsSkipped + cellsEmptiedByReap,
+        weatherkitOk,
+        weatherkitErr,
+        weatherkitTimeout,
+        apnsSent,
+        apnsFailed,
+        apns410Reaped,
+        activitySent,
+        activityFailed,
+        pushBudgetDropped: budget.denied,
+        queuedReapsDrained,
+        truncated: coverageTruncated,
+        durationMs: Date.now() - tickStartMs,
+      });
     }
   },
 };
@@ -752,13 +987,19 @@ async function migrateLegacyRecords(legacy: LegacyRecord[], env: Env): Promise<v
       await putDeviceRecordAtKey(record.key, record.device, env);
       migrated += 1;
     } catch (err) {
-      console.warn(`[Cron] Could not add a TTL to a legacy device record: ${err}`);
+      logWarn('kv.error', {
+        op: 'put',
+        keyPrefix: 'device',
+        reason: 'legacy_ttl_migration_failed',
+        error: formatError(err),
+      });
     }
   }
 
-  console.log(
-    `[Cron] Gave ${migrated} pre-TTL device record(s) an expiry; ${legacy.length - batch.length} still to go.`
-  );
+  logInfo('cron.ttl_migration', {
+    count: migrated,
+    remaining: legacy.length - batch.length,
+  });
 }
 
 // Collapse the minute-by-minute forecast into contiguous wet stretches, normalized
@@ -801,7 +1042,10 @@ async function discardDeadActivityToken(deviceToken: string, err: unknown, env: 
   if (!(err instanceof APNsError)) return;
   if (!err.isUnregistered && !err.isBadDeviceToken) return;
   await clearActivityToken(deviceToken, env);
-  console.log(`[Activity] Cleared dead activity token (${err.reason})`);
+  logInfo('activity.token_cleared', {
+    status: err.status,
+    reason: err.reason,
+  });
 }
 
 /** The fields a `/register` body can actually change. */
@@ -973,17 +1217,28 @@ async function putActivityToken(
   env: Env
 ): Promise<void> {
   const key = activityKey(deviceToken);
-  const stored = await env.DEVICES.get(key);
+  let stored: string | null;
+  try {
+    stored = await env.DEVICES.get(key);
+  } catch (err) {
+    logError('kv.error', { op: 'get', keyPrefix: 'activity', error: formatError(err) });
+    throw err;
+  }
   if (stored !== null && storedActivityToken(stored) === activityToken) return;
 
   const record: ActivityRegistration = {
     activityToken,
     activityUpdatedAt: new Date().toISOString(),
   };
-  await env.DEVICES.put(key, JSON.stringify(record), {
-    expirationTtl: ACTIVITY_RECORD_TTL_SECONDS,
-    metadata: { activityToken } satisfies ActivityKeyMetadata,
-  });
+  try {
+    await env.DEVICES.put(key, JSON.stringify(record), {
+      expirationTtl: ACTIVITY_RECORD_TTL_SECONDS,
+      metadata: { activityToken } satisfies ActivityKeyMetadata,
+    });
+  } catch (err) {
+    logError('kv.error', { op: 'put', keyPrefix: 'activity', error: formatError(err) });
+    throw err;
+  }
 }
 
 // A record this Worker cannot parse is treated as absent, so the caller rewrites
@@ -1012,16 +1267,38 @@ function storedActivityToken(raw: string): string | null {
 // Drain the delete allowance and removeDevice throws for the rest of the day,
 // so `/unregister` 500s and the cron cannot reap dead tokens.
 async function clearActivityToken(deviceToken: string, env: Env): Promise<void> {
-  const existing = await env.DEVICES.get(activityKey(deviceToken));
+  const key = activityKey(deviceToken);
+  let existing: string | null;
+  try {
+    existing = await env.DEVICES.get(key);
+  } catch (err) {
+    logError('kv.error', { op: 'get', keyPrefix: 'activity', error: formatError(err) });
+    throw err;
+  }
   if (existing === null) return;
-  await env.DEVICES.delete(activityKey(deviceToken));
+  try {
+    await env.DEVICES.delete(key);
+  } catch (err) {
+    logError('kv.error', { op: 'delete', keyPrefix: 'activity', error: formatError(err) });
+    throw err;
+  }
 }
 
-async function handleTestRain(request: Request, env: Env): Promise<Response> {
+async function handleTestRain(
+  request: Request,
+  env: Env,
+  reqLog: RequestLogContext
+): Promise<Response> {
   const body = await readJson<{ token?: unknown; minutesUntilRain?: unknown }>(request);
-  if (!body) return json({ error: 'Malformed JSON body' }, 400);
+  if (!body) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'malformed_json';
+    return json({ error: 'Malformed JSON body' }, 400);
+  }
 
   if (!isValidDeviceToken(body.token)) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'invalid_token';
     return json({ error: 'Invalid or missing token' }, 400);
   }
 
@@ -1034,6 +1311,8 @@ async function handleTestRain(request: Request, env: Env): Promise<Response> {
     await sendRainAlert(body.token, minutesUntilRain, env);
     return json({ ok: true, minutesUntilRain });
   } catch (err) {
+    reqLog.code = 'apns_failed';
+    reqLog.reason = formatError(err);
     return json({ error: String(err) }, 500);
   }
 }
@@ -1055,18 +1334,31 @@ async function handleTestRain(request: Request, env: Env): Promise<Response> {
 // Admin-gated, so it sits outside the cron's push budget on purpose: it is one
 // push per operator request, not a fan-out, and it must not be able to starve a
 // tick of budget it never touches.
-async function handleTestActivity(request: Request, env: Env): Promise<Response> {
+async function handleTestActivity(
+  request: Request,
+  env: Env,
+  reqLog: RequestLogContext
+): Promise<Response> {
   const body = await readJson<{
     token?: unknown; precip?: unknown; event?: unknown; minutesUntil?: unknown;
   }>(request);
-  if (!body) return json({ error: 'Malformed JSON body' }, 400);
+  if (!body) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'malformed_json';
+    return json({ error: 'Malformed JSON body' }, 400);
+  }
 
   if (!isValidDeviceToken(body.token)) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'invalid_token';
     return json({ error: 'Invalid or missing token' }, 400);
   }
 
   const registration = await env.DEVICES.get(`device:${body.token}`);
-  if (registration === null) return json({ error: 'Device not registered' }, 404);
+  if (registration === null) {
+    reqLog.code = 'device_not_registered';
+    return json({ error: 'Device not registered' }, 404);
+  }
 
   // The activity token lives under its own `activity:` key (see types.ts for
   // why it is not a field on the device record), and only in a `get`'s body —
@@ -1074,6 +1366,7 @@ async function handleTestActivity(request: Request, env: Env): Promise<Response>
   const stored = await env.DEVICES.get(activityKey(body.token));
   const activityToken = stored === null ? null : storedActivityToken(stored);
   if (!activityToken) {
+    reqLog.code = 'activity_token_missing';
     return json({
       error: 'Device has no activity token — no Live Activity is running, or the '
         + 'app never reported its push token',
@@ -1126,6 +1419,8 @@ async function handleTestActivity(request: Request, env: Env): Promise<Response>
     return json({ ok: true, event, precip: precip ?? null, minutesUntil });
   } catch (err) {
     await discardDeadActivityToken(body.token, err, env);
+    reqLog.code = 'apns_failed';
+    reqLog.reason = formatError(err);
     return json({ error: String(err) }, 500);
   }
 }
@@ -1139,22 +1434,36 @@ async function handleTestActivity(request: Request, env: Env): Promise<Response>
 // the cron's own summary log only fires for a grid that already has a
 // registered device AND active precipitation. backend/test/probe-weatherkit-summary.sh
 // drives it.
-async function handleTestCron(request: Request, env: Env): Promise<Response> {
+async function handleTestCron(
+  request: Request,
+  env: Env,
+  reqLog: RequestLogContext
+): Promise<Response> {
   const body = await readJson<{
     token?: unknown; lat?: unknown; lon?: unknown; dryRun?: unknown;
   }>(request);
-  if (!body) return json({ error: 'Malformed JSON body' }, 400);
+  if (!body) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'malformed_json';
+    return json({ error: 'Malformed JSON body' }, 400);
+  }
 
   if (!isValidDeviceToken(body.token)) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'invalid_token';
     return json({ error: 'Invalid or missing token' }, 400);
   }
   if (!isValidLatitude(body.lat) || !isValidLongitude(body.lon)) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'invalid_coordinates';
     return json({ error: 'Invalid or missing lat/lon' }, 400);
   }
+  const gridKey = toGridKey(body.lat, body.lon);
+  reqLog.gridKey = gridKey;
   const dryRun = body.dryRun === true;
 
   try {
-    const forecast = await fetchForecast(body.lat, body.lon, env);
+    const forecast = await fetchForecast(body.lat, body.lon, env, gridKey);
     const now = Date.now();
     const minutes = nextHourMinutes(forecast, now);
     const rainStart = minutes?.find(isWet);
@@ -1193,11 +1502,17 @@ async function handleTestCron(request: Request, env: Env): Promise<Response> {
       ...diagnostics,
     });
   } catch (err) {
+    reqLog.code = 'test_cron_failed';
+    reqLog.reason = formatError(err);
     return json({ error: String(err) }, 500);
   }
 }
 
-async function handleRegister(request: Request, env: Env): Promise<Response> {
+async function handleRegister(
+  request: Request,
+  env: Env,
+  reqLog: RequestLogContext
+): Promise<Response> {
   const body = await readJson<{
     token?: unknown;
     lat?: unknown;
@@ -1210,12 +1525,20 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     quietHoursEndMinutes?: unknown;
     timeZoneIdentifier?: unknown;
   }>(request);
-  if (!body) return json({ error: 'Malformed JSON body' }, 400);
+  if (!body) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'malformed_json';
+    return json({ error: 'Malformed JSON body' }, 400);
+  }
 
   if (!isValidDeviceToken(body.token)) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'invalid_token';
     return json({ error: 'Invalid or missing token' }, 400);
   }
   if (!isValidLatitude(body.lat) || !isValidLongitude(body.lon)) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'invalid_coordinates';
     return json({ error: 'Invalid or missing lat/lon' }, 400);
   }
   const quietHoursEnabled = asBoolean(body.quietHoursEnabled, false);
@@ -1228,10 +1551,13 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
         !isValidMinuteOfDay(body.quietHoursEndMinutes) ||
         !isValidTimeZoneIdentifier(body.timeZoneIdentifier)))
   ) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'invalid_quiet_hours';
     return json({ error: 'Invalid quiet-hours policy' }, 400);
   }
 
   const gridKey = toGridKey(body.lat, body.lon);
+  reqLog.gridKey = gridKey;
 
   // Read before write. A fresh literal here would erase two things the request
   // does not carry: the Live Activity push token (which the client only ever
@@ -1250,7 +1576,14 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   try {
     existing = (await env.DEVICES.get(`device:${body.token}`, 'json')) as DeviceRegistration | null;
   } catch (err) {
-    console.error(`[Register] Could not read the existing registration: ${err}`);
+    logError('kv.error', {
+      op: 'get',
+      keyPrefix: 'device',
+      gridKey,
+      reason: 'read_existing_registration_failed',
+      error: formatError(err),
+    });
+    reqLog.code = 'storage_unavailable';
     return json(
       {
         error: 'Registration storage is temporarily unavailable. Existing alerts are unaffected; retry shortly.',
@@ -1294,10 +1627,16 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     existing !== null && toGridKey(existing.lat, existing.lon) === gridKey;
   const cell = await reserveGridCell(gridKey, body.token, env, { incumbent });
   if (!cell.ok) {
-    console.error(
-      `[Register] Refused (${cell.code}): ${cell.cells}/${MAX_GRID_CELLS} cells, ` +
-        `${cell.devices}/${MAX_DEVICES_PER_CELL} devices in this cell`
-    );
+    const code = cell.code ?? 'coverage_at_capacity';
+    reqLog.code = code;
+    logError('register.capacity_refused', {
+      code,
+      gridKey,
+      cells: cell.cells,
+      maxGridCells: MAX_GRID_CELLS,
+      devices: cell.devices,
+      maxDevicesPerCell: MAX_DEVICES_PER_CELL,
+    });
     // A device that really was registered gets that registration dropped:
     // leaving it in place would keep pushing rain alerts for wherever the user
     // used to be, which is worse than no alerts at all.
@@ -1315,7 +1654,13 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
       try {
         await removeDevice(body.token, env);
       } catch (err) {
-        console.error(`[Register] Could not clear the stale registration: ${err}`);
+        logError('kv.error', {
+          op: 'delete',
+          keyPrefix: 'device',
+          gridKey,
+          reason: 'clear_stale_on_capacity_refusal',
+          error: formatError(err),
+        });
       }
     }
 
@@ -1329,7 +1674,7 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
           : 'This service is at its coverage limit and cannot take on a new area right now. ' +
             'Any earlier registration for this device has been cleared, so it will not keep ' +
             'sending alerts for a previous location; retry later to set alerts up again.',
-        code: cell.code ?? 'coverage_at_capacity',
+        code,
         maxGridCells: MAX_GRID_CELLS,
         maxDevicesPerCell: MAX_DEVICES_PER_CELL,
       },
@@ -1339,10 +1684,12 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   }
 
   if (cell.evictedTokens && cell.evictedTokens.length > 0) {
-    const evictedLabel = cell.evictedCells?.join(', ') ?? 'unknown';
-    console.log(
-      `[Register] Evicted dormant cell(s) ${evictedLabel} (${cell.evictedTokens.length} stale device(s)) to admit grid ${gridKey}`
-    );
+    reqLog.evictedCells = cell.evictedCells;
+    logInfo('register.evict_dormant', {
+      gridKey,
+      evictedCells: cell.evictedCells ?? [],
+      count: cell.evictedTokens.length,
+    });
     await evictDormantDevicesFromKV(cell.evictedTokens, env);
   }
 
@@ -1374,23 +1721,26 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
           env
         );
       } catch (err) {
-        console.error(`[Register] KV write failed: ${err}`);
+        logError('kv.error', {
+          op: 'put',
+          keyPrefix: 'device',
+          gridKey,
+          reason: 'opt_outs_only_write_failed',
+          error: formatError(err),
+        });
+        reqLog.code = 'kv_write_failed';
         return json({ error: 'KV write failed' }, 500);
       }
     }
     if (decision !== 'write') {
-      console.log(
-        decision === 'unchanged'
-          ? `[Register] Unchanged and still fresh, skipped the write for grid ${gridKey}`
-          : decision === 'opt-outs-only'
-            ? `[Register] Stored the opt-outs for grid ${gridKey}; the rest is cooling down`
-            : `[Register] Same-cell settings change cooling down, kept grid ${gridKey} for now`
-      );
+      reqLog.reason = decision;
       if (decision !== 'unchanged') {
         const retryAfterSeconds =
           decision === 'opt-outs-only'
             ? DEVICE_REWRITE_COOLDOWN_SECONDS
             : rewriteCooldownRemainingSeconds(existing);
+        reqLog.code = 'rewrite_cooldown';
+        reqLog.retryAfterSeconds = retryAfterSeconds;
         return json(
           { ok: false, deferred: true, retryAfterSeconds, gridKey },
           202,
@@ -1416,19 +1766,35 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     // on foreground and after every weather poll, a fabricated one never does
     // (see DEVICE_RECORD_TTL_SECONDS).
     await putDeviceRecord(body.token, registration, env);
-    console.log(`[Register] Stored registration for grid ${gridKey}`);
+    reqLog.reason = existing ? 'updated' : 'created';
   } catch (err) {
-    console.error(`[Register] KV write failed: ${err}`);
+    logError('kv.error', {
+      op: 'put',
+      keyPrefix: 'device',
+      gridKey,
+      error: formatError(err),
+    });
+    reqLog.code = 'kv_write_failed';
     return json({ error: 'KV write failed' }, 500);
   }
 
   return json({ ok: true, gridKey });
 }
 
-async function handleUnregister(request: Request, env: Env): Promise<Response> {
+async function handleUnregister(
+  request: Request,
+  env: Env,
+  reqLog: RequestLogContext
+): Promise<Response> {
   const body = await readJson<{ token?: unknown }>(request);
-  if (!body) return json({ error: 'Malformed JSON body' }, 400);
+  if (!body) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'malformed_json';
+    return json({ error: 'Malformed JSON body' }, 400);
+  }
   if (!isValidDeviceToken(body.token)) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'invalid_token';
     return json({ error: 'Invalid or missing token' }, 400);
   }
 
@@ -1469,11 +1835,27 @@ async function handleUnregister(request: Request, env: Env): Promise<Response> {
 // delete allowance in a single burst. Deletes and the registry call have to be
 // earned by something actually being there.
 async function removeDevice(deviceToken: string, env: Env): Promise<void> {
-  const existing = await env.DEVICES.get(`device:${deviceToken}`);
+  const key = `device:${deviceToken}`;
+  let existing: string | null;
+  try {
+    existing = await env.DEVICES.get(key);
+  } catch (err) {
+    logError('kv.error', { op: 'get', keyPrefix: 'device', error: formatError(err) });
+    throw err;
+  }
   if (existing === null) return;
 
+  const deleteDevice = async () => {
+    try {
+      await env.DEVICES.delete(key);
+    } catch (err) {
+      logError('kv.error', { op: 'delete', keyPrefix: 'device', error: formatError(err) });
+      throw err;
+    }
+  };
+
   await Promise.all([
-    env.DEVICES.delete(`device:${deviceToken}`),
+    deleteDevice(),
     clearActivityToken(deviceToken, env),
     releaseGridCell(deviceToken, env),
   ]);
@@ -1503,7 +1885,12 @@ async function evictDormantDevicesFromKV(deviceTokens: string[], env: Env): Prom
           clearActivityToken(token, env),
         ]);
       } catch (err) {
-        console.error(`[Register] Could not delete evicted dormant device from KV: ${err}`);
+        logError('kv.error', {
+          op: 'delete',
+          keyPrefix: 'device',
+          reason: 'evict_dormant_failed',
+          error: formatError(err),
+        });
       }
     })
   );
@@ -1536,68 +1923,118 @@ async function recordPushFailure(
   err: unknown,
   env: Env,
   reaps: TickBudget
-): Promise<void> {
-  if (!(err instanceof APNsError)) return;
+): Promise<{ reaped: boolean; reaped410: boolean }> {
+  if (!(err instanceof APNsError)) return { reaped: false, reaped410: false };
 
-  const reap = async (why: string): Promise<void> => {
+  const reap = async (reason: string, is410: boolean): Promise<{ reaped: boolean; reaped410: boolean }> => {
     if (!reaps.spend()) {
       await flagPendingReap(deviceToken, env);
-      console.error(
-        `[APNs] Reap budget exhausted (MAX_DEVICE_REAPS_PER_TICK=${MAX_DEVICE_REAPS_PER_TICK}); ` +
-          `deferring ${why} to the next tick. The device is skipped until then.`
-      );
-      return;
+      logError('apns.reap_budget_exhausted', {
+        reason,
+        status: err.status,
+        apnsReason: err.reason,
+        maxDeviceReapsPerTick: MAX_DEVICE_REAPS_PER_TICK,
+      });
+      return { reaped: false, reaped410: false };
     }
     await removeDevice(deviceToken, env);
-    console.log(`[APNs] ${why}`);
+    logInfo('apns.token_reaped', {
+      reason,
+      status: err.status,
+      apnsReason: err.reason,
+    });
+    return { reaped: true, reaped410: is410 };
   };
 
   if (err.isUnregistered) {
-    await reap('Dropped unregistered device token');
-    return;
+    return reap('unregistered', true);
   }
 
-  if (!err.isBadDeviceToken) return;
+  if (!err.isBadDeviceToken) return { reaped: false, reaped410: false };
 
   const key = `apnsfail:${deviceToken}`;
-  const strikes = parseInt((await env.DEVICES.get(key)) ?? '0', 10) + 1;
+  let current = '0';
+  try {
+    current = (await env.DEVICES.get(key)) ?? '0';
+  } catch (kvErr) {
+    logError('kv.error', { op: 'get', keyPrefix: 'apnsfail', error: formatError(kvErr) });
+    throw kvErr;
+  }
+  const strikes = parseInt(current, 10) + 1;
   if (strikes >= BAD_TOKEN_STRIKES) {
-    await reap(`Dropped device after ${strikes} BadDeviceToken rejections`);
+    return reap('bad_device_token_strikes', false);
   } else {
-    await env.DEVICES.put(key, String(strikes), { expirationTtl: 86400 });
-    console.log(`[APNs] BadDeviceToken strike ${strikes}/${BAD_TOKEN_STRIKES}`);
+    try {
+      await env.DEVICES.put(key, String(strikes), { expirationTtl: 86400 });
+    } catch (kvErr) {
+      logError('kv.error', { op: 'put', keyPrefix: 'apnsfail', error: formatError(kvErr) });
+      throw kvErr;
+    }
+    logWarn('apns.bad_token_strike', {
+      strikes,
+      maxStrikes: BAD_TOKEN_STRIKES,
+      status: err.status,
+      apnsReason: err.reason,
+    });
+    return { reaped: false, reaped410: false };
   }
 }
 
-async function handleRegisterActivity(request: Request, env: Env): Promise<Response> {
+async function handleRegisterActivity(
+  request: Request,
+  env: Env,
+  reqLog: RequestLogContext
+): Promise<Response> {
   const body = await readJson<{ token?: unknown; activityToken?: unknown }>(request);
-  if (!body) return json({ error: 'Malformed JSON body' }, 400);
+  if (!body) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'malformed_json';
+    return json({ error: 'Malformed JSON body' }, 400);
+  }
 
   if (!isValidDeviceToken(body.token) || !isValidActivityToken(body.activityToken)) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'invalid_token';
     return json({ error: 'Invalid or missing token or activityToken' }, 400);
   }
 
-  const existing = await env.DEVICES.get(`device:${body.token}`);
+  let existing: string | null;
+  try {
+    existing = await env.DEVICES.get(`device:${body.token}`);
+  } catch (err) {
+    logError('kv.error', { op: 'get', keyPrefix: 'device', error: formatError(err) });
+    throw err;
+  }
   if (existing === null) {
-    console.log(`[Activity] Register failed: no device for token`);
+    reqLog.code = 'device_not_registered';
     return json({ error: 'Device not registered' }, 404);
   }
 
   await putActivityToken(body.token, body.activityToken, env);
-  console.log(`[Activity] Registered activity token for device`);
+  reqLog.reason = 'registered';
 
   return json({ ok: true });
 }
 
-async function handleUnregisterActivity(request: Request, env: Env): Promise<Response> {
+async function handleUnregisterActivity(
+  request: Request,
+  env: Env,
+  reqLog: RequestLogContext
+): Promise<Response> {
   const body = await readJson<{ token?: unknown }>(request);
-  if (!body) return json({ error: 'Malformed JSON body' }, 400);
+  if (!body) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'malformed_json';
+    return json({ error: 'Malformed JSON body' }, 400);
+  }
   if (!isValidDeviceToken(body.token)) {
+    reqLog.code = 'bad_request';
+    reqLog.reason = 'invalid_token';
     return json({ error: 'Invalid or missing token' }, 400);
   }
 
   await clearActivityToken(body.token, env);
-  console.log(`[Activity] Unregistered activity token for device`);
+  reqLog.reason = 'unregistered';
 
   return json({ ok: true });
 }

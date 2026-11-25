@@ -30,3 +30,7 @@ new_sqlite_classes = ["RegistrationLimiter", "CoverageRegistry"]
 
 [observability]
 enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true

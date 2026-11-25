@@ -19,6 +19,7 @@
 
 import { CoverageMap, CoverageReply, RateReply } from './types';
 import { normalizeGridKey } from './grid';
+import { logInfo, logWarn } from './logger';
 
 const COVERAGE_KEY = 'cells';
 const RECENT_KEY = 'recent';
@@ -116,6 +117,13 @@ export class RegistrationLimiter {
           }
         }
         delete live[victim];
+        logWarn('do.eviction', {
+          object: 'RegistrationLimiter',
+          reason: 'max_buckets_per_shard',
+          count: 1,
+          bucketCount: keys.length,
+          maxBuckets: MAX_BUCKETS_PER_SHARD,
+        });
       }
     }
 
@@ -136,18 +144,28 @@ export class RegistrationLimiter {
     const stored = (await this.ctx.storage.get<BucketMap>(BUCKETS_KEY)) ?? {};
     const live: BucketMap = {};
     let latestExpiry = 0;
+    let prunedCount = 0;
     for (const [key, entry] of Object.entries(stored)) {
       if (entry.expiresAt > now) {
         live[key] = entry;
         if (entry.expiresAt > latestExpiry) latestExpiry = entry.expiresAt;
+      } else {
+        prunedCount += 1;
       }
     }
-    if (Object.keys(live).length === 0) {
+    const remainingCount = Object.keys(live).length;
+    if (remainingCount === 0) {
       await this.ctx.storage.deleteAll();
     } else {
       await this.ctx.storage.put<BucketMap>(BUCKETS_KEY, live);
       await this.ctx.storage.setAlarm(latestExpiry + 1000);
     }
+    logInfo('do.alarm', {
+      object: 'RegistrationLimiter',
+      prunedCount,
+      remainingCount,
+      deletedAll: remainingCount === 0,
+    });
   }
 }
 
@@ -437,6 +455,14 @@ export class CoverageRegistry {
           }
           evictedTokens = [...evictedTokenSet];
           changed = true;
+          logInfo('do.eviction', {
+            object: 'CoverageRegistry',
+            reason: 'dormant_cells',
+            gridKey,
+            evictedCells,
+            count: evictedCells.length,
+            evictedDeviceCount: evictedTokens.length,
+          });
         } else {
           if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
           if (deviceToken in activity) {
@@ -480,11 +506,20 @@ export class CoverageRegistry {
     cells: CoverageMap,
     gridKey: string
   ): CoverageReply {
+    const cellCount = Object.keys(cells).length;
+    const deviceCount = cells[gridKey]?.length ?? 0;
+    logWarn('do.capacity_refused', {
+      object: 'CoverageRegistry',
+      code,
+      gridKey,
+      cells: cellCount,
+      devices: deviceCount,
+    });
     return {
       ok: false,
       code,
-      cells: Object.keys(cells).length,
-      devices: cells[gridKey]?.length ?? 0,
+      cells: cellCount,
+      devices: deviceCount,
     };
   }
 

@@ -57,10 +57,10 @@ extension LiveActivityCardPreview {
             .split(separator: ",")
             .compactMap { LiveActivityService.DebugScenario(rawValue: String($0)) }
         guard !codes.isEmpty else {
-            print("[LiveActivity][Debug] -liveActivityCards matched no known scenarios: \(args[idx + 1])")
+            AppLogger.activity.warning("-liveActivityCards matched no known scenarios: \(args[idx + 1])")
             return nil
         }
-        print("[LiveActivity][Debug] Rendering cards: \(codes.map(\.rawValue).joined(separator: ","))")
+        AppLogger.activity.debug("Rendering debug cards: \(codes.map(\.rawValue).joined(separator: ","))")
         return LiveActivityCardPreview(scenarios: codes)
     }
 }

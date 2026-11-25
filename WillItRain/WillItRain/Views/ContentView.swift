@@ -355,14 +355,16 @@ struct ContentView: View {
             }
 
             let interval = forecast.nextPollInterval(leadTimeMinutes: settings.leadTime)
-            print("[Weather] Next poll in \(Int(interval))s")
+            AppLogger.weather.info("Next poll in \(Int(interval))s")
             weatherPoller.schedule(after: interval) {
                 Task { await fetchWeather() }
             }
         } catch LocationError.permissionDenied {
+            AppLogger.weather.warning("Location permission denied during weather fetch")
             appState = .error(.locationDenied)
             return
         } catch {
+            AppLogger.weather.error("Weather fetch failed: \(error.localizedDescription)")
             appState = .error(.network(error.localizedDescription))
             weatherPoller.schedule(after: 60) {
                 Task { await fetchWeather() }

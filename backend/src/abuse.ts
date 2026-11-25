@@ -39,6 +39,7 @@
 // until then.
 
 import { CoverageMap, CoverageReply, DeviceRegistration, Env, GridCell, RateReply } from './types';
+import { formatError, logWarn } from './logger';
 
 // ---------------------------------------------------------------------------
 // The fan-out budget
@@ -604,6 +605,7 @@ function limiterShardName(bucket: string): string {
 
 export async function checkRegistrationRate(request: Request, env: Env): Promise<RateDecision> {
   const bucket = await clientBucket(request);
+  const bucketPrefix = bucket.slice(0, 8);
   const shard = limiterShardName(bucket);
 
   try {
@@ -616,18 +618,26 @@ export async function checkRegistrationRate(request: Request, env: Env): Promise
         maxRequests: RATE_LIMIT_MAX_REQUESTS,
       }),
     });
-    return (await response.json()) as RateReply;
+    const reply = (await response.json()) as RateReply;
+    return { ...reply, bucketPrefix };
   } catch (err) {
     // An infrastructure blip must not lock every real user out of registering.
     // Failing open here cannot uncap the expensive thing: the coverage registry
     // is a separate object, and selectCellsWithinCap bounds the cron's fan-out
     // no matter what the registration side let through.
-    console.warn(`[Abuse] Rate-limit bookkeeping failed, allowing request: ${err}`);
-    return { ok: true, retryAfterSeconds: 0 };
+    logWarn('do.fail_open', {
+      object: 'RegistrationLimiter',
+      op: 'check',
+      shard,
+      bucketPrefix,
+      reason: 'rate_limit_check_failed',
+      error: formatError(err),
+    });
+    return { ok: true, retryAfterSeconds: 0, bucketPrefix };
   }
 }
 
-export type RateDecision = RateReply;
+export type RateDecision = RateReply & { bucketPrefix?: string };
 export type CellDecision = CoverageReply;
 
 // ---------------------------------------------------------------------------
@@ -669,7 +679,13 @@ export async function reserveGridCell(
   } catch (err) {
     // As with the throttle: prefer a working service over a strictly-accounted
     // one. selectCellsWithinCap is what actually protects the quota.
-    console.warn(`[Abuse] Grid-cell bookkeeping failed, allowing registration: ${err}`);
+    logWarn('do.fail_open', {
+      object: 'CoverageRegistry',
+      op: 'reserve',
+      gridKey,
+      reason: 'coverage_reserve_failed',
+      error: formatError(err),
+    });
     return { ok: true, cells: 0, devices: 0 };
   }
 }
@@ -687,7 +703,12 @@ export async function flagPendingReap(deviceToken: string, env: Env): Promise<vo
       body: JSON.stringify({ deviceToken }),
     });
   } catch (err) {
-    console.warn(`[Abuse] Could not flag device for reaping: ${err}`);
+    logWarn('do.fail_open', {
+      object: 'CoverageRegistry',
+      op: 'flag_reap',
+      reason: 'flag_pending_reap_failed',
+      error: formatError(err),
+    });
   }
 }
 
@@ -704,7 +725,12 @@ export async function readPendingReaps(env: Env): Promise<Set<string>> {
     const { tokens } = (await res.json()) as { tokens: string[] };
     return new Set(tokens);
   } catch (err) {
-    console.warn(`[Abuse] Could not read pending reaps: ${err}`);
+    logWarn('do.fail_open', {
+      object: 'CoverageRegistry',
+      op: 'pending_reaps',
+      reason: 'read_pending_reaps_failed',
+      error: formatError(err),
+    });
     return new Set();
   }
 }
@@ -717,7 +743,12 @@ export async function releaseGridCell(deviceToken: string, env: Env): Promise<vo
       body: JSON.stringify({ deviceToken }),
     });
   } catch (err) {
-    console.warn(`[Abuse] Could not release grid-cell slot: ${err}`);
+    logWarn('do.fail_open', {
+      object: 'CoverageRegistry',
+      op: 'release',
+      reason: 'release_grid_cell_failed',
+      error: formatError(err),
+    });
   }
 }
 
@@ -747,7 +778,13 @@ export async function reconcileCoverage(grids: GridCell[], env: Env): Promise<vo
       body: JSON.stringify({ coverage, activity }),
     });
   } catch (err) {
-    console.warn(`[Abuse] Could not reconcile grid-cell coverage: ${err}`);
+    logWarn('do.fail_open', {
+      object: 'CoverageRegistry',
+      op: 'reconcile',
+      count: grids.length,
+      reason: 'reconcile_coverage_failed',
+      error: formatError(err),
+    });
   }
 }
 
