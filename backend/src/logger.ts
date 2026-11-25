@@ -33,29 +33,6 @@ const APNS_DEVICE_PATH_RE = /\/3\/device\/[^\s"'/?]+/g;
 const BEARER_JWT_RE = /\bBearer\s+[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+/gi;
 const WEATHERKIT_COORDS_RE = /\/weather\/[^/\s]+\/-?\d+(?:\.\d+)?\/-?\d+(?:\.\d+)?/g;
 
-// Fields whose string values are known-safe structural identifiers (coarse grid
-// key, route path, timestamp, event name, etc.) and should not be altered.
-const PASSTHROUGH_KEYS = new Set([
-  'event',
-  'level',
-  'ts',
-  'route',
-  'method',
-  'code',
-  'gridKey',
-  'bucketPrefix',
-  'shard',
-  'object',
-  'op',
-  'prefix',
-  'keyPrefix',
-  'pushType',
-  'activityEvent',
-  'env',
-  'precip',
-  'kind',
-]);
-
 /** Scrubs tokens, JWTs, and raw coordinate URLs from free-form text. */
 export function scrubSensitive(value: string): string {
   return value
@@ -83,19 +60,19 @@ export function isTimeoutError(err: unknown): boolean {
   return /timed out|timeout|aborted due to timeout/i.test(message);
 }
 
-function sanitizeValue(key: string, value: unknown): unknown {
+function sanitizeValue(value: unknown): unknown {
   if (value === undefined) return undefined;
   if (typeof value === 'string') {
-    return PASSTHROUGH_KEYS.has(key) ? value : scrubSensitive(value);
+    return scrubSensitive(value);
   }
   if (Array.isArray(value)) {
-    return value.map((item) => (typeof item === 'string' ? scrubSensitive(item) : item));
+    return value.map((item) => sanitizeValue(item));
   }
   if (value !== null && typeof value === 'object') {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       if (v === undefined || FORBIDDEN_KEYS.has(k.toLowerCase())) continue;
-      out[k] = sanitizeValue(k, v);
+      out[k] = sanitizeValue(v);
     }
     return out;
   }
@@ -114,7 +91,7 @@ function emit(level: LogLevel, event: string, fields?: LogFields): void {
       if (value === undefined) continue;
       if (key === 'event' || key === 'level' || key === 'ts') continue;
       if (FORBIDDEN_KEYS.has(key.toLowerCase())) continue;
-      record[key] = sanitizeValue(key, value);
+      record[key] = sanitizeValue(value);
     }
   }
 

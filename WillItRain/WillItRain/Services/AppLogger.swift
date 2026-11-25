@@ -1,12 +1,11 @@
 import Foundation
 import OSLog
 
-/// Lightweight structured logger backed by Apple's `os.Logger` plus a bounded,
-/// thread-safe in-memory ring buffer of sanitized entries.
+/// Lightweight structured logger backed by Apple's `os.Logger`.
 ///
 /// Privacy invariant: raw APNs device tokens, Live Activity push tokens, bearer
 /// JWTs, and high-precision latitude/longitude pairs are scrubbed before writing
-/// to either `os.Logger` or the ring buffer.
+/// to `os.Logger`.
 nonisolated final class AppLogger: @unchecked Sendable {
     enum Category: String, CaseIterable, Sendable {
         case push
@@ -25,7 +24,6 @@ nonisolated final class AppLogger: @unchecked Sendable {
     }
 
     struct Entry: Equatable, Sendable {
-        let timestamp: Date
         let category: Category
         let level: Level
         let message: String
@@ -57,7 +55,6 @@ nonisolated final class AppLogger: @unchecked Sendable {
         }
     }
 
-    static let defaultCapacity = 150
     static let defaultSubsystem = Bundle.main.bundleIdentifier ?? "com.willitrain.WillItRain"
     static let shared = AppLogger()
 
@@ -69,21 +66,16 @@ nonisolated final class AppLogger: @unchecked Sendable {
     static var metrics: CategoryLogger { shared.category(.metrics) }
 
     let subsystem: String
-    let capacity: Int
 
-    private let now: @Sendable () -> Date
     private let loggers: [Category: Logger]
-    private let lock = NSLock()
-    private var ringBuffer: [Entry] = []
+    private let sink: (@Sendable (Entry) -> Void)?
 
     init(
         subsystem: String = AppLogger.defaultSubsystem,
-        capacity: Int = AppLogger.defaultCapacity,
-        now: @escaping @Sendable () -> Date = Date.init
+        sink: (@Sendable (Entry) -> Void)? = nil
     ) {
         self.subsystem = subsystem
-        self.capacity = max(1, capacity)
-        self.now = now
+        self.sink = sink
         var built: [Category: Logger] = [:]
         for category in Category.allCases {
             built[category] = Logger(subsystem: subsystem, category: category.rawValue)
@@ -97,19 +89,7 @@ nonisolated final class AppLogger: @unchecked Sendable {
 
     func log(category: Category, level: Level, _ message: String) {
         let sanitized = Self.sanitize(message)
-        let entry = Entry(
-            timestamp: now(),
-            category: category,
-            level: level,
-            message: sanitized
-        )
-
-        lock.lock()
-        if ringBuffer.count >= capacity {
-            ringBuffer.removeFirst(ringBuffer.count - capacity + 1)
-        }
-        ringBuffer.append(entry)
-        lock.unlock()
+        sink?(Entry(category: category, level: level, message: sanitized))
 
         guard let osLogger = loggers[category] else { return }
         switch level {
@@ -122,32 +102,6 @@ nonisolated final class AppLogger: @unchecked Sendable {
         case .error:
             osLogger.error("\(sanitized, privacy: .public)")
         }
-    }
-
-    /// Returns stored entries in chronological order, optionally filtered by category.
-    func recentEntries(category: Category? = nil) -> [Entry] {
-        lock.lock()
-        let snapshot = ringBuffer
-        lock.unlock()
-        guard let category else { return snapshot }
-        return snapshot.filter { $0.category == category }
-    }
-
-    /// Human-readable newline-delimited dump for debug inspection and sysdiagnose capture.
-    func formattedDump(category: Category? = nil) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return recentEntries(category: category)
-            .map { entry in
-                "[\(formatter.string(from: entry.timestamp))] [\(entry.level.rawValue.uppercased())] [\(entry.category.rawValue)] \(entry.message)"
-            }
-            .joined(separator: "\n")
-    }
-
-    func clear() {
-        lock.lock()
-        ringBuffer.removeAll()
-        lock.unlock()
     }
 
     // MARK: - Privacy sanitization

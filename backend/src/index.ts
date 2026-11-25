@@ -825,6 +825,13 @@ export default {
             //     activity and dropping its token (transition).
             // A push failure here must never break the alert loop.
             if (rainingNow && activityToken && budget.spend()) {
+              const activityKind =
+                minutesUntilEnd === undefined
+                  ? 'steady_rain'
+                  : minutesUntilEnd > 0
+                    ? 'raining_now'
+                    : 'rain_end';
+              let shouldClearEndedToken = false;
               try {
                 if (minutesUntilEnd === undefined || minutesUntilEnd > 0) {
                   const segments = computeSegments(minutes, isWet, now, ACTIVITY_WINDOW_MINUTES);
@@ -869,7 +876,7 @@ export default {
                   activitySent += 1;
                   logInfo('activity.sent', {
                     gridKey: grid.gridKey,
-                    kind: minutesUntilEnd === undefined ? 'steady_rain' : 'raining_now',
+                    kind: activityKind,
                     activityEvent: 'update',
                     priority: LIVE_ACTIVITY_PRIORITY.keepalive,
                     precip,
@@ -896,11 +903,11 @@ export default {
                     event: 'end',
                     priority: LIVE_ACTIVITY_PRIORITY.transition,
                   });
-                  await clearActivityToken(device.token, env);
                   activitySent += 1;
+                  shouldClearEndedToken = true;
                   logInfo('activity.sent', {
                     gridKey: grid.gridKey,
-                    kind: 'rain_end',
+                    kind: activityKind,
                     activityEvent: 'end',
                     priority: LIVE_ACTIVITY_PRIORITY.transition,
                     precip,
@@ -910,13 +917,19 @@ export default {
                 activityFailed += 1;
                 logError('activity.failed', {
                   gridKey: grid.gridKey,
-                  kind: 'raining_now',
+                  kind: activityKind,
                   status: err instanceof APNsError ? err.status : undefined,
                   reason: err instanceof APNsError ? err.reason : undefined,
                   timeout: isTimeoutError(err),
                   error: formatError(err),
                 });
                 await discardDeadActivityToken(device.token, err, env);
+              }
+              if (shouldClearEndedToken) {
+                try {
+                  await clearActivityToken(device.token, env);
+                } catch {
+                }
               }
             }
           }
@@ -948,7 +961,7 @@ export default {
         cellsTotal,
         cellsProcessed,
         cellsSkipped,
-        evictedCells: cellsSkipped + cellsEmptiedByReap,
+        evictedCells: cellsEmptiedByReap,
         weatherkitOk,
         weatherkitErr,
         weatherkitTimeout,
@@ -998,7 +1011,7 @@ async function migrateLegacyRecords(legacy: LegacyRecord[], env: Env): Promise<v
 
   logInfo('cron.ttl_migration', {
     count: migrated,
-    remaining: legacy.length - batch.length,
+    remaining: legacy.length - migrated,
   });
 }
 

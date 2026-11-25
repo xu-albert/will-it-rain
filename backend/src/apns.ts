@@ -132,13 +132,12 @@ async function sendNotification(
   badge: number,
   env: Env
 ): Promise<void> {
-  const token = await generateAPNsJWT(env);
-
   const host = env.APNS_ENV === 'sandbox' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
   const startMs = Date.now();
-  let resp: Response;
+  let status: number | undefined;
   try {
-    resp = await fetch(`https://${host}/3/device/${deviceToken}`, {
+    const token = await generateAPNsJWT(env);
+    const resp = await fetch(`https://${host}/3/device/${deviceToken}`, {
       method: 'POST',
       headers: {
         Authorization: `bearer ${token}`,
@@ -152,12 +151,28 @@ async function sendNotification(
       }),
       signal: AbortSignal.timeout(APNS_TIMEOUT_MS),
     });
+    status = resp.status;
+
+    if (!resp.ok) {
+      const reason = parseAPNsReason(await resp.text());
+      const durationMs = Date.now() - startMs;
+      logError('apns.error', {
+        pushType: 'alert',
+        env: env.APNS_ENV,
+        status: resp.status,
+        reason,
+        durationMs,
+      });
+      throw new APNsError(resp.status, reason);
+    }
   } catch (err) {
+    if (err instanceof APNsError) throw err;
     const durationMs = Date.now() - startMs;
     if (isTimeoutError(err)) {
       logError('apns.timeout', {
         pushType: 'alert',
         env: env.APNS_ENV,
+        status,
         timeoutMs: APNS_TIMEOUT_MS,
         durationMs,
         error: formatError(err),
@@ -166,24 +181,12 @@ async function sendNotification(
       logError('apns.error', {
         pushType: 'alert',
         env: env.APNS_ENV,
+        status,
         durationMs,
         error: formatError(err),
       });
     }
     throw err;
-  }
-
-  if (!resp.ok) {
-    const durationMs = Date.now() - startMs;
-    const reason = parseAPNsReason(await resp.text());
-    logError('apns.error', {
-      pushType: 'alert',
-      env: env.APNS_ENV,
-      status: resp.status,
-      reason,
-      durationMs,
-    });
-    throw new APNsError(resp.status, reason);
   }
 }
 
@@ -237,8 +240,6 @@ export async function sendLiveActivityUpdate(
   env: Env,
   { event, priority }: LiveActivityPushOptions
 ): Promise<void> {
-  const token = await generateAPNsJWT(env);
-
   const host = env.APNS_ENV === 'sandbox' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
   const nowSeconds = Math.floor(Date.now() / 1000);
 
@@ -253,9 +254,10 @@ export async function sendLiveActivityUpdate(
   }
 
   const startMs = Date.now();
-  let resp: Response;
+  let status: number | undefined;
   try {
-    resp = await fetch(`https://${host}/3/device/${activityToken}`, {
+    const token = await generateAPNsJWT(env);
+    const resp = await fetch(`https://${host}/3/device/${activityToken}`, {
       method: 'POST',
       headers: {
         Authorization: `bearer ${token}`,
@@ -267,7 +269,24 @@ export async function sendLiveActivityUpdate(
       body: JSON.stringify({ aps }),
       signal: AbortSignal.timeout(APNS_TIMEOUT_MS),
     });
+    status = resp.status;
+
+    if (!resp.ok) {
+      const reason = parseAPNsReason(await resp.text());
+      const durationMs = Date.now() - startMs;
+      logError('apns.error', {
+        pushType: 'liveactivity',
+        activityEvent: event,
+        priority,
+        env: env.APNS_ENV,
+        status: resp.status,
+        reason,
+        durationMs,
+      });
+      throw new APNsError(resp.status, reason);
+    }
   } catch (err) {
+    if (err instanceof APNsError) throw err;
     const durationMs = Date.now() - startMs;
     if (isTimeoutError(err)) {
       logError('apns.timeout', {
@@ -275,6 +294,7 @@ export async function sendLiveActivityUpdate(
         activityEvent: event,
         priority,
         env: env.APNS_ENV,
+        status,
         timeoutMs: APNS_TIMEOUT_MS,
         durationMs,
         error: formatError(err),
@@ -285,25 +305,11 @@ export async function sendLiveActivityUpdate(
         activityEvent: event,
         priority,
         env: env.APNS_ENV,
+        status,
         durationMs,
         error: formatError(err),
       });
     }
     throw err;
-  }
-
-  if (!resp.ok) {
-    const durationMs = Date.now() - startMs;
-    const reason = parseAPNsReason(await resp.text());
-    logError('apns.error', {
-      pushType: 'liveactivity',
-      activityEvent: event,
-      priority,
-      env: env.APNS_ENV,
-      status: resp.status,
-      reason,
-      durationMs,
-    });
-    throw new APNsError(resp.status, reason);
   }
 }

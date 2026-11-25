@@ -66,7 +66,6 @@ export async function fetchForecast(
   env: Env,
   gridKey: string = toGridKey(lat, lon)
 ): Promise<WeatherKitForecast> {
-  const token = await generateJWT(env);
   // forecastHourly is the fallback for regions with no forecastNextHour
   // (nextHour.ts). Only the hours that can contain its synthesized minutes are
   // asked for: from the hour containing the series' lookback start — by default
@@ -83,17 +82,36 @@ export async function fetchForecast(
     `&hourlyStart=${encodeURIComponent(hourlyStart)}&hourlyEnd=${encodeURIComponent(hourlyEnd)}`;
 
   const startMs = Date.now();
-  let resp: Response;
+  let status: number | undefined;
   try {
-    resp = await fetch(url, {
+    const token = await generateJWT(env);
+    const resp = await fetch(url, {
       headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(WEATHERKIT_TIMEOUT_MS),
     });
+    status = resp.status;
+
+    if (!resp.ok) {
+      const body = await resp.text();
+      const durationMs = Date.now() - startMs;
+      const detail = scrubSensitive(body.slice(0, 200));
+      logError('weatherkit.error', {
+        gridKey,
+        status: resp.status,
+        durationMs,
+        error: detail,
+      });
+      throw new WeatherKitError(resp.status, detail);
+    }
+
+    return (await resp.json()) as WeatherKitForecast;
   } catch (err) {
+    if (err instanceof WeatherKitError) throw err;
     const durationMs = Date.now() - startMs;
     if (isTimeoutError(err)) {
       logError('weatherkit.timeout', {
         gridKey,
+        status,
         timeoutMs: WEATHERKIT_TIMEOUT_MS,
         durationMs,
         error: formatError(err),
@@ -101,25 +119,11 @@ export async function fetchForecast(
     } else {
       logError('weatherkit.error', {
         gridKey,
+        status,
         durationMs,
         error: formatError(err),
       });
     }
     throw err;
   }
-
-  const durationMs = Date.now() - startMs;
-  if (!resp.ok) {
-    const body = await resp.text();
-    const detail = scrubSensitive(body.slice(0, 200));
-    logError('weatherkit.error', {
-      gridKey,
-      status: resp.status,
-      durationMs,
-      error: detail,
-    });
-    throw new WeatherKitError(resp.status, detail);
-  }
-
-  return resp.json() as Promise<WeatherKitForecast>;
 }

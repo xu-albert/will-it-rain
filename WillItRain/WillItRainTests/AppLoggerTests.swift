@@ -7,75 +7,42 @@ import MetricKit
 
 final class AppLoggerTests: XCTestCase {
 
-    // MARK: - AppLogger ring buffer & categories
+    // MARK: - AppLogger sink & categories
 
-    private nonisolated final class ClockBox: @unchecked Sendable {
+    private nonisolated final class EntryCollector: @unchecked Sendable {
         private let lock = NSLock()
-        private var current: Date
+        private var storage: [AppLogger.Entry] = []
 
-        init(_ start: Date) {
-            self.current = start
-        }
-
-        func next() -> Date {
+        func record(_ entry: AppLogger.Entry) {
             lock.lock()
-            defer { lock.unlock() }
-            current = current.addingTimeInterval(1)
-            return current
+            storage.append(entry)
+            lock.unlock()
+        }
+
+        func entries(category: AppLogger.Category? = nil) -> [AppLogger.Entry] {
+            lock.lock()
+            let snapshot = storage
+            lock.unlock()
+            guard let category else { return snapshot }
+            return snapshot.filter { $0.category == category }
         }
     }
 
-    func testRingBufferEnforcesCapacityAndPreservesOrder() {
-        let clock = ClockBox(Date(timeIntervalSince1970: 1_700_000_000))
-        let logger = AppLogger(subsystem: "com.willitrain.test", capacity: 5, now: { clock.next() })
+    func testAllCategoriesAndLevelsEmitThroughInjectedSink() {
+        let collector = EntryCollector()
+        let logger = AppLogger(subsystem: "com.willitrain.test", sink: { collector.record($0) })
 
-        for i in 1...8 {
-            logger.category(.weather).info("event \(i)")
-        }
-
-        let entries = logger.recentEntries()
-        XCTAssertEqual(entries.count, 5)
-        XCTAssertEqual(entries.map(\.message), ["event 4", "event 5", "event 6", "event 7", "event 8"])
-        XCTAssertEqual(Set(entries.map(\.category)), [.weather])
-        XCTAssertEqual(Set(entries.map(\.level)), [.info])
-    }
-
-    func testDefaultCapacityCapsAt150Entries() {
-        let logger = AppLogger(subsystem: "com.willitrain.test")
-        XCTAssertEqual(logger.capacity, 150)
-
-        for i in 1...200 {
-            logger.category(.push).info("entry \(i)")
-        }
-
-        let entries = logger.recentEntries()
-        XCTAssertEqual(entries.count, 150)
-        XCTAssertEqual(entries.first?.message, "entry 51")
-        XCTAssertEqual(entries.last?.message, "entry 200")
-    }
-
-    func testCategoryFilteringDumpAndClear() {
-        let fixed = Date(timeIntervalSince1970: 1_700_000_000)
-        let logger = AppLogger(subsystem: "com.willitrain.test", capacity: 20, now: { fixed })
-
-        logger.category(.push).info("push ok")
+        logger.category(.push).debug("push debug")
         logger.category(.activity).warning("activity stale")
         logger.category(.weather).error("weather timeout")
         logger.category(.notifications).info("notif armed")
         logger.category(.background).info("bg scheduled")
         logger.category(.metrics).info("metrics ready")
 
-        XCTAssertEqual(logger.recentEntries().count, 6)
-        XCTAssertEqual(logger.recentEntries(category: .weather).map(\.message), ["weather timeout"])
-        XCTAssertEqual(logger.recentEntries(category: .activity).map(\.level), [.warning])
-
-        let dump = logger.formattedDump(category: .weather)
-        XCTAssertTrue(dump.contains("[ERROR]"))
-        XCTAssertTrue(dump.contains("[weather]"))
-        XCTAssertTrue(dump.contains("weather timeout"))
-
-        logger.clear()
-        XCTAssertTrue(logger.recentEntries().isEmpty)
+        XCTAssertEqual(collector.entries().count, 6)
+        XCTAssertEqual(collector.entries(category: .push), [.init(category: .push, level: .debug, message: "push debug")])
+        XCTAssertEqual(collector.entries(category: .weather), [.init(category: .weather, level: .error, message: "weather timeout")])
+        XCTAssertEqual(collector.entries(category: .activity).map(\.level), [.warning])
     }
 
     func testSanitizerRedactsTokensJWTsAndExactCoordinatesWhileKeepingCoarseGridKeys() {
@@ -83,12 +50,13 @@ final class AppLoggerTests: XCTestCase {
         let activityToken = String(repeating: "cd", count: 32)
         let jwt = "Bearer eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJ0ZXN0In0.signature123"
 
-        let logger = AppLogger(subsystem: "com.willitrain.test", capacity: 10)
+        let collector = EntryCollector()
+        let logger = AppLogger(subsystem: "com.willitrain.test", sink: { collector.record($0) })
         logger.category(.push).error(
             "HTTP 503 code=coverage_at_capacity grid=37.75,-122.40 token=\(deviceToken) url=https://api.push.apple.com/3/device/\(activityToken) auth=\(jwt) lat=37.774929 lon=-122.419416"
         )
 
-        let message = logger.recentEntries().first?.message ?? ""
+        let message = collector.entries().first?.message ?? ""
         XCTAssertTrue(message.contains("HTTP 503"))
         XCTAssertTrue(message.contains("code=coverage_at_capacity"))
         XCTAssertTrue(message.contains("grid=37.75,-122.40"))
@@ -100,7 +68,8 @@ final class AppLoggerTests: XCTestCase {
     }
 
     func testConcurrentWritesAreThreadSafe() async {
-        let logger = AppLogger(subsystem: "com.willitrain.test", capacity: 150)
+        let collector = EntryCollector()
+        let logger = AppLogger(subsystem: "com.willitrain.test", sink: { collector.record($0) })
         await withTaskGroup(of: Void.self) { group in
             for worker in 0..<8 {
                 group.addTask {
@@ -110,7 +79,7 @@ final class AppLoggerTests: XCTestCase {
                 }
             }
         }
-        XCTAssertEqual(logger.recentEntries().count, 150)
+        XCTAssertEqual(collector.entries().count, 240)
     }
 
     // MARK: - PushRegistrationService -> AppLogger integration
@@ -154,7 +123,8 @@ final class AppLoggerTests: XCTestCase {
             )
         }
 
-        let logger = AppLogger(subsystem: "com.willitrain.test", capacity: 20)
+        let collector = EntryCollector()
+        let logger = AppLogger(subsystem: "com.willitrain.test", sink: { collector.record($0) })
         let service = PushRegistrationService(
             baseURL: URL(string: "https://worker.test")!,
             defaults: defaults,
@@ -168,7 +138,7 @@ final class AppLoggerTests: XCTestCase {
         let result = await service.registerLocation(lat: 37.774929, lon: -122.419416, leadTimeMinutes: 20)
 
         XCTAssertEqual(result, .rejected)
-        let pushEntries = logger.recentEntries(category: .push)
+        let pushEntries = collector.entries(category: .push)
         let rejection = pushEntries.first { $0.level == .error }
         XCTAssertNotNil(rejection)
         XCTAssertTrue(rejection?.message.contains("HTTP 503") == true)
@@ -180,7 +150,7 @@ final class AppLoggerTests: XCTestCase {
     // MARK: - MetricKitDiagnostics
 
     func testMetricKitStartAndStopAreIdempotent() {
-        let logger = AppLogger(subsystem: "com.willitrain.test", capacity: 20)
+        let logger = AppLogger(subsystem: "com.willitrain.test")
         var added = 0
         var removed = 0
         let diagnostics = MetricKitDiagnostics(
@@ -202,7 +172,8 @@ final class AppLoggerTests: XCTestCase {
     }
 
     func testMetricKitLogsMetricSummariesAndEscalatesAbnormalExits() {
-        let logger = AppLogger(subsystem: "com.willitrain.test", capacity: 20)
+        let collector = EntryCollector()
+        let logger = AppLogger(subsystem: "com.willitrain.test", sink: { collector.record($0) })
         let diagnostics = MetricKitDiagnostics(
             logger: logger,
             registerSubscriber: { _ in },
@@ -235,7 +206,7 @@ final class AppLoggerTests: XCTestCase {
             )
         )
 
-        let entries = logger.recentEntries(category: .metrics)
+        let entries = collector.entries(category: .metrics)
         XCTAssertEqual(entries.count, 2)
         XCTAssertEqual(entries[0].level, .info)
         XCTAssertTrue(entries[0].message.contains("cpu=12.50s"))
@@ -248,7 +219,8 @@ final class AppLoggerTests: XCTestCase {
     }
 
     func testMetricKitLogsCrashHangCPUAndDiskDiagnosticsAndSanitizesSecrets() {
-        let logger = AppLogger(subsystem: "com.willitrain.test", capacity: 20)
+        let collector = EntryCollector()
+        let logger = AppLogger(subsystem: "com.willitrain.test", sink: { collector.record($0) })
         let diagnostics = MetricKitDiagnostics(
             logger: logger,
             registerSubscriber: { _ in },
@@ -273,7 +245,7 @@ final class AppLoggerTests: XCTestCase {
             )
         )
 
-        let entries = logger.recentEntries(category: .metrics)
+        let entries = collector.entries(category: .metrics)
         XCTAssertEqual(entries.count, 4)
         XCTAssertTrue(entries.allSatisfy { $0.level == .error })
         XCTAssertTrue(entries[0].message.contains("crash diagnostic") && entries[0].message.contains("signal=11"))
@@ -292,7 +264,7 @@ final class AppLoggerTests: XCTestCase {
                 diskWriteExceptions: []
             )
         )
-        XCTAssertEqual(logger.recentEntries(category: .metrics).last?.level, .info)
+        XCTAssertEqual(collector.entries(category: .metrics).last?.level, .info)
 
         #if canImport(MetricKit)
         // Real delegate entry points accept empty arrays cleanly in Simulator

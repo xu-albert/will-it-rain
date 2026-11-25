@@ -1,5 +1,11 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
+import { fetchForecast } from '../src/weatherkit';
+import {
+  LIVE_ACTIVITY_PRIORITY,
+  sendLiveActivityUpdate,
+  sendRainAlert,
+} from '../src/apns';
 import {
   formatError,
   isTimeoutError,
@@ -13,6 +19,7 @@ import {
   MAX_DEVICES_PER_CELL,
   MAX_GRID_CELLS,
   RATE_LIMIT_MAX_REQUESTS,
+  flagPendingReap,
 } from '../src/abuse';
 import { RegistrationLimiter } from '../src/durable';
 import { coordsForCell, fakeToken, generateSigningKey, makeHarness } from './harness';
@@ -120,6 +127,52 @@ describe('Structured logger redaction & formatting', () => {
     expect(isTimeoutError(new Error('The operation was aborted due to timeout'))).toBe(true);
     expect(isTimeoutError(new Error('HTTP 500 Internal Server Error'))).toBe(false);
     expect(isTimeoutError(null)).toBe(false);
+  });
+
+  it('scrubs sensitive untrusted routes and recursively sanitizes objects and arrays inside arrays', async () => {
+    const { entries, raw } = captureLogs();
+    const harness = makeHarness();
+    const leakedToken = fakeToken(77);
+    const leakedActivity = fakeToken(88);
+
+    await worker.fetch(
+      new Request(`https://worker.test/3/device/${leakedToken}`, { method: 'GET' }),
+      harness.env
+    );
+    await worker.fetch(
+      new Request(`https://worker.test/${leakedActivity}`, { method: 'GET' }),
+      harness.env
+    );
+    await worker.fetch(
+      new Request('https://worker.test/weather/en-US/37.774929/-122.419416', { method: 'GET' }),
+      harness.env
+    );
+
+    logInfo('test.nested_arrays', {
+      items: [
+        { token: leakedToken, note: `push=/3/device/${leakedToken}` },
+        [[{ lat: 37.774929, lon: -122.419416, text: `raw=${leakedActivity}` }]],
+      ],
+    });
+
+    const routes = entries.filter((e) => e.event === 'http.request').map((e) => e.route);
+    expect(routes).toEqual([
+      '/3/device/[redacted]',
+      '/[redacted-token]',
+      '/weather/[redacted]',
+    ]);
+
+    const nested = entries.find((e) => e.event === 'test.nested_arrays');
+    expect(nested?.items).toEqual([
+      { note: 'push=/3/device/[redacted]' },
+      [[{ text: 'raw=[redacted-token]' }]],
+    ]);
+
+    const joined = raw.join('\n');
+    expect(joined).not.toContain(leakedToken);
+    expect(joined).not.toContain(leakedActivity);
+    expect(joined).not.toContain('37.774929');
+    expect(joined).not.toContain('-122.419416');
   });
 });
 
@@ -618,6 +671,330 @@ describe('Cron tick start, summary, and upstream error/timeout structured loggin
     const joined = raw.join('\n');
     for (const secret of [devOk, devDead, actOk, actDead, devErrCell, devTimeoutCell]) {
       expect(joined).not.toContain(secret);
+    }
+  });
+
+  it('logs JWT, malformed-JSON, and mid-body timeout failures across WeatherKit and APNs without double-logging HTTP errors', async () => {
+    vi.useFakeTimers();
+    const baseTime = Date.parse('2026-11-01T00:00:00.000Z');
+    vi.setSystemTime(new Date(baseTime));
+
+    const sampleState = {
+      statusText: 'Rain incoming',
+      countdownTarget: null,
+      heroText: null,
+      subBold: 'Rain expected',
+      subRest: ' · next hour',
+      boldFirst: true,
+      rightText: '',
+      segments: [],
+      windowMinutes: 90,
+      midLabel: '+45 min',
+      endLabel: '+90 min',
+      flagText: null,
+      flagPosition: null,
+      precip: 'rain' as const,
+    };
+
+    try {
+      // Advance past any cached JWT from earlier tests, then use a broken signing key.
+      vi.setSystemTime(new Date(baseTime + 45 * 60_000));
+      const { entries: jwtEntries } = captureLogs();
+      const brokenHarness = makeHarness({ signingKey: 'not-a-valid-pem-key' });
+
+      await expect(fetchForecast(37.75, -122.4, brokenHarness.env)).rejects.toThrow();
+      await expect(sendRainAlert(fakeToken(10), 5, brokenHarness.env)).rejects.toThrow();
+      await expect(
+        sendLiveActivityUpdate(fakeToken(11), sampleState, brokenHarness.env, {
+          event: 'update',
+          priority: LIVE_ACTIVITY_PRIORITY.transition,
+        })
+      ).rejects.toThrow();
+
+      expect(jwtEntries.filter((e) => e.event === 'weatherkit.error')).toHaveLength(1);
+      expect(jwtEntries.filter((e) => e.event === 'apns.error' && e.pushType === 'alert')).toHaveLength(1);
+      expect(
+        jwtEntries.filter((e) => e.event === 'apns.error' && e.pushType === 'liveactivity')
+      ).toHaveLength(1);
+
+      // Valid signing key: test malformed 200 JSON, mid-body timeouts, and non-2xx single logging.
+      vi.restoreAllMocks();
+      const { entries } = captureLogs();
+      const validHarness = makeHarness({ signingKey });
+
+      // 1. WeatherKit 200 with malformed JSON
+      vi.stubGlobal('fetch', async () => new Response('<html>bad gateway</html>', { status: 200 }));
+      await expect(fetchForecast(37.75, -122.4, validHarness.env)).rejects.toThrow();
+      expect(entries.filter((e) => e.event === 'weatherkit.error' && e.status === 200)).toHaveLength(1);
+
+      // 2. WeatherKit mid-body timeout during resp.json()
+      vi.stubGlobal('fetch', async () => ({
+        ok: true,
+        status: 200,
+        json: async () => {
+          throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+        },
+      }));
+      await expect(fetchForecast(37.75, -122.4, validHarness.env)).rejects.toThrow();
+      expect(entries.filter((e) => e.event === 'weatherkit.timeout' && e.status === 200)).toHaveLength(1);
+
+      // 3. WeatherKit non-2xx logs exactly once
+      vi.stubGlobal('fetch', async () => new Response('server error', { status: 502 }));
+      await expect(fetchForecast(37.75, -122.4, validHarness.env)).rejects.toThrow();
+      expect(entries.filter((e) => e.event === 'weatherkit.error' && e.status === 502)).toHaveLength(1);
+
+      // 4. APNs alert & liveactivity mid-body timeout during resp.text() on non-2xx
+      vi.stubGlobal('fetch', async () => ({
+        ok: false,
+        status: 503,
+        text: async () => {
+          throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+        },
+      }));
+      await expect(sendRainAlert(fakeToken(12), 5, validHarness.env)).rejects.toThrow();
+      await expect(
+        sendLiveActivityUpdate(fakeToken(13), sampleState, validHarness.env, {
+          event: 'end',
+          priority: LIVE_ACTIVITY_PRIORITY.transition,
+        })
+      ).rejects.toThrow();
+      expect(
+        entries.filter((e) => e.event === 'apns.timeout' && e.pushType === 'alert' && e.status === 503)
+      ).toHaveLength(1);
+      expect(
+        entries.filter(
+          (e) => e.event === 'apns.timeout' && e.pushType === 'liveactivity' && e.status === 503
+        )
+      ).toHaveLength(1);
+
+      // 5. APNs non-2xx normal rejection logs exactly once (not duplicated by catch)
+      vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ reason: 'Unregistered' }), { status: 410 }));
+      await expect(sendRainAlert(fakeToken(14), 5, validHarness.env)).rejects.toThrow();
+      await expect(
+        sendLiveActivityUpdate(fakeToken(15), sampleState, validHarness.env, {
+          event: 'update',
+          priority: LIVE_ACTIVITY_PRIORITY.keepalive,
+        })
+      ).rejects.toThrow();
+      expect(
+        entries.filter((e) => e.event === 'apns.error' && e.pushType === 'alert' && e.status === 410)
+      ).toHaveLength(1);
+      expect(
+        entries.filter(
+          (e) => e.event === 'apns.error' && e.pushType === 'liveactivity' && e.status === 410
+        )
+      ).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports accurate evictedCells, ttl_migration remaining, steady_rain/rain_end activity.failed kinds, and rain_end activitySent on KV cleanup error', async () => {
+    // 1. evictedCells does not conflate skipped cells or double-count a skipped cell emptied by pending reap.
+    {
+      const { entries } = captureLogs();
+      const harness = makeHarness({ signingKey });
+      for (let i = 0; i <= MAX_GRID_CELLS; i++) {
+        const { lat, lon } = coordsForCell(i);
+        const token = fakeToken(200 + i);
+        await harness.kv.put(
+          `device:${token}`,
+          JSON.stringify({
+            token,
+            lat,
+            lon,
+            leadTimeMinutes: 20,
+            registeredAt: new Date(Date.parse('2026-09-01T00:00:00.000Z') + i * 60_000).toISOString(),
+            renewedAt: new Date().toISOString(),
+          }),
+          { expirationTtl: 86400 }
+        );
+      }
+      // Flag the sole device in the skipped (newest) cell for pending reap.
+      const skippedToken = fakeToken(200 + MAX_GRID_CELLS);
+      await flagPendingReap(skippedToken, harness.env);
+
+      vi.stubGlobal('fetch', async () =>
+        new Response(JSON.stringify({ forecastNextHour: { minutes: [] } }), { status: 200 })
+      );
+
+      await worker.scheduled(
+        { scheduledTime: Date.now() } as ScheduledEvent,
+        harness.env,
+        {} as ExecutionContext
+      );
+
+      const summary = entries.find((e) => e.event === 'cron.summary');
+      expect(summary).toMatchObject({
+        cellsTotal: MAX_GRID_CELLS + 1,
+        cellsProcessed: MAX_GRID_CELLS,
+        cellsSkipped: 1,
+        evictedCells: 1,
+        queuedReapsDrained: 1,
+      });
+    }
+
+    // 2. Legacy TTL migration counts remaining as legacy.length - migrated when puts fail.
+    {
+      vi.restoreAllMocks();
+      const { entries } = captureLogs();
+      const harness = makeHarness({ signingKey });
+      const c0 = coordsForCell(0);
+      const t1 = fakeToken(301);
+      const t2 = fakeToken(302);
+      // Seed without expirationTtl so readCoverage classifies them as legacy.
+      await harness.kv.put(
+        `device:${t1}`,
+        JSON.stringify({ token: t1, lat: c0.lat, lon: c0.lon, leadTimeMinutes: 20, registeredAt: '2026-09-01T00:00:00.000Z' })
+      );
+      await harness.kv.put(
+        `device:${t2}`,
+        JSON.stringify({ token: t2, lat: c0.lat, lon: c0.lon, leadTimeMinutes: 20, registeredAt: '2026-09-01T00:01:00.000Z' })
+      );
+
+      const origPut = harness.kv.put.bind(harness.kv);
+      let devicePutCalls = 0;
+      vi.spyOn(harness.kv, 'put').mockImplementation(async (key, value, options) => {
+        if (key.startsWith('device:')) {
+          devicePutCalls += 1;
+          if (devicePutCalls === 2) throw new Error('KV write quota exceeded');
+        }
+        return origPut(key, value, options);
+      });
+
+      vi.stubGlobal('fetch', async () =>
+        new Response(JSON.stringify({ forecastNextHour: { minutes: [] } }), { status: 200 })
+      );
+
+      await worker.scheduled(
+        { scheduledTime: Date.now() } as ScheduledEvent,
+        harness.env,
+        {} as ExecutionContext
+      );
+
+      const migration = entries.find((e) => e.event === 'cron.ttl_migration');
+      expect(migration).toMatchObject({ count: 1, remaining: 1 });
+    }
+
+    // 3. State B activity.failed uses exact kind (steady_rain / rain_end) and rain_end cleanup KV failure does not miscount activitySent as activityFailed.
+    {
+      vi.restoreAllMocks();
+      const { entries } = captureLogs();
+      const harness = makeHarness({ signingKey });
+      const now = Date.now();
+
+      const cSteady = coordsForCell(0);
+      const cEndFail = coordsForCell(1);
+      const cEndKvFail = coordsForCell(2);
+
+      const dSteady = fakeToken(401);
+      const aSteady = fakeToken(501);
+      const dEndFail = fakeToken(402);
+      const aEndFail = fakeToken(502);
+      const dEndKvFail = fakeToken(403);
+      const aEndKvFail = fakeToken(503);
+
+      for (const [tok, act, cell, idx] of [
+        [dSteady, aSteady, cSteady, 0],
+        [dEndFail, aEndFail, cEndFail, 1],
+        [dEndKvFail, aEndKvFail, cEndKvFail, 2],
+      ] as const) {
+        await harness.kv.put(
+          `device:${tok}`,
+          JSON.stringify({
+            token: tok,
+            lat: cell.lat,
+            lon: cell.lon,
+            leadTimeMinutes: 20,
+            rainStartEnabled: false,
+            rainEndEnabled: false,
+            registeredAt: new Date(Date.parse('2026-09-01T00:00:00.000Z') + idx * 60_000).toISOString(),
+            renewedAt: new Date(now).toISOString(),
+          }),
+          { expirationTtl: 86400 }
+        );
+        await harness.kv.put(
+          `activity:${tok}`,
+          JSON.stringify({ activityToken: act, activityUpdatedAt: new Date(now).toISOString() }),
+          { metadata: { activityToken: act }, expirationTtl: 86400 }
+        );
+      }
+
+      const steadyRain = {
+        forecastNextHour: {
+          minutes: Array.from({ length: 60 }, (_, m) => ({
+            startTime: new Date(now + m * 60_000).toISOString(),
+            precipitationChance: 0.9,
+            precipitationIntensity: 3.0,
+          })),
+        },
+        forecastHourly: { summary: [{ condition: 'rain' }] },
+      };
+
+      const rainEndedAtNow = {
+        forecastNextHour: {
+          minutes: [
+            {
+              startTime: new Date(now - 2 * 60_000).toISOString(),
+              precipitationChance: 0.9,
+              precipitationIntensity: 2.0,
+            },
+            {
+              startTime: new Date(now).toISOString(),
+              precipitationChance: 0,
+              precipitationIntensity: 0,
+            },
+          ],
+        },
+        forecastHourly: { summary: [{ condition: 'rain' }] },
+      };
+
+      const origDelete = harness.kv.delete.bind(harness.kv);
+      vi.spyOn(harness.kv, 'delete').mockImplementation(async (key) => {
+        if (key === `activity:${dEndKvFail}`) {
+          throw new Error('KV delete quota exceeded');
+        }
+        return origDelete(key);
+      });
+
+      vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.startsWith('https://weatherkit.apple.com/')) {
+          if (url.includes(`/${cSteady.lat}/${cSteady.lon}`)) {
+            return new Response(JSON.stringify(steadyRain), { status: 200 });
+          }
+          return new Response(JSON.stringify(rainEndedAtNow), { status: 200 });
+        }
+        if (url.includes(`/3/device/${aSteady}`) || url.includes(`/3/device/${aEndFail}`)) {
+          return new Response(JSON.stringify({ reason: 'InternalServerError' }), { status: 500 });
+        }
+        return new Response('', { status: 200 });
+      });
+
+      await worker.scheduled(
+        { scheduledTime: now } as ScheduledEvent,
+        harness.env,
+        {} as ExecutionContext
+      );
+
+      const failedKinds = entries
+        .filter((e) => e.event === 'activity.failed')
+        .map((e) => e.kind)
+        .sort();
+      expect(failedKinds).toEqual(['rain_end', 'steady_rain']);
+
+      expect(
+        entries.some((e) => e.event === 'activity.sent' && e.kind === 'rain_end' && e.activityEvent === 'end')
+      ).toBe(true);
+      expect(
+        entries.some((e) => e.event === 'kv.error' && e.op === 'delete' && e.keyPrefix === 'activity')
+      ).toBe(true);
+
+      const summary = entries.find((e) => e.event === 'cron.summary');
+      expect(summary).toMatchObject({
+        activitySent: 1,
+        activityFailed: 2,
+      });
     }
   });
 });
