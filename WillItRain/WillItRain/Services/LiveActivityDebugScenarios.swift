@@ -146,6 +146,8 @@ extension LiveActivityService {
             )
             LiveActivityService.shared.observePushToken(for: activity)
             AppLogger.activity.debug("Started debug scenario \(scenario.rawValue): \(activity.id)")
+            // scripts/test-live-activity.sh verifies startup via `simctl launch --console-pty` stdout.
+            print("[LiveActivity][Debug] Started scenario \(scenario.rawValue): \(activity.id)")
         } catch {
             AppLogger.activity.error("Failed to start debug scenario \(scenario.rawValue): \(error.localizedDescription)")
         }

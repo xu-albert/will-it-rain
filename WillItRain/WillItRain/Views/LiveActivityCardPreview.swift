@@ -60,7 +60,10 @@ extension LiveActivityCardPreview {
             AppLogger.activity.warning("-liveActivityCards matched no known scenarios: \(args[idx + 1])")
             return nil
         }
-        AppLogger.activity.debug("Rendering debug cards: \(codes.map(\.rawValue).joined(separator: ","))")
+        let joinedCodes = codes.map(\.rawValue).joined(separator: ",")
+        AppLogger.activity.debug("Rendering debug cards: \(joinedCodes)")
+        // scripts/test-live-activity.sh verifies flag parsing via `simctl launch --console-pty` stdout.
+        print("[LiveActivity][Debug] Rendering cards: \(joinedCodes)")
         return LiveActivityCardPreview(scenarios: codes)
     }
 }
