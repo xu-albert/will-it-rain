@@ -22,7 +22,8 @@ final class PushRegistrationService {
     private let session: URLSession
     private let now: () -> Date
     private let scheduleReplay: @MainActor (Date) -> Void
-    private let log: (String) -> Void
+    private let logger: AppLogger
+    private let logObserver: ((String) -> Void)?
     private var retryTask: Task<Void, Never>?
     private var registrationChain: Task<Void, Never>?
 
@@ -32,14 +33,22 @@ final class PushRegistrationService {
         session: URLSession = .shared,
         now: @escaping () -> Date = Date.init,
         scheduleReplay: @escaping @MainActor (Date) -> Void = { BackgroundRefresh.schedule(at: $0) },
-        log: @escaping (String) -> Void = { print($0) }
+        log: ((String) -> Void)? = nil,
+        logger: AppLogger = .shared
     ) {
         self.baseURL = baseURL
         self.defaults = defaults
         self.session = session
         self.now = now
         self.scheduleReplay = scheduleReplay
-        self.log = log
+        self.logObserver = log
+        self.logger = logger
+    }
+
+    private func emit(_ level: AppLogger.Level, _ message: String) {
+        let sanitized = AppLogger.sanitize(message)
+        logger.log(category: .push, level: level, sanitized)
+        logObserver?(sanitized)
     }
 
     /// Called from AppDelegate when APNs returns a device token
@@ -50,7 +59,7 @@ final class PushRegistrationService {
             defaults.removeObject(forKey: Self.pendingRegistrationKey)
         }
         defaults.set(hex, forKey: Self.deviceTokenKey)
-        log("[Push] Stored device token")
+        emit(.info, "[Push] Stored device token")
     }
 
     /// Whether APNs has handed us a device token yet.
@@ -210,7 +219,7 @@ final class PushRegistrationService {
                     defaults.removeObject(forKey: Self.pendingRegistrationKey)
                 }
                 retryTask = nil
-                log("[Push] Registered with backend")
+                emit(.info, "[Push] Registered with backend")
                 return .registered
             } else if let status = http?.statusCode, status == 202 || status == 429,
                       let deferred = try? JSONDecoder().decode(DeferredRegistration.self, from: data) {
@@ -225,7 +234,8 @@ final class PushRegistrationService {
                 }
                 scheduleRetry(after: TimeInterval(delay))
                 scheduleReplay(retryAt)
-                log("[Push] Registration deferred for \(delay)s (HTTP \(status))")
+                let codeSuffix = deferred.code.map { " code=\($0)" } ?? ""
+                emit(.warning, "[Push] Registration deferred for \(delay)s (HTTP \(status)\(codeSuffix))")
                 return .deferred(retryAfterSeconds: delay)
             } else {
                 // The backend refuses registrations it cannot afford: three
@@ -236,20 +246,23 @@ final class PushRegistrationService {
                 // come with an explanation in the body. The two capacity
                 // refusals also clear any earlier registration for this device,
                 // rather than leave it alerting for a previous location;
-                // `storage_unavailable` changes nothing at all. Print the body
-                // verbatim, rather than letting a rejected registration look
-                // like a success.
+                // `storage_unavailable` changes nothing at all. Log the status,
+                // error code, and sanitized body rather than letting a rejected
+                // registration look like a success.
+                let status = http?.statusCode ?? -1
                 let detail = String(data: data, encoding: .utf8) ?? "<no body>"
+                let rejected = try? JSONDecoder().decode(RejectedRegistration.self, from: data)
                 if forStoredToken,
-                   let rejected = try? JSONDecoder().decode(RejectedRegistration.self, from: data),
-                   rejected.code == "coverage_at_capacity" || rejected.code == "cell_at_capacity" {
+                   let code = rejected?.code,
+                   code == "coverage_at_capacity" || code == "cell_at_capacity" {
                     defaults.set(false, forKey: Self.remoteRegistrationActiveKey)
                 }
-                log("[Push] Registration rejected (HTTP \(http?.statusCode ?? -1)): \(detail)")
+                let codePart = rejected?.code.map { " code=\($0)" } ?? ""
+                emit(.error, "[Push] Registration rejected (HTTP \(status)\(codePart)): \(detail)")
                 return .rejected
             }
         } catch {
-            log("[Push] Registration failed: \(error)")
+            emit(.error, "[Push] Registration failed: \(error.localizedDescription)")
             return .unavailable
         }
     }
@@ -291,7 +304,7 @@ final class PushRegistrationService {
     func registerLiveActivityToken(_ activityToken: String) async {
         guard let token = defaults.string(forKey: Self.deviceTokenKey) else { return }
         guard isRemoteRegistrationActive else {
-            log("[Push] Skipping Live Activity token registration: remote device registration is not active")
+            emit(.warning, "[Push] Skipping Live Activity token registration: remote device registration is not active")
             return
         }
         let url = baseURL.appendingPathComponent("register-activity")
@@ -307,13 +320,16 @@ final class PushRegistrationService {
             let (data, response) = try await session.data(for: request)
             let http = response as? HTTPURLResponse
             if http?.statusCode == 200 {
-                log("[Push] Live Activity token registered")
+                emit(.info, "[Push] Live Activity token registered")
             } else {
+                let status = http?.statusCode ?? -1
                 let detail = String(data: data, encoding: .utf8) ?? "<no body>"
-                log("[Push] Live Activity token registration rejected (HTTP \(http?.statusCode ?? -1)): \(detail)")
+                let rejected = try? JSONDecoder().decode(RejectedRegistration.self, from: data)
+                let codePart = rejected?.code.map { " code=\($0)" } ?? ""
+                emit(.error, "[Push] Live Activity token registration rejected (HTTP \(status)\(codePart)): \(detail)")
             }
         } catch {
-            log("[Push] Live Activity token registration failed: \(error)")
+            emit(.error, "[Push] Live Activity token registration failed: \(error.localizedDescription)")
         }
     }
 
@@ -326,7 +342,16 @@ final class PushRegistrationService {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONEncoder().encode(["token": token])
-        _ = try? await session.data(for: request)
+        do {
+            let (data, response) = try await session.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            if status != 200 {
+                let detail = String(data: data, encoding: .utf8) ?? "<no body>"
+                emit(.warning, "[Push] Live Activity unregister returned HTTP \(status): \(detail)")
+            }
+        } catch {
+            emit(.warning, "[Push] Live Activity unregister failed: \(error.localizedDescription)")
+        }
     }
 
     func unregister() async {
@@ -338,7 +363,16 @@ final class PushRegistrationService {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONEncoder().encode(["token": token])
 
-        _ = try? await session.data(for: request)
+        do {
+            let (data, response) = try await session.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            if status != 200 {
+                let detail = String(data: data, encoding: .utf8) ?? "<no body>"
+                emit(.warning, "[Push] Device unregister returned HTTP \(status): \(detail)")
+            }
+        } catch {
+            emit(.warning, "[Push] Device unregister failed: \(error.localizedDescription)")
+        }
         defaults.removeObject(forKey: Self.deviceTokenKey)
         defaults.set(false, forKey: Self.remoteRegistrationActiveKey)
         defaults.removeObject(forKey: Self.pendingRegistrationKey)
@@ -386,8 +420,9 @@ private struct PendingRegistration: Codable {
 
 private struct DeferredRegistration: Decodable {
     let retryAfterSeconds: Int
+    let code: String?
 }
 
 private struct RejectedRegistration: Decodable {
-    let code: String
+    let code: String?
 }

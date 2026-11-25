@@ -1,4 +1,5 @@
 import { Env, LiveActivityContentState, Precip } from './types';
+import { formatError, isTimeoutError, logError } from './logger';
 
 // Generate JWT for APNs authentication (same key as WeatherKit but different use)
 // APNs provider tokens may be reused for up to 1 hour; regenerating one per push
@@ -131,26 +132,61 @@ async function sendNotification(
   badge: number,
   env: Env
 ): Promise<void> {
-  const token = await generateAPNsJWT(env);
-
   const host = env.APNS_ENV === 'sandbox' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
-  const resp = await fetch(`https://${host}/3/device/${deviceToken}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `bearer ${token}`,
-      'apns-topic': env.APNS_TOPIC,
-      'apns-push-type': 'alert',
-      'apns-priority': '10',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      aps: { alert, badge, sound: 'default' },
-    }),
-    signal: AbortSignal.timeout(APNS_TIMEOUT_MS),
-  });
+  const startMs = Date.now();
+  let status: number | undefined;
+  try {
+    const token = await generateAPNsJWT(env);
+    const resp = await fetch(`https://${host}/3/device/${deviceToken}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `bearer ${token}`,
+        'apns-topic': env.APNS_TOPIC,
+        'apns-push-type': 'alert',
+        'apns-priority': '10',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        aps: { alert, badge, sound: 'default' },
+      }),
+      signal: AbortSignal.timeout(APNS_TIMEOUT_MS),
+    });
+    status = resp.status;
 
-  if (!resp.ok) {
-    throw new APNsError(resp.status, parseAPNsReason(await resp.text()));
+    if (!resp.ok) {
+      const reason = parseAPNsReason(await resp.text());
+      const durationMs = Date.now() - startMs;
+      logError('apns.error', {
+        pushType: 'alert',
+        env: env.APNS_ENV,
+        status: resp.status,
+        reason,
+        durationMs,
+      });
+      throw new APNsError(resp.status, reason);
+    }
+  } catch (err) {
+    if (err instanceof APNsError) throw err;
+    const durationMs = Date.now() - startMs;
+    if (isTimeoutError(err)) {
+      logError('apns.timeout', {
+        pushType: 'alert',
+        env: env.APNS_ENV,
+        status,
+        timeoutMs: APNS_TIMEOUT_MS,
+        durationMs,
+        error: formatError(err),
+      });
+    } else {
+      logError('apns.error', {
+        pushType: 'alert',
+        env: env.APNS_ENV,
+        status,
+        durationMs,
+        error: formatError(err),
+      });
+    }
+    throw err;
   }
 }
 
@@ -204,8 +240,6 @@ export async function sendLiveActivityUpdate(
   env: Env,
   { event, priority }: LiveActivityPushOptions
 ): Promise<void> {
-  const token = await generateAPNsJWT(env);
-
   const host = env.APNS_ENV === 'sandbox' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
   const nowSeconds = Math.floor(Date.now() / 1000);
 
@@ -219,20 +253,63 @@ export async function sendLiveActivityUpdate(
     aps['dismissal-date'] = nowSeconds + 5 * 60;
   }
 
-  const resp = await fetch(`https://${host}/3/device/${activityToken}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `bearer ${token}`,
-      'apns-topic': `${env.APNS_TOPIC}.push-type.liveactivity`,
-      'apns-push-type': 'liveactivity',
-      'apns-priority': String(priority),
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ aps }),
-    signal: AbortSignal.timeout(APNS_TIMEOUT_MS),
-  });
+  const startMs = Date.now();
+  let status: number | undefined;
+  try {
+    const token = await generateAPNsJWT(env);
+    const resp = await fetch(`https://${host}/3/device/${activityToken}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `bearer ${token}`,
+        'apns-topic': `${env.APNS_TOPIC}.push-type.liveactivity`,
+        'apns-push-type': 'liveactivity',
+        'apns-priority': String(priority),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ aps }),
+      signal: AbortSignal.timeout(APNS_TIMEOUT_MS),
+    });
+    status = resp.status;
 
-  if (!resp.ok) {
-    throw new APNsError(resp.status, parseAPNsReason(await resp.text()));
+    if (!resp.ok) {
+      const reason = parseAPNsReason(await resp.text());
+      const durationMs = Date.now() - startMs;
+      logError('apns.error', {
+        pushType: 'liveactivity',
+        activityEvent: event,
+        priority,
+        env: env.APNS_ENV,
+        status: resp.status,
+        reason,
+        durationMs,
+      });
+      throw new APNsError(resp.status, reason);
+    }
+  } catch (err) {
+    if (err instanceof APNsError) throw err;
+    const durationMs = Date.now() - startMs;
+    if (isTimeoutError(err)) {
+      logError('apns.timeout', {
+        pushType: 'liveactivity',
+        activityEvent: event,
+        priority,
+        env: env.APNS_ENV,
+        status,
+        timeoutMs: APNS_TIMEOUT_MS,
+        durationMs,
+        error: formatError(err),
+      });
+    } else {
+      logError('apns.error', {
+        pushType: 'liveactivity',
+        activityEvent: event,
+        priority,
+        env: env.APNS_ENV,
+        status,
+        durationMs,
+        error: formatError(err),
+      });
+    }
+    throw err;
   }
 }

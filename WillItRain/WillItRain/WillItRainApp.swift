@@ -67,14 +67,17 @@ struct WillItRainApp: App {
 
                 let nextInterval = forecast.nextPollInterval(leadTimeMinutes: settings.leadTime)
                 BackgroundRefresh.schedule(after: nextInterval)
+                AppLogger.background.info("Background refresh completed; next interval \(Int(nextInterval))s")
                 task.setTaskCompleted(success: true)
             } catch {
+                AppLogger.background.error("Background refresh failed: \(error.localizedDescription)")
                 BackgroundRefresh.schedule(after: 15 * 60)
                 task.setTaskCompleted(success: false)
             }
         }
 
         task.expirationHandler = {
+            AppLogger.background.warning("Background refresh expired before completion")
             operation.cancel()
         }
     }

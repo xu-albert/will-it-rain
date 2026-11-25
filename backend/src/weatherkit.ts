@@ -1,5 +1,7 @@
 import { Env, WeatherKitForecast } from './types';
 import { SYNTHESIZED_LOOKBACK_MINUTES } from './nextHour';
+import { toGridKey } from './grid';
+import { formatError, isTimeoutError, logError, scrubSensitive } from './logger';
 
 // WeatherKit accepts tokens for up to one hour; refresh a little earlier so a
 // cron burst never signs one token per grid cell.
@@ -48,8 +50,22 @@ async function generateJWT(env: Env): Promise<string> {
 // Bound upstream stalls so one hung WeatherKit socket cannot stall the sequential cron tick.
 export const WEATHERKIT_TIMEOUT_MS = 8_000;
 
-export async function fetchForecast(lat: number, lon: number, env: Env): Promise<WeatherKitForecast> {
-  const token = await generateJWT(env);
+export class WeatherKitError extends Error {
+  constructor(
+    readonly status: number,
+    readonly detail: string
+  ) {
+    super(`WeatherKit API error: ${status} ${detail}`);
+    this.name = 'WeatherKitError';
+  }
+}
+
+export async function fetchForecast(
+  lat: number,
+  lon: number,
+  env: Env,
+  gridKey: string = toGridKey(lat, lon)
+): Promise<WeatherKitForecast> {
   // forecastHourly is the fallback for regions with no forecastNextHour
   // (nextHour.ts). Only the hours that can contain its synthesized minutes are
   // asked for: from the hour containing the series' lookback start — by default
@@ -65,14 +81,49 @@ export async function fetchForecast(lat: number, lon: number, env: Env): Promise
     `?dataSets=forecastNextHour,forecastHourly` +
     `&hourlyStart=${encodeURIComponent(hourlyStart)}&hourlyEnd=${encodeURIComponent(hourlyEnd)}`;
 
-  const resp = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(WEATHERKIT_TIMEOUT_MS),
-  });
+  const startMs = Date.now();
+  let status: number | undefined;
+  try {
+    const token = await generateJWT(env);
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(WEATHERKIT_TIMEOUT_MS),
+    });
+    status = resp.status;
 
-  if (!resp.ok) {
-    throw new Error(`WeatherKit API error: ${resp.status} ${await resp.text()}`);
+    if (!resp.ok) {
+      const body = await resp.text();
+      const durationMs = Date.now() - startMs;
+      const detail = scrubSensitive(body.slice(0, 200));
+      logError('weatherkit.error', {
+        gridKey,
+        status: resp.status,
+        durationMs,
+        error: detail,
+      });
+      throw new WeatherKitError(resp.status, detail);
+    }
+
+    return (await resp.json()) as WeatherKitForecast;
+  } catch (err) {
+    if (err instanceof WeatherKitError) throw err;
+    const durationMs = Date.now() - startMs;
+    if (isTimeoutError(err)) {
+      logError('weatherkit.timeout', {
+        gridKey,
+        status,
+        timeoutMs: WEATHERKIT_TIMEOUT_MS,
+        durationMs,
+        error: formatError(err),
+      });
+    } else {
+      logError('weatherkit.error', {
+        gridKey,
+        status,
+        durationMs,
+        error: formatError(err),
+      });
+    }
+    throw err;
   }
-
-  return resp.json() as Promise<WeatherKitForecast>;
 }

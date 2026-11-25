@@ -54,6 +54,7 @@ a stubbed `URLProtocol`, never a live Worker.
 | Backend test harnesses | `backend/test/kvMock.ts`, `backend/test/doMock.ts` | — | In-memory KV (with expiry + stale-read simulation) and a Durable Object namespace mock that runs the *real* `CoverageRegistry`/`RegistrationLimiter` classes, not stubs |
 | Backend next-hour series | `backend/test/next-hour.test.ts` | Vitest | `nextHourMinutes`: a real `forecastNextHour` passes through untouched; otherwise the minute series synthesized from `forecastHourly`, starting one cron interval before now and bounded by the readings on hand |
 | Backend WeatherKit & upstream timeouts | `backend/test/weatherkit.test.ts` | Vitest | WeatherKit JWTs are reused within the 40-minute cache window and refreshed after it; stalled WeatherKit and APNs fetches abort at `WEATHERKIT_TIMEOUT_MS` / `APNS_TIMEOUT_MS` (8s) |
+| Backend structured logging | `backend/test/logger.test.ts` | Vitest | Single-line JSON log emission, recursive forbidden-key and token/JWT/coordinate redaction (including untrusted routes), HTTP and Durable Object event logging (`http.request`, `do.*`), cron start/summary telemetry, and WeatherKit/APNs error and timeout logging |
 | iOS forecast model | `WillItRain/WillItRainTests/RainForecastTests.swift` | XCTest | `PrecipitationIntensity.from(millimetersPerHour:)` thresholds and `Comparable` ordering, `PrecipitationPeriod.contains`, type icons, `PrecipitationType.isWintry` and the `.mixed` copy, and `RainForecast`'s time-dependent readings (current/next period, hero status copy, poll interval) at a given instant |
 | iOS forecast merge | `WillItRain/WillItRainTests/ForecastMergeTests.swift` | XCTest | `ForecastMerge.merge(minute:hourly:now:)` at fixed instants and `PrecipitationPeriod.detect(in:)` on the merged series: which hourly reading is kept and how it is clipped, `hasMinuteForecast`, and which periods are `isConfirmed` (see section 4) |
 | iOS alert gate | `WillItRain/WillItRainTests/NotificationServiceTests.swift` | XCTest | Every path through `NotificationService.evaluateAndSchedule` at explicit instants with delivery recorded and settings in an isolated `UserDefaults` suite: two-pass rain-start and rain-end confirmation, same-event suppression, rain resuming within the hour, quiet hours, opt-outs, hourly-only and unconfirmed-nowcast periods, and standing down while a confirmed Worker registration owns alerts |
@@ -62,6 +63,7 @@ a stubbed `URLProtocol`, never a live Worker.
 | iOS Live Activity content & teardown | `WillItRain/WillItRainTests/LiveActivityServiceTests.swift` | XCTest | `LiveActivityService.makeState` per design state (which period types resolve to `precip: .wintry`, the wintry copy, and that every state the app builds carries `precip`) and `endAll()` teardown calling remote unregister only when activities or observers were active |
 | iOS location service | `WillItRain/WillItRainTests/LocationServiceTests.swift` | XCTest | `LocationService.currentLocation()` against a stubbed `CLLocationManager`, including the stuck-continuation regression (see section 4) |
 | iOS build product | `WillItRain/WillItRainTests/BuildProductTests.swift` | XCTest | Generated `Info.plist` keys: portrait lock, bundle ID, display name, Live Activity entitlement flags, background task ID, location usage strings, version keys present, and the deployment floor (`MinimumOSVersion`) on the app and on the embedded widget appex, asserted equal so the two cannot drift apart |
+| iOS logging & MetricKit | `WillItRain/WillItRainTests/AppLoggerTests.swift` | XCTest | `AppLogger` category/level routing through an injected sink, token/JWT/coordinate sanitization, concurrent logging safety, `PushRegistrationService` error-code logging without leaking tokens, and `MetricKitDiagnostics` subscriber lifecycle and metric/diagnostic payload logging |
 
 ### What is missing
 
@@ -487,8 +489,9 @@ The cron no longer keeps pushing to tokens APNs has rejected:
   `MAX_DEVICE_REAPS_PER_TICK` (2) devices are dropped per cron tick, because the
   Free plan allows 1,000 KV deletes a day. Beyond that the token is queued in the
   CoverageRegistry, skipped by the push loop so it costs no further pushes, and
-  reaped by a later tick — `[APNs] Reap budget exhausted` and
-  `[Cron] … still queued for deletion` say so in `wrangler tail`.
+  reaped by a later tick — structured JSON error events
+  `apns.reap_budget_exhausted` and `cron.reap_backlog` say so in `wrangler tail`
+  and Cloudflare Workers Logs.
 - **BadDeviceToken** → a strike counter (`apnsfail:<token>`, 24h TTL). The
   device is dropped on the 5th strike. It is deliberately not 1, because a
   wrong `APNS_ENV` makes *every* device return BadDeviceToken, and a single
@@ -501,9 +504,11 @@ The cron no longer keeps pushing to tokens APNs has rejected:
 
 ```bash
 cd backend
-npx wrangler tail
-#   then trigger a test or wait for the :00/:10/:20 cron — you'll see
-#   [Cron]/[Register] logs and any APNs errors in real time.
+npx wrangler tail --format json
+#   then trigger a test or wait for the :00/:10/:20 cron — the Worker emits
+#   single-line structured JSON events (`http.request`, `cron.start`,
+#   `cron.summary`, `apns.error`, `weatherkit.error`, `do.*`, `kv.error`)
+#   that also persist to Cloudflare Workers Logs (`[observability.logs]`).
 ```
 
 ### E. (Optional) set APNS_ENV explicitly
@@ -574,9 +579,9 @@ could not read.
 The caps are set by the Workers **Free** plan's 50-external-subrequests-per-invocation
 budget, which the cron shares between one WeatherKit fetch per cell and up to two
 APNs pushes per notified device — 15 + `PUSH_BUDGET_PER_INVOCATION` (34) ≤ 50. The
-cron logs `[Cron] Grid-cell cap hit` if it has to skip cells, and
-`[Cron] Push budget exhausted` if it runs out of pushes; both are `console.error`,
-so `wrangler tail` shows them.
+cron emits `cron.cell_cap_hit` if it has to skip cells, and
+`cron.push_budget_exhausted` if it runs out of pushes; both are structured JSON
+`console.error` events, so `wrangler tail` and Workers Logs show them.
 
 Device records expire 14 days after their last write (`activity:` records expire
 after 24 hours), and the app re-registers on cold launch, on every foreground,

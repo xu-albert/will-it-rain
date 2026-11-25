@@ -66,9 +66,9 @@ final class LiveActivityService {
                     pushType: .token
                 )
                 observePushToken(for: activity)
-                print("[LiveActivity] Started \(activity.id)")
+                AppLogger.activity.info("Started Live Activity \(activity.id)")
             } catch {
-                print("[LiveActivity] Start failed: \(error)")
+                AppLogger.activity.error("Live Activity start failed: \(error.localizedDescription)")
             }
         }
     }
@@ -80,6 +80,7 @@ final class LiveActivityService {
             observer.cancel()
         }
         tokenObservers.removeAll()
+        AppLogger.activity.info("Ended \(endedIDs.count) Live Activity instance(s)")
         Task { await unregisterRemoteActivity() }
     }
 
@@ -91,7 +92,7 @@ final class LiveActivityService {
         tokenObservers[activity.id] = Task {
             for await tokenData in activity.pushTokenUpdates {
                 let hex = tokenData.map { String(format: "%02x", $0) }.joined()
-                print("[LiveActivity] Push token received")
+                AppLogger.activity.info("Live Activity push token received")
                 await PushRegistrationService.shared.registerLiveActivityToken(hex)
             }
         }

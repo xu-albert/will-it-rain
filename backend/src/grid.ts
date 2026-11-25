@@ -1,5 +1,6 @@
 import { ActivityKeyMetadata, DeviceRegistration, GridCell, Env } from './types';
 import { MAX_DEVICE_RECORDS } from './abuse';
+import { formatError, logError } from './logger';
 
 /**
  * Every device that currently has a Live Activity, by device token.
@@ -15,7 +16,13 @@ export async function readActivityTokens(env: Env): Promise<Map<string, string>>
 
   let cursor: string | undefined;
   do {
-    const list = await env.DEVICES.list<ActivityKeyMetadata>({ prefix: 'activity:', cursor });
+    let list: KVNamespaceListResult<ActivityKeyMetadata, string>;
+    try {
+      list = await env.DEVICES.list<ActivityKeyMetadata>({ prefix: 'activity:', cursor });
+    } catch (err) {
+      logError('kv.error', { op: 'list', prefix: 'activity:', error: formatError(err) });
+      throw err;
+    }
     for (const key of list.keys) {
       const activityToken = key.metadata?.activityToken;
       if (activityToken) tokens.set(key.name.slice('activity:'.length), activityToken);
@@ -97,7 +104,13 @@ export async function readCoverage(env: Env): Promise<Coverage> {
 
   let cursor: string | undefined;
   do {
-    const list = await env.DEVICES.list({ prefix: 'device:', cursor });
+    let list: KVNamespaceListResult<unknown, string>;
+    try {
+      list = await env.DEVICES.list({ prefix: 'device:', cursor });
+    } catch (err) {
+      logError('kv.error', { op: 'list', prefix: 'device:', error: formatError(err) });
+      throw err;
+    }
     for (const key of list.keys) {
       if (read >= MAX_DEVICE_RECORDS) {
         truncated = true;
@@ -105,7 +118,13 @@ export async function readCoverage(env: Env): Promise<Coverage> {
       }
       read += 1;
 
-      const value = await env.DEVICES.get(key.name, 'json');
+      let value: unknown;
+      try {
+        value = await env.DEVICES.get(key.name, 'json');
+      } catch (err) {
+        logError('kv.error', { op: 'get', keyPrefix: 'device', error: formatError(err) });
+        throw err;
+      }
       if (!value) continue;
       const device = value as DeviceRegistration;
       if (key.expiration === undefined) legacy.push({ key: key.name, device });

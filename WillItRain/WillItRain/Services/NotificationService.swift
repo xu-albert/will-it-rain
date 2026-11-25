@@ -30,8 +30,13 @@ final class NotificationService {
 
     func requestPermission() async -> Bool {
         do {
-            return try await Self.center.requestAuthorization(options: [.alert, .sound])
+            let granted = try await Self.center.requestAuthorization(options: [.alert, .sound])
+            if !granted {
+                AppLogger.notifications.warning("Notification authorization not granted")
+            }
+            return granted
         } catch {
+            AppLogger.notifications.error("Notification authorization failed: \(error.localizedDescription)")
             return false
         }
     }
@@ -86,12 +91,12 @@ final class NotificationService {
                         )
                         settings.lastNotifiedPrecipStart = next.start
                         settings.pendingPrecipStart = nil
-                        print("[Notifications] Rain start confirmed and notified")
+                        AppLogger.notifications.info("Rain start confirmed and notified")
                     }
                 } else {
                     // First pass: set pending
                     settings.pendingPrecipStart = next.start
-                    print("[Notifications] Rain start pending confirmation")
+                    AppLogger.notifications.info("Rain start pending confirmation")
                 }
             } else {
                 // Rain moved out of lead time window — clear pending
@@ -119,12 +124,12 @@ final class NotificationService {
                         )
                         settings.lastNotifiedPrecipEnd = current.end
                         settings.pendingPrecipEnd = nil
-                        print("[Notifications] Rain end confirmed and notified")
+                        AppLogger.notifications.info("Rain end confirmed and notified")
                     }
                 } else {
                     // First pass: set pending
                     settings.pendingPrecipEnd = current.end
-                    print("[Notifications] Rain end pending confirmation")
+                    AppLogger.notifications.info("Rain end pending confirmation")
                 }
             } else {
                 settings.pendingPrecipEnd = nil
@@ -149,7 +154,7 @@ final class NotificationService {
                 "precip-resume"
             )
             settings.lastNotifiedPrecipStart = next.start
-            print("[Notifications] Rain resuming notification sent")
+            AppLogger.notifications.info("Rain resuming notification sent")
         }
     }
 
@@ -164,7 +169,7 @@ final class NotificationService {
 
         center.add(request) { error in
             if let error {
-                print("Notification error: \(error.localizedDescription)")
+                AppLogger.notifications.error("Local notification delivery failed (\(identifier)): \(error.localizedDescription)")
             }
         }
     }

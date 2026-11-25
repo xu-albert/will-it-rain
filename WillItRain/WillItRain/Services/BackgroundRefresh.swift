@@ -23,9 +23,9 @@ enum BackgroundRefresh {
         request.earliestBeginDate = Date(timeIntervalSinceNow: clamped)
         do {
             try BGTaskScheduler.shared.submit(request)
-            print("[Background] Scheduled refresh in \(Int(clamped))s")
+            AppLogger.background.info("Scheduled background refresh in \(Int(clamped))s")
         } catch {
-            print("Background task scheduling failed: \(error)")
+            AppLogger.background.error("Background task scheduling failed: \(error.localizedDescription)")
         }
     }
 }

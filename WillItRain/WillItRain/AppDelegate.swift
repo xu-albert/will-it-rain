@@ -9,6 +9,7 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        MetricKitDiagnostics.shared.start()
         UNUserNotificationCenter.current().delegate = self
         locationService.startMonitoringSignificantLocationChanges()
         // Every launch, background ones included: a registration the Worker
@@ -29,7 +30,7 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
-        print("[Push] Failed to register: \(error)")
+        AppLogger.push.error("Failed to register for remote notifications: \(error.localizedDescription)")
     }
 
     // Show notifications even when app is in foreground

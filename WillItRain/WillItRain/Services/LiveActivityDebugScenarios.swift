@@ -123,7 +123,7 @@ extension LiveActivityService {
               let scenario = DebugScenario(rawValue: launchArgs[idx + 1]) else { return }
 
         guard ActivityAuthorizationInfo().areActivitiesEnabled else {
-            print("[LiveActivity][Debug] Activities not enabled on this device/simulator — cannot start scenario \(scenario.rawValue)")
+            AppLogger.activity.warning("Activities not enabled on this device/simulator — cannot start debug scenario \(scenario.rawValue)")
             return
         }
 
@@ -145,9 +145,11 @@ extension LiveActivityService {
                 pushType: .token
             )
             LiveActivityService.shared.observePushToken(for: activity)
+            AppLogger.activity.debug("Started debug scenario \(scenario.rawValue): \(activity.id)")
+            // scripts/test-live-activity.sh verifies startup via `simctl launch --console-pty` stdout.
             print("[LiveActivity][Debug] Started scenario \(scenario.rawValue): \(activity.id)")
         } catch {
-            print("[LiveActivity][Debug] Failed to start scenario \(scenario.rawValue): \(error)")
+            AppLogger.activity.error("Failed to start debug scenario \(scenario.rawValue): \(error.localizedDescription)")
         }
     }
 }

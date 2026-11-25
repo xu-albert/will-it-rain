@@ -847,9 +847,11 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
     // 75 devices wanted an alert, 34 got one. Exhaustion must never be silent —
     // recordPushFailure ignores anything that is not an APNsError, so a
     // subrequest overflow would otherwise vanish.
-    const exhausted = errors.find((line) => line.includes('Push budget exhausted'));
+    const exhausted = errors
+      .map((line) => JSON.parse(line) as { event?: string; dropped?: number })
+      .find((entry) => entry.event === 'cron.push_budget_exhausted');
     expect(exhausted).toBeDefined();
-    expect(exhausted).toContain(`dropped ${75 - PUSH_BUDGET_PER_INVOCATION}`);
+    expect(exhausted?.dropped).toBe(75 - PUSH_BUDGET_PER_INVOCATION);
   });
 
   it('still sends rain alerts when the Live Activity tokens cannot be read', async () => {
@@ -871,7 +873,12 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
 
     expect(tick.weatherFetches).toBe(2);
     expect(tick.pushes).toBe(6);
-    expect(errors.some((line) => line.includes('Could not read Live Activity tokens'))).toBe(true);
+    expect(
+      errors.some(
+        (line) =>
+          (JSON.parse(line) as { event?: string }).event === 'cron.activity_tokens_unavailable'
+      )
+    ).toBe(true);
   });
 
   it('reaps only as many dead devices as the daily delete allowance affords', async () => {
@@ -898,7 +905,11 @@ describe('a cron tick that wants more pushes than the plan allows', () => {
     // One delete each: these devices never started a Live Activity, so
     // clearActivityToken finds nothing and spends nothing.
     expect(harness.kv.deletes).toBe(MAX_DEVICE_REAPS_PER_TICK);
-    expect(errors.some((line) => line.includes('Reap budget exhausted'))).toBe(true);
+    expect(
+      errors.some(
+        (line) => (JSON.parse(line) as { event?: string }).event === 'apns.reap_budget_exhausted'
+      )
+    ).toBe(true);
 
     // Deferred, not lost: the queue drains at the same rate every tick until it
     // is empty, whether or not those devices are pushed to again.
