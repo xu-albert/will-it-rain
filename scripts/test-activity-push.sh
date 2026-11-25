@@ -24,7 +24,7 @@
 #   2. Launch with the argument `-liveActivityScenario BS` (Xcode: Edit Scheme >
 #      Run > Arguments). BS is the wintry "snowing now" state.
 #   3. Watch the Xcode console for:
-#           [LiveActivity] Push token received
+#           Live Activity push token received
 #           [Push] Live Activity token registered
 #      Those lines are the whole point. Until they appear the server literally
 #      cannot reach the activity — an activity started with `pushType: nil` has
