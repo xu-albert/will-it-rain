@@ -26,13 +26,34 @@ export async function readActivityTokens(env: Env): Promise<Map<string, string>>
   return tokens;
 }
 
-// Round to ~1km grid cells to deduplicate weather API calls
-const GRID_PRECISION = 2; // 0.01 degrees ~ 1.1km
+// Round to ~5.5 km grid cells so nearby metro users share cells and routine
+// neighborhood travel does not churn the Free-plan MAX_GRID_CELLS cap.
+export const GRID_PRECISION = 0.05; // 0.05 degrees ~ 5.5 km
+const GRID_STEPS_PER_DEGREE = Math.round(1 / GRID_PRECISION);
+
+function snapCoordinate(value: number): string {
+  const snapped = Math.round(value * GRID_STEPS_PER_DEGREE) / GRID_STEPS_PER_DEGREE;
+  // Normalize -0 so "-0.00" and "0.00" never split one cell into two.
+  const normalized = Object.is(snapped, -0) || Math.abs(snapped) < 1e-9 ? 0 : snapped;
+  return normalized.toFixed(2);
+}
 
 export function toGridKey(lat: number, lon: number): string {
-  const roundedLat = lat.toFixed(GRID_PRECISION);
-  const roundedLon = lon.toFixed(GRID_PRECISION);
-  return `${roundedLat},${roundedLon}`;
+  return `${snapCoordinate(lat)},${snapCoordinate(lon)}`;
+}
+
+/**
+ * Normalizes a stored grid key — including legacy 0.01° keys left in
+ * CoverageRegistry across a precision change — onto the current GRID_PRECISION.
+ * Non-coordinate keys (such as unit-test labels) pass through unchanged.
+ */
+export function normalizeGridKey(gridKey: string): string {
+  const parts = gridKey.split(',');
+  if (parts.length !== 2) return gridKey;
+  const lat = Number(parts[0]);
+  const lon = Number(parts[1]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return gridKey;
+  return toGridKey(lat, lon);
 }
 
 export function gridCenter(gridKey: string): { lat: number; lon: number } {

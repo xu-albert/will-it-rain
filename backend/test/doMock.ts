@@ -53,6 +53,11 @@ class StorageMock {
   async getAlarm(): Promise<number | null> {
     return this.alarmAt;
   }
+
+  /** Test-only: clear the armed alarm right before delivering it, matching workerd. */
+  async clearAlarm(): Promise<void> {
+    this.alarmAt = null;
+  }
 }
 
 class InstanceMock {
@@ -76,8 +81,9 @@ class InstanceMock {
     return next;
   }
 
-  runAlarm(): Promise<void> {
-    return this.object.alarm?.() ?? Promise.resolve();
+  async runAlarm(): Promise<void> {
+    await this.storage.clearAlarm();
+    await (this.object.alarm?.() ?? Promise.resolve());
   }
 }
 
@@ -117,5 +123,22 @@ export class DurableObjectNamespaceMock {
   /** Test-only: run an instance's alarm handler, as the runtime eventually would. */
   async runAlarm(name: string): Promise<void> {
     await this.instances.get(name)?.runAlarm();
+  }
+
+  /** Test-only: run every instantiated object's alarm handler. */
+  async runAllAlarms(): Promise<void> {
+    for (const instance of this.instances.values()) {
+      await instance.runAlarm();
+    }
+  }
+
+  /** Test-only: inspect or seed raw DO storage for migration and cleanup tests. */
+  storageFor(name: string): StorageMock {
+    let instance = this.instances.get(name);
+    if (!instance) {
+      instance = new InstanceMock(this.ctor);
+      this.instances.set(name, instance);
+    }
+    return instance.storage;
   }
 }

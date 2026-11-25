@@ -585,4 +585,97 @@ final class PushRegistrationServiceTests: XCTestCase {
         XCTAssertFalse(service.isRemoteRegistrationActive,
                        "Only a registration of the stored token may hand alerts to the Worker")
     }
+
+    // MARK: - Live Activity registration & teardown
+
+    func testRegisterLiveActivityTokenSkipsNetworkCallWhenRemoteRegistrationIsInactive() async {
+        var requestCount = 0
+        URLProtocolStub.handler = { request in
+            requestCount += 1
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                Data("{\"ok\":true}".utf8)
+            )
+        }
+        var logs: [String] = []
+        let service = PushRegistrationService(
+            baseURL: URL(string: "https://worker.test")!,
+            defaults: defaults,
+            session: session,
+            log: { logs.append($0) }
+        )
+        service.storeToken(Data(repeating: 0xab, count: 32))
+        XCTAssertFalse(service.isRemoteRegistrationActive)
+
+        await service.registerLiveActivityToken(String(repeating: "ef", count: 32))
+
+        XCTAssertEqual(requestCount, 0, "Should not POST /register-activity when device registration is not active")
+        XCTAssertTrue(logs.contains { $0.contains("Skipping Live Activity token registration") })
+    }
+
+    func testRegisterLiveActivityTokenLogsStatusAndBodyOnFailureWithoutLeakingTokens() async {
+        let deviceToken = String(repeating: "ab", count: 32)
+        let activityToken = String(repeating: "ef", count: 32)
+        var requestedPaths: [String] = []
+        URLProtocolStub.handler = { request in
+            requestedPaths.append(request.url?.path ?? "")
+            if request.url?.path == "/register" {
+                return (
+                    HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                    Data("{\"ok\":true}".utf8)
+                )
+            }
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!,
+                Data("{\"error\":\"Device not registered\"}".utf8)
+            )
+        }
+        var logs: [String] = []
+        let service = PushRegistrationService(
+            baseURL: URL(string: "https://worker.test")!,
+            defaults: defaults,
+            session: session,
+            log: { logs.append($0) }
+        )
+        service.storeToken(Data(repeating: 0xab, count: 32))
+        _ = await service.registerLocation(lat: 37.35, lon: -122.05, leadTimeMinutes: 20)
+        XCTAssertTrue(service.isRemoteRegistrationActive)
+
+        await service.registerLiveActivityToken(activityToken)
+
+        XCTAssertEqual(requestedPaths, ["/register", "/register-activity"])
+        XCTAssertTrue(logs.contains { $0.contains("HTTP 404") && $0.contains("Device not registered") })
+        XCTAssertFalse(logs.contains { $0.contains(deviceToken) || $0.contains(activityToken) })
+    }
+
+    func testUnregisterLiveActivityPostsStoredDeviceToken() async throws {
+        var receivedMethod: String?
+        var receivedPath: String?
+        var receivedBody: [String: String]?
+        URLProtocolStub.handler = { request in
+            receivedMethod = request.httpMethod
+            receivedPath = request.url?.path
+            receivedBody = try JSONDecoder().decode(
+                [String: String].self,
+                from: try URLProtocolStub.bodyData(from: request)
+            )
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                Data("{\"ok\":true}".utf8)
+            )
+        }
+        let service = PushRegistrationService(
+            baseURL: URL(string: "https://worker.test")!,
+            defaults: defaults,
+            session: session,
+            log: { _ in }
+        )
+        service.storeToken(Data(repeating: 0xab, count: 32))
+
+        await service.unregisterLiveActivity()
+
+        XCTAssertEqual(receivedMethod, "POST")
+        XCTAssertEqual(receivedPath, "/unregister-activity")
+        XCTAssertEqual(receivedBody?["token"], String(repeating: "ab", count: 32))
+    }
 }

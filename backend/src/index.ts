@@ -35,9 +35,11 @@ import {
   secureEquals,
 } from './validate';
 import {
+  ACTIVITY_RECORD_TTL_SECONDS,
   DEVICE_RECORD_REFRESH_SECONDS,
   DEVICE_REWRITE_COOLDOWN_SECONDS,
   DEVICE_RECORD_TTL_SECONDS,
+  DORMANT_CELL_THRESHOLD_SECONDS,
   MAX_DEVICES_PER_CELL,
   MAX_DEVICE_RECORDS,
   MAX_GRID_CELLS,
@@ -360,7 +362,7 @@ export default {
     // them here rather than only when a push happens to fail is what makes the
     // queue finite: the push loop below skips whatever is still flagged, so a
     // flagged device never fails another push and would otherwise sit in KV
-    // holding a cell slot until its 45-day TTL ran out.
+    // holding a cell slot until its 14-day TTL ran out.
     //
     // Draining first also fixes the precedence. notifyOnce writes its dedup key
     // only after the push resolves, so a throwing push leaves nothing behind and
@@ -872,7 +874,7 @@ function writeDecision(
   // on every foreground and the skip below could never fire. The grid key is
   // the only precision the server ever consumes — the cron fetches weather for
   // `gridCenter(gridKey)`, never for the device's own lat/lon — so jitter
-  // inside a ~1.1 km cell genuinely changes nothing. A user who moves to a
+  // inside a ~5.5 km cell genuinely changes nothing. A user who moves to a
   // different cell changes the key, and that still writes.
   //
   // The consequence is that the stored lat/lon can lag the device's latest fix
@@ -949,10 +951,10 @@ function activityKey(deviceToken: string): string {
 }
 
 // The activity token is duplicated into the key's metadata so the cron can read
-// every device's token with one `list` instead of one `get` per device. The TTL
-// matches the device record's, so an activity key can never outlive the device
-// that owns it and become the immortal junk DEVICE_RECORD_TTL_SECONDS exists to
-// prevent.
+// every device's token with one `list` instead of one `get` per device. iOS
+// Live Activities cannot outlive 12 hours (8h active + 4h on Lock Screen), so
+// ACTIVITY_RECORD_TTL_SECONDS (24h) expires stale tokens automatically even if
+// the app never called `/unregister-activity`.
 //
 // Re-submitting a token that is already stored writes nothing. `/register-activity`
 // shares `/register`'s per-IP throttle bucket, so without this one address could
@@ -979,7 +981,7 @@ async function putActivityToken(
     activityUpdatedAt: new Date().toISOString(),
   };
   await env.DEVICES.put(key, JSON.stringify(record), {
-    expirationTtl: DEVICE_RECORD_TTL_SECONDS,
+    expirationTtl: ACTIVITY_RECORD_TTL_SECONDS,
     metadata: { activityToken } satisfies ActivityKeyMetadata,
   });
 }
@@ -1336,6 +1338,14 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     );
   }
 
+  if (cell.evictedTokens && cell.evictedTokens.length > 0) {
+    const evictedLabel = cell.evictedCells?.join(', ') ?? 'unknown';
+    console.log(
+      `[Register] Evicted dormant cell(s) ${evictedLabel} (${cell.evictedTokens.length} stale device(s)) to admit grid ${gridKey}`
+    );
+    await evictDormantDevicesFromKV(cell.evictedTokens, env);
+  }
+
   // Decided AFTER the cell is reserved, and that ordering is load-bearing.
   // `reserve` is the only path that clears a device's pending-reap flag, which
   // is what puts a device APNs once rejected — a wrong APNS_ENV window, say —
@@ -1467,6 +1477,36 @@ async function removeDevice(deviceToken: string, env: Env): Promise<void> {
     clearActivityToken(deviceToken, env),
     releaseGridCell(deviceToken, env),
   ]);
+}
+
+// Clears KV records for devices whose dormant cell CoverageRegistry already
+// evicted atomically during /reserve. Reads first so expired keys spend no KV
+// deletes and a device that concurrently woke up and wrote a fresh record is
+// left intact.
+async function evictDormantDevicesFromKV(deviceTokens: string[], env: Env): Promise<void> {
+  const dormantMs = DORMANT_CELL_THRESHOLD_SECONDS * 1000;
+  const now = Date.now();
+  await Promise.allSettled(
+    deviceTokens.map(async (token) => {
+      try {
+        const raw = await env.DEVICES.get(`device:${token}`);
+        if (raw === null) return;
+        try {
+          const parsed = JSON.parse(raw) as Partial<DeviceRegistration>;
+          const ts = Date.parse(parsed.renewedAt ?? parsed.registeredAt ?? '');
+          if (Number.isFinite(ts) && now - ts < dormantMs) return;
+        } catch {
+          // Malformed record — proceed with deleting it.
+        }
+        await Promise.all([
+          env.DEVICES.delete(`device:${token}`),
+          clearActivityToken(token, env),
+        ]);
+      } catch (err) {
+        console.error(`[Register] Could not delete evicted dormant device from KV: ${err}`);
+      }
+    })
+  );
 }
 
 // Decides whether a push failure means the device is gone.

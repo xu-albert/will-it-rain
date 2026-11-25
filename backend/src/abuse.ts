@@ -178,15 +178,29 @@ export const MAX_DEVICE_RECORDS = MAX_GRID_CELLS * MAX_DEVICES_PER_CELL;
 export const RATE_LIMIT_WINDOW_SECONDS = 600;
 export const RATE_LIMIT_MAX_REQUESTS = 20;
 
+// Fixed shard pool for RegistrationLimiter so SQLite DO storage is O(1) bounded
+// under any IP churn or rotating-source flood instead of spawning one persistent
+// SQLite database per unique client IP.
+export const RATE_LIMIT_SHARDS = 16;
+
 // How long a `device:` record survives without being refreshed. Renewal is not
 // incidental: ContentView re-registers on cold launch, unconditionally on
 // willEnterForeground, and after every successful weather poll, and
 // LocationService re-registers on any move over 10 km — so a live install
-// rewrites its own record long before 45 days pass, while a fabricated one,
-// which nothing ever refreshes, evaporates. Before this existed the only
-// pruning path was a push failure, which never fires for a coordinate where it
-// never rains — which is why planted registrations used to be permanent.
-export const DEVICE_RECORD_TTL_SECONDS = 45 * 24 * 60 * 60; // 45 days
+// rewrites its own record long before 14 days pass, while a dormant single-open
+// or fabricated record evaporates instead of holding a scarce cell slot.
+export const DEVICE_RECORD_TTL_SECONDS = 14 * 24 * 60 * 60; // 14 days
+
+// How long an `activity:` token survives without being cleared. iOS Live
+// Activities cannot outlive 12 hours (8h active + 4h on Lock Screen), so 24h
+// gives 2x headroom while preventing stale tokens from lingering for weeks.
+export const ACTIVITY_RECORD_TTL_SECONDS = 24 * 60 * 60; // 24 hours
+
+// How long a cell may go without any occupant registering or renewing before it
+// becomes eligible for eviction when a new cell arrives at MAX_GRID_CELLS.
+// Active users who open the app at least once a week stay strictly protected;
+// long-dormant cells give up their slot instead of returning 503 worldwide.
+export const DORMANT_CELL_THRESHOLD_SECONDS = 7 * 24 * 60 * 60; // 7 days
 
 // Records written before the TTL existed carry no expiration and KV cannot add
 // one after the fact, so the cron rewrites them as it meets them. Bounded per
@@ -215,14 +229,15 @@ export const MAX_DEVICE_REAPS_PER_TICK = 2;
 // nothing in it changed. The client re-registers constantly (cold launch, every
 // foreground, every successful poll), and writing on each of those spends the
 // daily KV write allowance below on nothing. Skipping the identical write is
-// only safe because this threshold forces one through long before the 45-day
-// TTL runs out: 7 days leaves better than six refreshes of headroom.
+// only safe because this threshold forces one through long before the 14-day
+// TTL runs out: 3 days leaves four refreshes of headroom and keeps KV's
+// `renewedAt` well inside DORMANT_CELL_THRESHOLD_SECONDS.
 //
 // The freshness check reads `renewedAt`, never `registeredAt`. They are
 // different facts: `registeredAt` is first-seen and must stay first-seen,
 // because selectCellsWithinCap ranks cells by it and restamping it would let a
 // planted record outrank a live user.
-export const DEVICE_RECORD_REFRESH_SECONDS = 7 * 24 * 60 * 60; // 7 days
+export const DEVICE_RECORD_REFRESH_SECONDS = 3 * 24 * 60 * 60; // 3 days
 
 // The shortest interval at which one device's record may be re-persisted.
 //
@@ -356,12 +371,12 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //      magnitude below it.
 //
 // WRITES — 1,000/day
-//   `device:` puts, /register     ~43/day steady state. Without the
+//   `device:` puts, /register     ~100/day steady state. Without the
 //                                 skip-when-unchanged check below this would be
 //                                 one write per foreground per device —
 //                                 thousands. With it, an unchanged device
 //                                 writes once per DEVICE_RECORD_REFRESH_SECONDS,
-//                                 so 300/7 ~= 43, plus one per genuine change of
+//                                 so 300/3 = 100, plus one per genuine change of
 //                                 coordinates or settings.
 //   `device:` puts, TTL migration <= 5 x 144 = 720/day, but only until the
 //                                 pre-TTL records are drained; then zero.
@@ -460,7 +475,8 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //                                 1 reconcile, MAX_DEVICE_REAPS_PER_TICK
 //                                 releases, and worst case one flag-reap per
 //                                 push attempted.
-//   limiter alarms                1 per address per idle window, the self-clean.
+//   limiter alarms                1 per active shard (<= RATE_LIMIT_SHARDS) per
+//                                 expiry/idle cycle, the self-clean.
 //   => The cron spends ~5.5% of the allowance. Registration is the term that
 //      moves: one address at the 20-per-10-minutes ceiling is 2,880
 //      registrations = ~5,760 requests/day, so ~17 sustained addresses drain it.
@@ -469,33 +485,37 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //      with nothing in this file bounding it.
 //
 // DO ROWS WRITTEN — 100,000/day; a put, a delete and a setAlarm are one row each
-//   limiter, admitted request     1 WINDOW_KEY put, plus 1 setAlarm on the
-//                                 request that opens a window and 1 for the
-//                                 deleteAll when that alarm fires. A 429 writes
-//                                 nothing at all.
-//   reserve, per registration     1 RECENT_KEY put always, 1 COVERAGE_KEY put
-//                                 when the tally actually moves, and 1
-//                                 PENDING_KEY put only for a device that was
-//                                 flagged — 1 to 3, usually 2.
-//   reserve, per refusal          <= 2: the coverage put for the old cell it
-//                                 released on the way in, and the
-//                                 recent-admission forget.
-//   release                       <= 3, on a teardown and on a reap.
+//   limiter, admitted request     1 BUCKETS_KEY put per request on the client's
+//                                 shard, plus 1 setAlarm when that shard has no
+//                                 armed alarm, and 1 deleteAll (or 1 put + 1
+//                                 setAlarm if live buckets remain) when the
+//                                 alarm fires. A 429 writes nothing at all.
+//   reserve, per registration     1 RECENT_KEY put always, 1 ACTIVITY_KEY put
+//                                 whenever the timestamp advances or dormant
+//                                 devices are evicted, 1 COVERAGE_KEY put when
+//                                 the tally actually moves, and 1 PENDING_KEY
+//                                 put only when a device was flagged — 1 to 4,
+//                                 usually 2 unchanged or 3 on a cell change.
+//   reserve, per refusal          <= 3: the coverage put for the old cell it
+//                                 released on the way in, the activity removal,
+//                                 and the recent-admission forget.
+//   release                       <= 4, on a teardown and on a reap: coverage,
+//                                 activity, recent, pending.
 //   flag-reap                     1 per newly rejected token, <= 34/tick.
-//   reconcile                     3/tick unconditionally: coverage, recent,
-//                                 pending.
-//   => The cron is <= 43/tick = 6,192/day, ~6%. One address at the throttle
-//      ceiling writes ~5,800 rows/day re-registering unchanged, and ~8,640 when
-//      it alternates cells so the tally moves on every request, so 12 to 17
+//   reconcile                     4/tick unconditionally: coverage, recent,
+//                                 activity, pending.
+//   => The cron is <= 46/tick = 6,624/day, ~6.6%. One address at the throttle
+//      ceiling writes ~8,640 rows/day re-registering unchanged, and ~11,520
+//      when it alternates cells so the tally moves on every request, so 9 to 12
 //      sustained addresses drain it — the same shape as the KV write bucket, and
 //      for the same reason.
 //
 // DO ROWS READ — 5,000,000/day
-//   ~4 per admitted registration (the limiter's window get, plus coverage,
-//   recent and pending inside reserve) and ~45 per cron tick, so ~11,500/day
-//   for an address at the throttle ceiling and ~6,500/day for the cron. Fits
-//   with three orders of magnitude to spare. It is listed so the next reader can
-//   see it was counted, not because it needs watching.
+//   ~5 per admitted registration (the limiter shard's buckets get, plus
+//   coverage, recent, activity and pending inside reserve) and <= 46 per cron
+//   tick, so ~14,400/day for an address at the throttle ceiling and ~6,600/day
+//   for the cron. Fits with three orders of magnitude to spare. It is listed so
+//   the next reader can see it was counted, not because it needs watching.
 //
 // DO DURATION — 13,000 GB-s/day
 //   The one term here bounded by argument rather than arithmetic: neither object
@@ -523,7 +543,7 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 //   rather than assume the bucket cannot move.
 //
 //   ALL FOUR DO METERS FIT, and none of them gets a budget. Legitimate traffic
-//   spends about 6% of the two that bind first — requests and rows written —
+//   spends under 7% of the two that bind first — requests and rows written —
 //   and far less of rows read and duration, and no arithmetic above asks for a
 //   bound, so there is deliberately no per-tick DO budget, no new constant and
 //   no guard code here —
@@ -541,7 +561,7 @@ export const INTERNAL_SUBREQUEST_CEILING = 1_000;
 // (TESTING.md documents ~15 devices, an order of magnitude below every
 // crossover above) and that running near the caps needs the Paid plan.
 // Exceeding an allowance makes that operation fail for the rest of the UTC day:
-// KV writes gone means putDeviceRecord throws and /register 500s, and the 45-day
+// KV writes gone means putDeviceRecord throws and /register 500s, and the 14-day
 // TTL is only safe while live installs can renew; KV deletes gone means
 // /unregister 500s and dead tokens cannot be reaped; a DO meter gone means the
 // gate stops counting and lets everything through.
@@ -558,8 +578,8 @@ function clientAddress(request: Request): string {
   return request.headers.get('CF-Connecting-IP') ?? 'unknown';
 }
 
-// The address is hashed before it names a Durable Object so that the instance
-// name is not a short-lived log of who talked to us. This is bookkeeping
+// The address is hashed before it is stored as a rate-limit bucket key so the
+// shard's map is not a short-lived log of raw client IPs. This is bookkeeping
 // hygiene, not anonymisation: the IPv4 space is small enough to brute-force a
 // hash.
 async function clientBucket(request: Request): Promise<string> {
@@ -572,18 +592,26 @@ async function clientBucket(request: Request): Promise<string> {
     .join('');
 }
 
+function limiterShardName(bucket: string): string {
+  const prefix = parseInt(bucket.slice(0, 2), 16);
+  const shard = Number.isFinite(prefix) ? prefix % RATE_LIMIT_SHARDS : 0;
+  return `shard-${shard}`;
+}
+
 // ---------------------------------------------------------------------------
 // Rate limit
 // ---------------------------------------------------------------------------
 
 export async function checkRegistrationRate(request: Request, env: Env): Promise<RateDecision> {
   const bucket = await clientBucket(request);
+  const shard = limiterShardName(bucket);
 
   try {
-    const stub = env.REGISTRATION_LIMITER.get(env.REGISTRATION_LIMITER.idFromName(bucket));
+    const stub = env.REGISTRATION_LIMITER.get(env.REGISTRATION_LIMITER.idFromName(shard));
     const response = await stub.fetch('https://limiter/check', {
       method: 'POST',
       body: JSON.stringify({
+        bucket,
         windowSeconds: RATE_LIMIT_WINDOW_SECONDS,
         maxRequests: RATE_LIMIT_MAX_REQUESTS,
       }),
@@ -613,9 +641,11 @@ export type CellDecision = CoverageReply;
  *
  * A device already registered in that cell is always admitted — existing users
  * can re-register, move within their cell, or change their lead time even once
- * the service is full. Only a device that is new to a full cell, or that would
- * open a cell beyond the global cap (and so add ~4,383 WeatherKit calls a
- * month, forever), is turned away.
+ * the service is full. When at or above MAX_GRID_CELLS and a new cell is
+ * requested, the registry evicts enough oldest-renewed dormant cells (whose
+ * occupants have all been inactive for at least DORMANT_CELL_THRESHOLD_SECONDS)
+ * to stay within MAX_GRID_CELLS if enough exist, while strictly protecting
+ * active cells.
  */
 export async function reserveGridCell(
   gridKey: string,
@@ -632,6 +662,7 @@ export async function reserveGridCell(
         incumbent: options.incumbent === true,
         maxCells: MAX_GRID_CELLS,
         maxDevicesPerCell: MAX_DEVICES_PER_CELL,
+        dormantAfterMs: DORMANT_CELL_THRESHOLD_SECONDS * 1000,
       }),
     });
     return (await response.json()) as CoverageReply;
@@ -699,14 +730,21 @@ export async function releaseGridCell(deviceToken: string, env: Env): Promise<vo
  */
 export async function reconcileCoverage(grids: GridCell[], env: Env): Promise<void> {
   const coverage: CoverageMap = {};
+  const activity: Record<string, number> = {};
   for (const grid of grids) {
     coverage[grid.gridKey] = grid.devices.map((device) => device.token);
+    for (const device of grid.devices) {
+      const ts = Date.parse(device.renewedAt ?? device.registeredAt);
+      if (Number.isFinite(ts)) {
+        activity[device.token] = Math.max(activity[device.token] ?? -Infinity, ts);
+      }
+    }
   }
 
   try {
     await coverageStub(env).fetch('https://coverage/reconcile', {
       method: 'POST',
-      body: JSON.stringify({ coverage }),
+      body: JSON.stringify({ coverage, activity }),
     });
   } catch (err) {
     console.warn(`[Abuse] Could not reconcile grid-cell coverage: ${err}`);

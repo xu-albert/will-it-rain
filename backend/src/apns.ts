@@ -122,6 +122,9 @@ export async function sendRainEndAlert(
   await sendNotification(deviceToken, { title: 'Rain ending soon', body }, 0, env);
 }
 
+// Bound upstream stalls so one hung APNs socket cannot stall a sequential cron tick.
+export const APNS_TIMEOUT_MS = 8_000;
+
 async function sendNotification(
   deviceToken: string,
   alert: { title: string; body: string },
@@ -143,6 +146,7 @@ async function sendNotification(
     body: JSON.stringify({
       aps: { alert, badge, sound: 'default' },
     }),
+    signal: AbortSignal.timeout(APNS_TIMEOUT_MS),
   });
 
   if (!resp.ok) {
@@ -225,6 +229,7 @@ export async function sendLiveActivityUpdate(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ aps }),
+    signal: AbortSignal.timeout(APNS_TIMEOUT_MS),
   });
 
   if (!resp.ok) {

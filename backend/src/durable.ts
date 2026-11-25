@@ -18,11 +18,18 @@
 // the arithmetic in abuse.ts).
 
 import { CoverageMap, CoverageReply, RateReply } from './types';
+import { normalizeGridKey } from './grid';
 
 const COVERAGE_KEY = 'cells';
 const RECENT_KEY = 'recent';
 const PENDING_KEY = 'pendingReap';
-const WINDOW_KEY = 'window';
+const ACTIVITY_KEY = 'deviceActivity';
+const BUCKETS_KEY = 'buckets';
+
+// Hard ceiling on tracked IP buckets per shard within one rate-limit window.
+// Each serialized entry is ~60 bytes, so 1,000 entries stays under half of the
+// 128 KiB single-value DO storage ceiling while keeping the shard strictly O(1).
+const MAX_BUCKETS_PER_SHARD = 1_000;
 
 // How long an admission is protected from being reconciled away. Workers KV
 // `list` is eventually consistent, so a device admitted moments before a cron
@@ -35,29 +42,42 @@ type RecentAdmissions = Record<string, { gridKey: string; at: number }>;
 /** Tokens APNs has rejected that are queued for deletion, with when they were flagged. */
 type PendingReaps = Record<string, number>;
 
+/** Last seen / renewed epoch ms per device token, for dormant-cell eviction. */
+type DeviceActivity = Record<string, number>;
+
 function reply(body: unknown): Response {
   return new Response(JSON.stringify(body), {
     headers: { 'Content-Type': 'application/json' },
   });
 }
 
-interface RateWindow {
+interface RateEntry {
   window: number;
   count: number;
+  expiresAt: number;
 }
 
+type BucketMap = Record<string, RateEntry>;
+
 /**
- * One instance per client bucket: the fixed-window registration throttle.
+ * Fixed-shard registration throttle (see RATE_LIMIT_SHARDS in abuse.ts).
  *
- * The instance deletes its own storage once the window it was tracking is well
- * past, so a rotating-source flood leaves no residue behind — a Durable Object
- * with no stored data stops existing.
+ * Each shard holds a TTL-pruned map of hashed client buckets inside a single
+ * SQLite-backed Durable Object, capping total DO instances and SQLite storage
+ * at O(1) regardless of IP churn or rotating-source floods (SQLite DOs retain
+ * a minimum ~4 KB page footprint even after deleteAll(), so spawning one DO per
+ * unique IP caused unbounded storage growth).
  */
 export class RegistrationLimiter {
   constructor(private readonly ctx: DurableObjectState) {}
 
   async fetch(request: Request): Promise<Response> {
-    const { windowSeconds, maxRequests } = (await request.json()) as {
+    const {
+      bucket = 'default',
+      windowSeconds,
+      maxRequests,
+    } = (await request.json()) as {
+      bucket?: string;
       windowSeconds: number;
       maxRequests: number;
     };
@@ -65,21 +85,45 @@ export class RegistrationLimiter {
     const now = Date.now();
     const windowMs = windowSeconds * 1000;
     const window = Math.floor(now / windowMs);
-    const retryAfterSeconds = Math.max(1, Math.ceil(((window + 1) * windowMs - now) / 1000));
+    const expiresAt = (window + 1) * windowMs;
+    const retryAfterSeconds = Math.max(1, Math.ceil((expiresAt - now) / 1000));
 
-    const stored = await this.ctx.storage.get<RateWindow>(WINDOW_KEY);
-    const count = stored && stored.window === window ? stored.count : 0;
+    const stored = (await this.ctx.storage.get<BucketMap>(BUCKETS_KEY)) ?? {};
+    const live: BucketMap = {};
+    for (const [key, entry] of Object.entries(stored)) {
+      if (entry.expiresAt > now) live[key] = entry;
+    }
+
+    const existing = live[bucket];
+    const count = existing && existing.window === window ? existing.count : 0;
 
     if (count >= maxRequests) {
       const refusal: RateReply = { ok: false, retryAfterSeconds };
       return reply(refusal);
     }
 
-    await this.ctx.storage.put<RateWindow>(WINDOW_KEY, { window, count: count + 1 });
-    if (count === 0) {
-      // Self-cleanup one window after this one closes, so idle buckets do not
-      // accumulate. Set only when the window opens, to keep this to one extra
-      // write per client per window.
+    if (!(bucket in live)) {
+      const keys = Object.keys(live);
+      if (keys.length >= MAX_BUCKETS_PER_SHARD) {
+        // Evict the lowest-count (then earliest-expiring) bucket so repeat
+        // offenders remain throttled while single-value storage stays bounded.
+        let victim = keys[0];
+        for (const key of keys) {
+          const a = live[key];
+          const b = live[victim];
+          if (a.count < b.count || (a.count === b.count && a.expiresAt < b.expiresAt)) {
+            victim = key;
+          }
+        }
+        delete live[victim];
+      }
+    }
+
+    live[bucket] = { window, count: count + 1, expiresAt };
+    await this.ctx.storage.put<BucketMap>(BUCKETS_KEY, live);
+
+    const alarm = await this.ctx.storage.getAlarm();
+    if (alarm === null || alarm <= now) {
       await this.ctx.storage.setAlarm(now + windowMs * 2);
     }
 
@@ -88,7 +132,22 @@ export class RegistrationLimiter {
   }
 
   async alarm(): Promise<void> {
-    await this.ctx.storage.deleteAll();
+    const now = Date.now();
+    const stored = (await this.ctx.storage.get<BucketMap>(BUCKETS_KEY)) ?? {};
+    const live: BucketMap = {};
+    let latestExpiry = 0;
+    for (const [key, entry] of Object.entries(stored)) {
+      if (entry.expiresAt > now) {
+        live[key] = entry;
+        if (entry.expiresAt > latestExpiry) latestExpiry = entry.expiresAt;
+      }
+    }
+    if (Object.keys(live).length === 0) {
+      await this.ctx.storage.deleteAll();
+    } else {
+      await this.ctx.storage.put<BucketMap>(BUCKETS_KEY, live);
+      await this.ctx.storage.setAlarm(latestExpiry + 1000);
+    }
   }
 }
 
@@ -115,8 +174,27 @@ export class CoverageRegistry {
     return new Response('Not found', { status: 404 });
   }
 
-  private async load(): Promise<CoverageMap> {
-    return (await this.ctx.storage.get<CoverageMap>(COVERAGE_KEY)) ?? {};
+  private async load(): Promise<{ cells: CoverageMap; migrated: boolean }> {
+    const stored = (await this.ctx.storage.get<CoverageMap>(COVERAGE_KEY)) ?? {};
+    const cells: CoverageMap = {};
+    let migrated = false;
+    for (const [rawKey, tokens] of Object.entries(stored)) {
+      const key = normalizeGridKey(rawKey);
+      if (key !== rawKey) migrated = true;
+      const occupants = cells[key];
+      if (!occupants) {
+        cells[key] = [...tokens];
+      } else {
+        for (const token of tokens) {
+          if (!occupants.includes(token)) occupants.push(token);
+        }
+      }
+    }
+    return { cells, migrated };
+  }
+
+  private async loadActivity(): Promise<DeviceActivity> {
+    return (await this.ctx.storage.get<DeviceActivity>(ACTIVITY_KEY)) ?? {};
   }
 
   /**
@@ -177,11 +255,17 @@ export class CoverageRegistry {
     return (await this.ctx.storage.get<PendingReaps>(PENDING_KEY)) ?? {};
   }
 
-  private async forgetPending(deviceToken: string): Promise<void> {
+  private async forgetPending(deviceTokens: string[]): Promise<void> {
+    if (deviceTokens.length === 0) return;
     const pending = await this.loadPending();
-    if (!(deviceToken in pending)) return;
-    delete pending[deviceToken];
-    await this.ctx.storage.put(PENDING_KEY, pending);
+    let changed = false;
+    for (const token of deviceTokens) {
+      if (token in pending) {
+        delete pending[token];
+        changed = true;
+      }
+    }
+    if (changed) await this.ctx.storage.put(PENDING_KEY, pending);
   }
 
   /** Recent admissions, with anything past the grace window dropped. */
@@ -189,9 +273,66 @@ export class CoverageRegistry {
     const stored = (await this.ctx.storage.get<RecentAdmissions>(RECENT_KEY)) ?? {};
     const live: RecentAdmissions = {};
     for (const [token, entry] of Object.entries(stored)) {
-      if (now - entry.at < RECONCILE_GRACE_MS) live[token] = entry;
+      if (now - entry.at < RECONCILE_GRACE_MS) {
+        live[token] = { gridKey: normalizeGridKey(entry.gridKey), at: entry.at };
+      }
     }
     return live;
+  }
+
+  /**
+   * Finds the `count` oldest-renewed dormant cells eligible for eviction at cap.
+   *
+   * A cell is dormant only when EVERY occupant has a known activity timestamp
+   * at least `dormantAfterMs` old and none was admitted within the reconcile
+   * grace window. Any cell with an active occupant or unknown timestamp (e.g.
+   * before the first post-deploy reconcile populates timestamps from KV) is
+   * protected. Returns `null` if fewer than `count` eligible cells exist so
+   * callers never partially evict before refusing.
+   */
+  private findDormantVictims(
+    cells: CoverageMap,
+    activity: DeviceActivity,
+    recent: RecentAdmissions,
+    now: number,
+    dormantAfterMs: number,
+    count: number
+  ): string[] | null {
+    if (!Number.isFinite(dormantAfterMs) || dormantAfterMs <= 0 || count <= 0) return null;
+
+    const candidates: Array<{ key: string; lastActivity: number }> = [];
+
+    for (const [key, tokens] of Object.entries(cells)) {
+      if (tokens.length === 0) continue;
+
+      let cellLastActivity = -Infinity;
+      let eligible = true;
+      for (const token of tokens) {
+        if (token in recent) {
+          eligible = false;
+          break;
+        }
+        const ts = activity[token];
+        if (typeof ts !== 'number' || !Number.isFinite(ts)) {
+          eligible = false;
+          break;
+        }
+        if (ts > cellLastActivity) cellLastActivity = ts;
+      }
+      if (!eligible) continue;
+      if (now - cellLastActivity < dormantAfterMs) continue;
+
+      candidates.push({ key, lastActivity: cellLastActivity });
+    }
+
+    if (candidates.length < count) return null;
+
+    candidates.sort((a, b) => {
+      if (a.lastActivity !== b.lastActivity) return a.lastActivity - b.lastActivity;
+      return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+    });
+
+    return candidates.slice(0, count).map((c) => c.key);
   }
 
   /**
@@ -201,7 +342,7 @@ export class CoverageRegistry {
    * touching anything, so an existing user can always re-register, move within
    * their cell, or change their lead time even when the service is full. Only a
    * device that is genuinely new to a full cell, or that would open a cell
-   * beyond the global cap, is refused.
+   * beyond the global cap when no dormant cell can be evicted, is refused.
    *
    * `incumbent` says the caller has verified a stored `device:` record for this
    * token at this exact gridKey, so the device already occupies real storage and
@@ -216,18 +357,31 @@ export class CoverageRegistry {
    * capacity refusal, so leaving it counted would leak a slot forever.
    */
   private async reserve(request: Request): Promise<Response> {
-    const { gridKey, deviceToken, incumbent, maxCells, maxDevicesPerCell } =
-      (await request.json()) as {
-        gridKey: string;
-        deviceToken: string;
-        incumbent?: boolean;
-        maxCells: number;
-        maxDevicesPerCell: number;
-      };
+    const {
+      gridKey: rawGridKey,
+      deviceToken,
+      incumbent,
+      maxCells,
+      maxDevicesPerCell,
+      dormantAfterMs = 0,
+    } = (await request.json()) as {
+      gridKey: string;
+      deviceToken: string;
+      incumbent?: boolean;
+      maxCells: number;
+      maxDevicesPerCell: number;
+      dormantAfterMs?: number;
+    };
 
+    const gridKey = normalizeGridKey(rawGridKey);
     const now = Date.now();
-    const cells = await this.load();
-    let changed = false;
+    const { cells, migrated } = await this.load();
+    const recent = await this.loadRecent(now);
+    const activity = await this.loadActivity();
+    let changed = migrated;
+    let activityChanged = false;
+    let evictedCells: string[] | undefined;
+    let evictedTokens: string[] | undefined;
 
     for (const [key, tokens] of Object.entries(cells)) {
       if (key === gridKey) continue;
@@ -243,7 +397,14 @@ export class CoverageRegistry {
       if (!occupants.includes(deviceToken)) {
         if (occupants.length >= maxDevicesPerCell && !incumbent) {
           if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
-          await this.forgetRecent(deviceToken, now);
+          if (deviceToken in activity) {
+            delete activity[deviceToken];
+            await this.ctx.storage.put(ACTIVITY_KEY, activity);
+          }
+          if (deviceToken in recent) {
+            delete recent[deviceToken];
+            await this.ctx.storage.put(RECENT_KEY, recent);
+          }
           return reply(this.refusal('cell_at_capacity', cells, gridKey));
         }
         occupants.push(deviceToken);
@@ -251,9 +412,43 @@ export class CoverageRegistry {
       }
     } else {
       if (Object.keys(cells).length >= maxCells && !incumbent) {
-        if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
-        await this.forgetRecent(deviceToken, now);
-        return reply(this.refusal('coverage_at_capacity', cells, gridKey));
+        const needed = Object.keys(cells).length - maxCells + 1;
+        const victimKeys = this.findDormantVictims(
+          cells,
+          activity,
+          recent,
+          now,
+          dormantAfterMs,
+          needed
+        );
+        if (victimKeys !== null) {
+          evictedCells = victimKeys;
+          const evictedTokenSet = new Set<string>();
+          for (const victimKey of victimKeys) {
+            for (const token of cells[victimKey]) {
+              evictedTokenSet.add(token);
+              if (token in activity) {
+                delete activity[token];
+                activityChanged = true;
+              }
+              delete recent[token];
+            }
+            delete cells[victimKey];
+          }
+          evictedTokens = [...evictedTokenSet];
+          changed = true;
+        } else {
+          if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
+          if (deviceToken in activity) {
+            delete activity[deviceToken];
+            await this.ctx.storage.put(ACTIVITY_KEY, activity);
+          }
+          if (deviceToken in recent) {
+            delete recent[deviceToken];
+            await this.ctx.storage.put(RECENT_KEY, recent);
+          }
+          return reply(this.refusal('coverage_at_capacity', cells, gridKey));
+        }
       }
       cells[gridKey] = [deviceToken];
       changed = true;
@@ -261,15 +456,21 @@ export class CoverageRegistry {
 
     if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
 
-    const recent = await this.loadRecent(now);
+    if (activity[deviceToken] !== now) {
+      activity[deviceToken] = now;
+      activityChanged = true;
+    }
+    if (activityChanged) await this.ctx.storage.put(ACTIVITY_KEY, activity);
+
     recent[deviceToken] = { gridKey, at: now };
     await this.ctx.storage.put(RECENT_KEY, recent);
-    await this.forgetPending(deviceToken);
+    await this.forgetPending(evictedTokens ? [deviceToken, ...evictedTokens] : [deviceToken]);
 
     const admitted: CoverageReply = {
       ok: true,
       cells: Object.keys(cells).length,
       devices: cells[gridKey]?.length ?? 0,
+      ...(evictedCells ? { evictedCells, evictedTokens } : {}),
     };
     return reply(admitted);
   }
@@ -291,9 +492,9 @@ export class CoverageRegistry {
   private async release(request: Request): Promise<Response> {
     const { deviceToken } = (await request.json()) as { deviceToken: string };
     const now = Date.now();
-    const cells = await this.load();
+    const { cells, migrated } = await this.load();
 
-    let changed = false;
+    let changed = migrated;
     for (const [key, tokens] of Object.entries(cells)) {
       const at = tokens.indexOf(deviceToken);
       if (at === -1) continue;
@@ -302,8 +503,14 @@ export class CoverageRegistry {
       changed = true;
     }
     if (changed) await this.ctx.storage.put(COVERAGE_KEY, cells);
+
+    const activity = await this.loadActivity();
+    if (deviceToken in activity) {
+      delete activity[deviceToken];
+      await this.ctx.storage.put(ACTIVITY_KEY, activity);
+    }
     await this.forgetRecent(deviceToken, now);
-    await this.forgetPending(deviceToken);
+    await this.forgetPending([deviceToken]);
 
     return reply({ ok: true, cells: Object.keys(cells).length, devices: 0 } satisfies CoverageReply);
   }
@@ -328,11 +535,24 @@ export class CoverageRegistry {
    * partial read can never wipe live state.
    */
   private async reconcile(request: Request): Promise<Response> {
-    const { coverage } = (await request.json()) as { coverage: CoverageMap };
+    const { coverage, activity: kvActivity = {} } = (await request.json()) as {
+      coverage: CoverageMap;
+      activity?: DeviceActivity;
+    };
     const now = Date.now();
 
     const next: CoverageMap = {};
-    for (const [gridKey, tokens] of Object.entries(coverage)) next[gridKey] = [...tokens];
+    for (const [rawKey, tokens] of Object.entries(coverage)) {
+      const key = normalizeGridKey(rawKey);
+      const occupants = next[key];
+      if (!occupants) {
+        next[key] = [...tokens];
+      } else {
+        for (const token of tokens) {
+          if (!occupants.includes(token)) occupants.push(token);
+        }
+      }
+    }
 
     const recent = await this.loadRecent(now);
     for (const [token, entry] of Object.entries(recent)) {
@@ -347,11 +567,38 @@ export class CoverageRegistry {
     await this.ctx.storage.put(COVERAGE_KEY, next);
     await this.ctx.storage.put(RECENT_KEY, recent);
 
+    const covered = new Set(Object.values(next).flat());
+
+    // Keep the freshest observed activity timestamp for every covered device:
+    // KV supplies `renewedAt ?? registeredAt` (crucial for pre-existing records
+    // right after deploy), while `storedActivity` preserves unchanged
+    // re-registrations that skipped a KV write.
+    const storedActivity = await this.loadActivity();
+    const nextActivity: DeviceActivity = {};
+    for (const token of covered) {
+      let freshest = -Infinity;
+      const fromStored = storedActivity[token];
+      if (typeof fromStored === 'number' && Number.isFinite(fromStored) && fromStored > freshest) {
+        freshest = fromStored;
+      }
+      const fromKv = kvActivity[token];
+      if (typeof fromKv === 'number' && Number.isFinite(fromKv) && fromKv > freshest) {
+        freshest = fromKv;
+      }
+      const fromRecent = recent[token]?.at;
+      if (typeof fromRecent === 'number' && Number.isFinite(fromRecent) && fromRecent > freshest) {
+        freshest = fromRecent;
+      }
+      if (Number.isFinite(freshest)) {
+        nextActivity[token] = freshest;
+      }
+    }
+    await this.ctx.storage.put(ACTIVITY_KEY, nextActivity);
+
     // A pending-reap flag only exists to keep the cron from pushing to a token,
     // so once that token is out of the reconciled map it has nothing left to do
     // and would otherwise accumulate forever. Devices still in KV — including
     // the recent admissions merged in above — keep theirs.
-    const covered = new Set(Object.values(next).flat());
     const pending = await this.loadPending();
     const live: PendingReaps = {};
     for (const [token, at] of Object.entries(pending)) {

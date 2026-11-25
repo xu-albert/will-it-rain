@@ -13,6 +13,24 @@ final class LiveActivityService {
     private let horizonMinutes = 240
 
     private var tokenObservers: [String: Task<Void, Never>] = [:]
+    private let endActivities: () -> [String]
+    private let unregisterRemoteActivity: @MainActor () async -> Void
+
+    init(
+        endActivities: (() -> [String])? = nil,
+        unregisterRemoteActivity: (@MainActor () async -> Void)? = nil
+    ) {
+        self.endActivities = endActivities ?? {
+            let activities = Activity<RainActivityAttributes>.activities
+            for activity in activities {
+                Task { await activity.end(nil, dismissalPolicy: .default) }
+            }
+            return activities.map(\.id)
+        }
+        self.unregisterRemoteActivity = unregisterRemoteActivity ?? {
+            await PushRegistrationService.shared.unregisterLiveActivity()
+        }
+    }
 
     func sync(forecast: RainForecast, settings: NotificationSettings) {
         guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
@@ -56,11 +74,13 @@ final class LiveActivityService {
     }
 
     func endAll() {
-        for activity in Activity<RainActivityAttributes>.activities {
-            tokenObservers[activity.id]?.cancel()
-            tokenObservers[activity.id] = nil
-            Task { await activity.end(nil, dismissalPolicy: .default) }
+        let endedIDs = endActivities()
+        guard !endedIDs.isEmpty || !tokenObservers.isEmpty else { return }
+        for observer in tokenObservers.values {
+            observer.cancel()
         }
+        tokenObservers.removeAll()
+        Task { await unregisterRemoteActivity() }
     }
 
     // Not private: the DEBUG scenario harness starts its own activities and must

@@ -45,6 +45,9 @@ async function generateJWT(env: Env): Promise<string> {
   return token;
 }
 
+// Bound upstream stalls so one hung WeatherKit socket cannot stall the sequential cron tick.
+export const WEATHERKIT_TIMEOUT_MS = 8_000;
+
 export async function fetchForecast(lat: number, lon: number, env: Env): Promise<WeatherKitForecast> {
   const token = await generateJWT(env);
   // forecastHourly is the fallback for regions with no forecastNextHour
@@ -64,6 +67,7 @@ export async function fetchForecast(lat: number, lon: number, env: Env): Promise
 
   const resp = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(WEATHERKIT_TIMEOUT_MS),
   });
 
   if (!resp.ok) {

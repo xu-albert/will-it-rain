@@ -290,6 +290,10 @@ final class PushRegistrationService {
     /// content-state updates (apns-push-type: liveactivity).
     func registerLiveActivityToken(_ activityToken: String) async {
         guard let token = defaults.string(forKey: Self.deviceTokenKey) else { return }
+        guard isRemoteRegistrationActive else {
+            log("[Push] Skipping Live Activity token registration: remote device registration is not active")
+            return
+        }
         let url = baseURL.appendingPathComponent("register-activity")
 
         var request = URLRequest(url: url)
@@ -300,11 +304,13 @@ final class PushRegistrationService {
         )
 
         do {
-            let (_, response) = try await session.data(for: request)
-            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+            let (data, response) = try await session.data(for: request)
+            let http = response as? HTTPURLResponse
+            if http?.statusCode == 200 {
                 log("[Push] Live Activity token registered")
             } else {
-                log("[Push] Live Activity token registration returned non-200")
+                let detail = String(data: data, encoding: .utf8) ?? "<no body>"
+                log("[Push] Live Activity token registration rejected (HTTP \(http?.statusCode ?? -1)): \(detail)")
             }
         } catch {
             log("[Push] Live Activity token registration failed: \(error)")
